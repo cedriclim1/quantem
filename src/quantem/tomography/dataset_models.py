@@ -544,4 +544,8 @@ class TomographyINRPretrainDataset(Dataset):
         return {"coords": self.coords[idx], "target": self.targets[idx]}
 
 
+class TomographyEDSINRDataset(TomographyINRDataset):
+    pass
+
+
 DatasetModelType = TomographyINRDataset | TomographyPixDataset
