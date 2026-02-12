@@ -436,17 +436,24 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         return transformed_rays
 
     @staticmethod
-    @torch.compile(mode="reduce-overhead")
+    # @torch.compile(mode="reduce-overhead")
     def integrate_rays(
-        rays: torch.Tensor, num_samples_per_ray: int, target_values_len: int
+        rays: torch.Tensor,
+        num_samples_per_ray: int,
+        target_values_len: int,
     ) -> torch.Tensor:
-        ray_densities = rays.view(
-            target_values_len,
-            num_samples_per_ray,
-        )
         step_size = 2.0 / (num_samples_per_ray - 1)
 
-        predicted_values = ray_densities.sum(dim=1) * step_size
+        if rays.shape[1] > 1:
+            ray_densities = rays.view(target_values_len, num_samples_per_ray, rays.shape[1])
+            predicted_values = ray_densities.sum(axis=1, keepdim=True) * step_size
+            predicted_values = predicted_values.squeeze(1)
+        else:
+            ray_densities = rays.view(
+                target_values_len,
+                num_samples_per_ray,
+            )
+            predicted_values = ray_densities.sum(axis=1, keepdim=True) * step_size
 
         return predicted_values
 
@@ -545,7 +552,39 @@ class TomographyINRPretrainDataset(Dataset):
 
 
 class TomographyEDSINRDataset(TomographyINRDataset):
-    pass
+    def __init__(
+        self,
+        tilt_stack: NDArray
+        | torch.Tensor,  # (C, M, N, N), this is a Dataset4D not sure if we have that yet.
+        tilt_angles: NDArray | torch.Tensor,
+        learn_shift: bool = True,
+        learn_tilt_axis: bool = True,
+        seed: int = 42,
+        token: object | None = None,
+    ):
+        super().__init__(tilt_stack, tilt_angles, learn_shift, learn_tilt_axis, seed, token)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        C, P, H, W = self.tilt_stack.shape
+
+        projection_idx = idx // (H * W)
+        remaining = idx % (H * W)
+
+        pixel_i = remaining // W
+        pixel_j = remaining % W
+
+        target_value = self.tilt_stack[:, projection_idx, pixel_i, pixel_j]  # (C,)
+
+        return {
+            "projection_idx": torch.tensor(projection_idx),
+            "pixel_i": torch.tensor(pixel_i),
+            "pixel_j": torch.tensor(pixel_j),
+            "phi": self.tilt_angles[projection_idx],
+            "target_value": target_value,  # (C,)
+        }
+
+    def __len__(self):
+        return self.tilt_stack.shape[1] * self.tilt_stack.shape[2] * self.tilt_stack.shape[3]
 
 
 DatasetModelType = TomographyINRDataset | TomographyPixDataset

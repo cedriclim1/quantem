@@ -418,11 +418,13 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
         if all_densities.dim() > 1:
             all_densities = all_densities.squeeze(-1)
-
         valid_mask = (
             (coords[:, 0] >= -1) & (coords[:, 0] <= 1) & (coords[:, 1] >= -1) & (coords[:, 1] <= 1)
         ).float()
 
+        if all_densities.dim() > 1:
+            valid_mask = valid_mask.unsqueeze(-1)
+        # Multi-dimensional mask
         all_densities = all_densities * valid_mask
 
         all_densities = self.apply_hard_constraints(all_densities)
