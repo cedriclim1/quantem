@@ -122,7 +122,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 print("num_samples_per_ray schedule provided.")
 
         print(f"N: {N}, num_samples_per_ray: {num_samples_per_ray}")
-        for a0 in range(num_iter):
+        for a0 in tqdm(range(num_iter), desc="Epochs"):
             consistency_loss = 0.0
             total_loss = 0.0
             epoch_soft_constraint_loss = 0.0
@@ -149,12 +149,17 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 ):
                     all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
                     all_densities = self.obj_model.forward(all_coords)
-
                     integrated_densities = self.dset.integrate_rays(
                         all_densities,
                         curr_num_samples_per_ray,
                         len(batch["target_value"]),
                     )
+
+                    if "eds_signal" in batch:
+                        # eds_signal: [1, N] -> [N]
+                        eds = batch["eds_signal"].reshape(-1)  # bool, shape [N]
+
+                        integrated_densities[~eds, 1:] = 0
 
                 pred = integrated_densities.float()
 

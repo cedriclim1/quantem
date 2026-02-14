@@ -436,7 +436,7 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         return transformed_rays
 
     @staticmethod
-    # @torch.compile(mode="reduce-overhead")
+    @torch.compile(mode="reduce-overhead")
     def integrate_rays(
         rays: torch.Tensor,
         num_samples_per_ray: int,
@@ -566,13 +566,13 @@ class TomographyEDSINRDataset(TomographyINRDataset):
         """
         Since we have to implement sparse view EDS signals, we need to modify this dataset to handle this.
         """
-
         self.sparse_view_tilt_angles = sparse_view_tilt_angles
         self.eds_signals_tilt_stack = eds_signals_tilt_stack
         super().__init__(haadf_tilt_stack, tilt_angles, learn_shift, learn_tilt_axis, seed, token)
+        self.tilt_stack = self.tilt_stack.unsqueeze(0)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        C, P, H, W = self.tilt_stack.shape
+        _, _, H, W = self.tilt_stack.shape
 
         projection_idx = idx // (H * W)
         remaining = idx % (H * W)
@@ -580,16 +580,23 @@ class TomographyEDSINRDataset(TomographyINRDataset):
         pixel_i = remaining // W
         pixel_j = remaining % W
 
-        target_value = self.tilt_stack[projection_idx, pixel_i, pixel_j]  # (C,)
+        target_value = self.tilt_stack[:, projection_idx, pixel_i, pixel_j]  # (C,)
 
         if self.tilt_angles[projection_idx] in self.sparse_view_tilt_angles:
             eds_signal = True
-            target_value = torch.stack(
-                [target_value, self.eds_signals_tilt_stack[projection_idx, pixel_i, pixel_j]],
+            target_value = torch.cat(
+                [
+                    target_value,
+                    self.eds_signals_tilt_stack[:, projection_idx // 10, pixel_i, pixel_j],
+                ],
                 dim=0,
             )
+
         else:
             eds_signal = False
+            target_value = torch.cat(
+                [target_value, torch.zeros(self.eds_signals_tilt_stack.shape[0])], dim=0
+            )
 
         return {
             "projection_idx": torch.tensor(projection_idx),
@@ -601,7 +608,9 @@ class TomographyEDSINRDataset(TomographyINRDataset):
         }
 
     def __len__(self):
-        return self.tilt_stack.shape[1] * self.tilt_stack.shape[2] * self.tilt_stack.shape[3]
+        return (
+            self.tilt_stack.shape[1] * self.tilt_stack.shape[2] * self.tilt_stack.shape[3]
+        )  # +  self.eds_signals_tilt_stack.shape[0] * self.eds_signals_tilt_stack.shape[1] * self.eds_signals_tilt_stack.shape[2] * self.eds_signals_tilt_stack.shape[3]
 
     @property
     def sparse_view_tilt_angles(self) -> NDArray | torch.Tensor:
@@ -616,7 +625,12 @@ class TomographyEDSINRDataset(TomographyINRDataset):
         return self._eds_signals_tilt_stack
 
     @eds_signals_tilt_stack.setter
-    def eds_signals_tilt_stack(self, eds_signals_tilt_stack: torch.Tensor):
+    def eds_signals_tilt_stack(self, eds_signals_tilt_stack: torch.Tensor | NDArray):
+        max_val = np.quantile(eds_signals_tilt_stack, 0.95, axis=(1, 2, 3), keepdims=False)
+        eds_signals_tilt_stack /= max_val[:, None, None, None]
+        if not isinstance(eds_signals_tilt_stack, torch.Tensor):
+            eds_signals_tilt_stack = torch.from_numpy(eds_signals_tilt_stack)
+
         self._eds_signals_tilt_stack = eds_signals_tilt_stack
 
 
