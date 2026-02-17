@@ -321,23 +321,26 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     ) -> torch.Tensor:
         soft_loss = torch.tensor(0.0, device=coords.device)
         if self.constraints.tv_vol > 0:
-            num_tv_samples = min(10000, coords.shape[0])
+            num_tv_samples = min(10_000, coords.shape[0])
             tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
 
             tv_coords = coords[tv_indices].detach().requires_grad_(True)
-
             tv_densities_recomputed = self.model(tv_coords)
-            if tv_densities_recomputed.dim() > 1:
-                tv_densities_recomputed = tv_densities_recomputed.squeeze(-1)
+            # raise ValueError("Stop here")
+            # Ensure shape is [num_samples, num_channels]
+            if tv_densities_recomputed.dim() == 1:
+                tv_densities_recomputed = tv_densities_recomputed.unsqueeze(-1)
 
+            # Compute gradients for each channel
             grad_outputs = torch.autograd.grad(
                 outputs=tv_densities_recomputed,
                 inputs=tv_coords,
                 grad_outputs=torch.ones_like(tv_densities_recomputed),
                 create_graph=True,
-            )[0]
+            )[0]  # Shape: [num_samples, coord_dim]
 
-            grad_norm = torch.norm(grad_outputs, dim=1)
+            # Compute TV loss - gradient magnitude per sample
+            grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
             soft_loss += self.constraints.tv_vol * grad_norm.mean()
 
         return soft_loss
@@ -521,10 +524,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             )
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
 
-    def create_volume(
-        self,
-        return_vol: bool = False,
-    ):
+    def create_volume(self, return_vol: bool = False):
         N = max(self._shape)
         with torch.no_grad():
             coords_1d = torch.linspace(-1, 1, N)
@@ -537,30 +537,40 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             total_samples = N**3
             samples_per_gpu = total_samples // self.world_size
             remainder = total_samples % self.world_size
+
             if self.global_rank < remainder:
                 start_idx = self.global_rank * (samples_per_gpu + 1)
                 end_idx = start_idx + samples_per_gpu + 1
             else:
                 start_idx = self.global_rank * samples_per_gpu + remainder
                 end_idx = start_idx + samples_per_gpu
+
             inputs_subset = inputs[start_idx:end_idx]
             num_samples = inputs_subset.shape[0]
+
             outputs_list = []
             for batch_start in range(0, num_samples, inference_batch_size):
                 batch_end = min(batch_start + inference_batch_size, num_samples)
                 batch_coords = inputs_subset[batch_start:batch_end].to(
                     self.device, non_blocking=True
                 )
-                batch_outputs = model(batch_coords)
+
+                batch_outputs = model(batch_coords)  # (B, C) or (B,) etc.
                 batch_outputs = self.apply_hard_constraints(batch_outputs)
-                if batch_outputs.dim() > 1:
-                    batch_outputs = batch_outputs.squeeze(-1)
+
+                # Ensure shape is (B, C)
+                if batch_outputs.dim() == 1:
+                    batch_outputs = batch_outputs.unsqueeze(-1)  # (B, 1)
+
                 outputs_list.append(batch_outputs.cpu())
 
-            outputs = torch.cat(outputs_list, dim=0)
+            outputs = torch.cat(outputs_list, dim=0)  # (local_B, C)
+            C = outputs.shape[-1]  # e.g. 5
 
             if self.world_size > 1:
-                output_size = torch.tensor(outputs.shape[0], device=self.device, dtype=torch.long)
+                # gather variable-sized first dimension (local_B) while keeping channels
+                local_B = outputs.shape[0]
+                output_size = torch.tensor(local_B, device=self.device, dtype=torch.long)
                 all_sizes = [
                     torch.zeros(1, device=self.device, dtype=torch.long)
                     for _ in range(self.world_size)
@@ -568,26 +578,33 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                 dist.all_gather(all_sizes, output_size)
                 max_size = max(size.item() for size in all_sizes)
 
-                if outputs.shape[0] < max_size:
-                    padding = torch.zeros(
-                        max_size - outputs.shape[0], device=outputs.device, dtype=outputs.dtype
+                outputs_dev = outputs.to(self.device)  # (local_B, C)
+                if local_B < max_size:
+                    pad = torch.zeros(
+                        (max_size - local_B, C),
+                        device=self.device,
+                        dtype=outputs_dev.dtype,
                     )
-                    outputs_padded = torch.cat([outputs, padding], dim=0).to(self.device)
+                    outputs_padded = torch.cat([outputs_dev, pad], dim=0)  # (max_size, C)
                 else:
-                    outputs_padded = outputs.to(self.device)
+                    outputs_padded = outputs_dev
 
                 gathered_outputs = [
-                    torch.empty(max_size, device=self.device, dtype=outputs.dtype)
+                    torch.empty((max_size, C), device=self.device, dtype=outputs_dev.dtype)
                     for _ in range(self.world_size)
                 ]
                 dist.all_gather(gathered_outputs, outputs_padded.contiguous())
+
                 trimmed_outputs = []
                 for rank, size in enumerate(all_sizes):
-                    trimmed_outputs.append(gathered_outputs[rank][: size.item()])
+                    trimmed_outputs.append(gathered_outputs[rank][: size.item(), :])
 
-                pred_full = torch.cat(trimmed_outputs, dim=0).reshape(N, N, N).float()
+                pred_full = torch.cat(trimmed_outputs, dim=0).reshape(N, N, N, C).float()
             else:
-                pred_full = outputs.reshape(N, N, N).float()
+                pred_full = outputs.reshape(N, N, N, C).float()
+
+            # If you prefer channels-first volumes, uncomment:
+            # pred_full = pred_full.permute(3, 0, 1, 2).contiguous()  # (C, N, N, N)
 
             if return_vol:
                 return pred_full.detach().cpu()

@@ -587,7 +587,9 @@ class TomographyEDSINRDataset(TomographyINRDataset):
             target_value = torch.cat(
                 [
                     target_value,
-                    self.eds_signals_tilt_stack[:, projection_idx // 10, pixel_i, pixel_j],
+                    self.eds_signals_tilt_stack[
+                        :, projection_idx // 5, pixel_i, pixel_j
+                    ],  # TODO: This needs to be automated
                 ],
                 dim=0,
             )

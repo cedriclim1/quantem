@@ -228,7 +228,9 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
             total_loss, consistency_loss, epoch_soft_constraint_loss = metrics.tolist()
 
             if self.global_rank == 0:
-                print(f"Total Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}")
+                print(
+                    f"Total Loss: {total_loss:.5f}, Consistency Loss: {consistency_loss:.5f}, soft constraint loss: {epoch_soft_constraint_loss:.5f}"
+                )
 
                 if self.val_dataloader:
                     print(f"Validation loss: {avg_val_loss:4f}")
