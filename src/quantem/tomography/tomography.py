@@ -56,6 +56,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
         profiling_mode: bool = False,
         val_fraction: float = 0.0,
         # reset_dset: bool = False,
+        haadf_weight: float = 0.0,
         reset_dset: DatasetModelType | None = None,
     ):
         """
@@ -167,6 +168,13 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
 
                 batch_consistency_loss = torch.nn.functional.mse_loss(pred, target)
 
+                if haadf_weight > 0.0:
+                    haadf_signal = pred[:, 0]
+                    chemical_signals = pred[:, 1:]
+                    haadf_stack = haadf_signal.repeat(chemical_signals.shape[1])
+                    raise ValueError(f"haadf_stack.shape: {haadf_stack.shape} | HAADF sig: {haadf_stack} | chemical_signals.shape: {chemical_signals.shape} | Chemical signals: {chemical_signals}")
+                    haadf_weighting = haadf_weight * torch.nn.functional.mse_loss(haadf_stack, chemical_signals)
+                    batch_consistency_loss += haadf_weighting
                 soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords)
 
                 epoch_soft_constraint_loss += soft_constraints_loss.detach()
@@ -216,6 +224,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                                 integrated_densities, target
                             )
                             val_loss += batch_val_loss.detach() + soft_constraints_loss.detach()
+
                     avg_val_loss = val_loss.item() / len(self.val_dataloader)
 
             metrics = torch.tensor(
