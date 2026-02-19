@@ -177,7 +177,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
 
                 epoch_soft_constraint_loss += soft_constraints_loss.detach()
 
-                batch_loss = batch_consistency_loss.float() + soft_constraints_loss.detach()
+                batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
 
                 batch_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)

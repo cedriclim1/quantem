@@ -326,7 +326,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
             tv_coords = coords[tv_indices].detach().requires_grad_(True)
             tv_densities_recomputed = self.model(tv_coords)
-            # raise ValueError("Stop here")
             # Ensure shape is [num_samples, num_channels]
             if tv_densities_recomputed.dim() == 1:
                 tv_densities_recomputed = tv_densities_recomputed.unsqueeze(-1)
