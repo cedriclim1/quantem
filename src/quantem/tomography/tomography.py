@@ -186,7 +186,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 consistency_loss += batch_consistency_loss.detach()
 
             self.step_schedulers(loss=total_loss)
-            # TODO: Maybe reorganize the losses so that the order makes sense lol.
+            # TODO: Maybe reorganizgit ae the losses so that the order makes sense lol.
 
             total_loss = total_loss.item() / len(self.dataloader)
             consistency_loss = consistency_loss.item() / len(self.dataloader)
