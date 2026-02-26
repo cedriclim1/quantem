@@ -121,7 +121,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 print("num_samples_per_ray schedule provided.")
 
         print(f"N: {N}, num_samples_per_ray: {num_samples_per_ray}")
-        for a0 in range(num_iter):
+        for a0 in tqdm(range(num_iter), desc="Epoch"):
             consistency_loss = 0.0
             total_loss = 0.0
             epoch_soft_constraint_loss = 0.0
@@ -150,6 +150,11 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
 
                     all_densities = self.obj_model.forward(all_coords)
 
+                    if isinstance(all_densities, tuple):
+                        all_densities = all_densities[0]
+                        ot_reg = all_densities[1]
+                    else:
+                        ot_reg = 0.0
                     integrated_densities = self.dset.integrate_rays(
                         all_densities,
                         curr_num_samples_per_ray,
@@ -163,6 +168,9 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 batch_consistency_loss = torch.nn.functional.mse_loss(pred, target)
 
                 soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords)
+
+                if ot_reg != 0.0:
+                    soft_constraints_loss += ot_reg
 
                 epoch_soft_constraint_loss += soft_constraints_loss.detach()
 

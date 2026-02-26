@@ -475,7 +475,7 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         return self.tilt_stack.shape[0] * N * N
 
     def to(self, device: str):
-        super().to(device)
+        # super().to(device)
         self._z1_params = nn.Parameter(self._z1_angles.to(device))
         self._z3_params = nn.Parameter(self._z3_angles.to(device))
         self._shifts_params = nn.Parameter(self._shifts.to(device))
