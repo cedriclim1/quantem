@@ -712,6 +712,231 @@ class DynamicalSIREN(nn.Module):
         return trainable_params, total_params
 
 
+# ---- ODE building blocks (reuse your SineLayer init/behavior) ----
+
+class HSIrenBlock(nn.Module):
+    """Single H-SIREN block (no residual) for ODE dynamics, with time concatenation already included in dim."""
+    def __init__(
+        self,
+        dim: int,
+        omega_0: float,
+        dropout_rate: float = 0.0,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        super().__init__()
+        self.layer = SineLayer(
+            dim,
+            dim,
+            is_first=False,
+            omega_0=omega_0,
+            hsiren=False,   # only first layer of the *whole net* is sinh
+            dtype=dtype,
+        )
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.layer(x)
+        return self.dropout(x)
+
+
+class HSIrenResidualBlock(nn.Module):
+    """Residual H-SIREN block for ODE dynamics, with time concatenation already included in dim."""
+    def __init__(
+        self,
+        dim: int,
+        omega_0: float,
+        dropout_rate: float = 0.0,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        super().__init__()
+        self.layer1 = SineLayer(
+            dim,
+            dim,
+            is_first=False,
+            omega_0=omega_0,
+            hsiren=False,
+            dtype=dtype,
+        )
+        self.layer2 = SineLayer(
+            dim,
+            dim,
+            is_first=False,
+            omega_0=omega_0,
+            hsiren=False,
+            dtype=dtype,
+        )
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        out = self.layer1(x)
+        out = self.dropout(out)
+        out = self.layer2(out)
+        out = self.dropout(out)
+        return identity + out
+
+
+class ODEFuncHSIREN(nn.Module):
+    """
+    ODE dynamics function v = f(z, t) using your SineLayer-based blocks
+    with concatenation-only time conditioning (exactly like your DynamicalSIREN).
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_layers: int,
+        omega_0_hidden: float,
+        dropout_rate: float = 0.0,
+        block_type: Literal["mlp", "residual"] = "residual",
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        super().__init__()
+
+        block_dim = dim + 1  # time concatenated
+
+        Block = HSIrenResidualBlock if block_type == "residual" else HSIrenBlock
+
+        self.layers = nn.ModuleList(
+            [
+                Block(
+                    dim=block_dim,
+                    omega_0=omega_0_hidden,
+                    dropout_rate=dropout_rate,
+                    dtype=dtype,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        # Project back to dim (remove time channel)
+        self.output_proj = nn.Linear(block_dim, dim, dtype=dtype)
+
+        # Optional: you can match Siren-style final init if you want for this proj.
+        # Keeping it default is also fine; uncomment to mimic SIREN-ish scaling:
+        with torch.no_grad():
+            limit = math.sqrt(6 / block_dim) / omega_0_hidden
+            self.output_proj.weight.uniform_(-limit, limit)
+
+    def forward(self, z: torch.Tensor, t: float | torch.Tensor) -> torch.Tensor:
+        # t can be python float or tensor scalar; we broadcast to (B, 1)
+        if not torch.is_tensor(t):
+            t_val = float(t)
+            t_vec = torch.full((z.shape[0], 1), t_val, device=z.device, dtype=z.dtype)
+        else:
+            # tensor scalar or shape (B,) supported
+            if t.ndim == 0:
+                t_vec = t.expand(z.shape[0]).to(device=z.device, dtype=z.dtype).view(-1, 1)
+            elif t.ndim == 1 and t.shape[0] == z.shape[0]:
+                t_vec = t.to(device=z.device, dtype=z.dtype).view(-1, 1)
+            else:
+                raise ValueError(f"t must be a scalar or shape (B,), got shape {tuple(t.shape)}")
+
+        x = torch.cat([z, t_vec], dim=1)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        return self.output_proj(x)
+
+
+# ---- Main model ----
+
+class DynamicalHSiren(nn.Module):
+    """
+    Dynamical H-SIREN:
+    - Initial embedding uses your H-Siren *first* layer behavior (sinh) via SineLayer(hsiren=True, is_first=True).
+    - ODE dynamics uses standard sine layers (hsiren=False) with time concatenation.
+    - Euler integration + OT regularization identical to your DynamicalSIREN.
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        num_layers: int,
+        omega_0: float = 30.0,
+        omega_0_hidden: float = 30.0,
+        dropout_rate: float = 0.0,
+        block_type: Literal["mlp", "residual"] = "residual",
+        num_steps: int = 10,
+        total_time: float = 1.0,
+        ot_lambda: float = 1.0,
+        dtype: torch.dtype = torch.float32,
+        final_activation: str | Callable = "identity",
+        alpha: float = 1.0,
+    ) -> None:
+        super().__init__()
+
+        self.total_time = float(total_time)
+        self.num_steps = int(num_steps)
+        self.ot_lambda = float(ot_lambda)
+        self.dtype = dtype
+
+        # Initial embedding z(0) = HSiren first layer (sinh) w/ first-layer init
+        # Mirrors your HSiren/Siren._build() first layer construction.
+        self.input_embedding = SineLayer(
+            input_dim,
+            hidden_dim,
+            is_first=True,
+            omega_0=omega_0,
+            hsiren=True,     # THIS is the H-SIREN behavior (sinh in first layer)
+            alpha=alpha,
+            dtype=dtype,
+        )
+
+        # ODE function
+        self.ode_func = ODEFuncHSIREN(
+            dim=hidden_dim,
+            num_layers=num_layers,
+            omega_0_hidden=omega_0_hidden,
+            dropout_rate=dropout_rate,
+            block_type=block_type,
+            dtype=dtype,
+        )
+
+        # Output projection: match your Siren final-layer initialization
+        self.output_proj = nn.Linear(hidden_dim, output_dim, dtype=dtype)
+        with torch.no_grad():
+            limit = math.sqrt(6 / hidden_dim) / omega_0_hidden
+            self.output_proj.weight.uniform_(-limit, limit)
+
+        # Final activation: reuse your existing activation factory for consistency
+        self.final_activation = get_activation_function(final_activation, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: (B, input_dim)
+
+        Returns:
+            output: (B, output_dim)
+            ot_reg: scalar tensor
+        """
+        x = x.to(dtype=self.dtype)
+
+        # z(0)
+        z = self.input_embedding(x)
+
+        dt = self.total_time / self.num_steps
+        ot_accum = z.new_zeros(())  # scalar
+
+        for i in range(self.num_steps):
+            t = i * dt
+            v = self.ode_func(z, t)
+            ot_accum = ot_accum + v.pow(2).mean()
+            z = z + dt * v
+
+        ot_reg = 0.5 * self.ot_lambda * dt * ot_accum
+
+        y = self.output_proj(z)
+        y = self.final_activation(y)
+        return y, ot_reg
+
+    def get_param_count(self) -> Tuple[int, int]:
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        return trainable, total
+
 """
 Dynamical FFNet
 """

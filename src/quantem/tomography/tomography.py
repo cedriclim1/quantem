@@ -168,11 +168,11 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 batch_consistency_loss = torch.nn.functional.mse_loss(pred, target)
 
                 soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords)
-
                 if ot_reg != 0.0:
-                    soft_constraints_loss += ot_reg
+                    # soft_constraints_loss += ot_reg
+                    pass
 
-                epoch_soft_constraint_loss += soft_constraints_loss.detach()
+                epoch_soft_constraint_loss += soft_constraints_loss
 
                 batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
 
@@ -188,7 +188,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
 
             total_loss = total_loss.item() / len(self.dataloader)
             consistency_loss = consistency_loss.item() / len(self.dataloader)
-            epoch_soft_constraint_loss = epoch_soft_constraint_loss.item() / len(self.dataloader)
+            epoch_soft_constraint_loss = epoch_soft_constraint_loss.detach().item() / len(self.dataloader)
 
             if self.val_dataloader is not None:
                 print("Validating...")
@@ -235,7 +235,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
             total_loss, consistency_loss, epoch_soft_constraint_loss = metrics.tolist()
 
             if self.global_rank == 0:
-                print(f"Total Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}")
+                print(f"Total Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}")
 
                 if self.val_dataloader:
                     print(f"Validation loss: {avg_val_loss:4f}")

@@ -348,8 +348,9 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     def apply_soft_constraints(
         self,
         coords: torch.Tensor,
+        pred: torch.Tensor,
     ) -> torch.Tensor:
-        soft_loss = torch.tensor(0.0, device=coords.device)
+        soft_loss = torch.tensor(0.0, device=pred.device)
         if self.constraints.tv_vol > 0:
             num_tv_samples = min(10_000, coords.shape[0])
             tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
@@ -375,6 +376,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
             soft_loss += self.constraints.tv_vol * grad_norm.mean()
 
+        if self.constraints.sparsity > 0:
+            sparsity_loss = self.constraints.sparsity * torch.norm(pred, p=1)
+            soft_loss += sparsity_loss
+            
         return soft_loss
 
     def apply_hard_constraints(self, pred: torch.Tensor) -> torch.Tensor:
@@ -455,6 +460,8 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         if isinstance(all_densities, tuple):
             all_densities = all_densities[0]
             ot_reg = all_densities[1]
+        else:
+            ot_reg = None
 
         if all_densities.dim() > 1:
             all_densities = all_densities.squeeze(-1)
@@ -469,7 +476,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
         all_densities = self.apply_hard_constraints(all_densities)
 
-        if ot_reg != 0.0:
+        if ot_reg is not None:
             return all_densities, ot_reg
         else:
             return all_densities

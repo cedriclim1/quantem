@@ -69,6 +69,16 @@ class LoggerTomography(LoggerBase):
                 f"volume/sum_x_{channel}", pred_volume[channel].sum(axis=2), iter, logger_cmap
             )
 
+            self.log_image(
+                f"slice/slice_z_{channel}", pred_volume[channel][pred_volume.shape[1]//2], iter, logger_cmap
+            )
+            self.log_image(
+                f"slice/slice_y_{channel}", pred_volume[channel][:, pred_volume.shape[2]//2], iter, logger_cmap
+            )
+            self.log_image(
+                f"slice/slice_x_{channel}", pred_volume[channel][:, :, pred_volume.shape[3]//2], iter, logger_cmap
+            )
+
         # Plotting z1 and z3 vals
         print("Plotting z1 and z3 angles...")
         fig, ax = plt.subplots()
