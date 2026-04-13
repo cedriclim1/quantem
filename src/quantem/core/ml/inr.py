@@ -255,3 +255,6 @@ class HSiren(Siren):
             final_activation=final_activation,
             winner_initialization=winner_initialization,
         )
+
+
+# Tensor Decomposition Methods
