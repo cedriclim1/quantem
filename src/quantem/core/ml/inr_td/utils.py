@@ -119,3 +119,23 @@ def query_planes(
         result = result * sampled
     return result  # pyright: ignore[reportReturnType]
  
+
+def interpolate_ms_features(
+    pts: torch.Tensor,
+    ms_grids: nn.ModuleList,
+) -> torch.Tensor:
+    coo_combs = list(itertools.combinations(range(3), 2))  # [(0,1), (0,2), (1,2)]
+    multi_scale_interp = []
+
+    for grid in ms_grids:
+        interp_space = 1.
+        for ci, coo_comb in enumerate(coo_combs):
+            feature_dim = grid[ci].shape[1]
+            interp_out_plane = (
+                grid_sample_wrapper(grid[ci], pts[..., coo_comb])
+                .view(-1, feature_dim)
+            )
+            interp_space = interp_space * interp_out_plane
+        multi_scale_interp.append(interp_space)
+
+    return torch.cat(multi_scale_interp, dim=-1)

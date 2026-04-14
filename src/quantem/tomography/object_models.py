@@ -552,9 +552,14 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     # --- Optimization Parameters ---
     @property
     def params(self) -> Generator[torch.nn.Parameter, None, None]:
+        if hasattr(self.model, "get_params"):
+            return self.model.get_params()
         return self.model.parameters()  # type: ignore[attr-defined]
 
-    def get_optimization_parameters(self) -> list[nn.Parameter]:
+    def get_optimization_parameters(self) -> list[nn.Parameter] | dict[str, nn.Parameter]:
+        
+        if isinstance(self.params, dict):
+            return self.params
         return list(self.params)
 
     # Pretraining
