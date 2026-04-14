@@ -583,7 +583,7 @@ class OptimizerMixin:
     @abstractmethod
     def get_optimization_parameters(
         self,
-    ) -> "torch.Tensor | Sequence[torch.Tensor] | Iterator[torch.Tensor]":
+    ) -> "torch.Tensor | Sequence[torch.Tensor] | Iterator[torch.Tensor] | list[torch.nn.Parameter] | dict[str, torch.nn.Parameter]":
         """
         Get the parameters that should be optimized for this model.
         This could be replaced with just module.parameters(), but this allows for flexibility
