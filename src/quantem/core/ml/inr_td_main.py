@@ -90,10 +90,10 @@ class KPlanes(nn.Module):
     ):
         return self.get_densities(pts)
 
-    def get_params(self) -> dict[str, torch.nn.Parameter]:
+    def get_params(self) -> dict[str, list[torch.nn.Parameter]]:
         return {
-            "grids": list(self.grids),
-            "sigma_net": self.sigma_net,
+            "grids": [p for grid in self.grids for p in grid],  # flatten ParameterLists
+            "sigma_net": list(self.sigma_net.parameters()),
         }
 
  
