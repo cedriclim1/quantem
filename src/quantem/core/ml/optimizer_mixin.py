@@ -196,6 +196,11 @@ class OptimizerParams:
         Accepts either ``"name"`` or ``"type"`` as the optimizer key.
         """
 
+        if not isinstance(d, dict):
+            return d
+
+        if any(not isinstance(v, (str, int, float, bool, type)) for v in d.values()):
+            return {k: cls.parse_dict(v) for k, v in d.items()}
         d = dict(d)  # avoid mutating caller's dict
         name = d.pop("name", None)
         type_ = d.pop("type", None)
@@ -226,6 +231,8 @@ OptimizerType = (
     | OptimizerParams.SGD
     | OptimizerParams.NoneOptimizer
 )
+
+
 
 
 class SchedulerParams:
@@ -559,9 +566,11 @@ class OptimizerMixin:
     @optimizer_params.setter
     def optimizer_params(self, params: OptimizerType | dict):
         """Set the optimizer parameters."""
-
         if isinstance(params, dict):
             params = OptimizerParams.parse_dict(d=params)
+
+            self._optimizer_params = params
+            return
         if not isinstance(params, OptimizerType):
             raise TypeError(f"optimizer parameters must be a OptimizerType, got {type(params)}")
         self._optimizer_params = params
@@ -591,7 +600,7 @@ class OptimizerMixin:
         """
         raise NotImplementedError("Subclasses must implement get_optimization_parameters")
 
-    def set_optimizer(self, opt_params: OptimizerType | dict | None = None) -> None:
+    def set_optimizer(self, opt_params: OptimizerType) -> None:
         """
         Set the optimizer for this model.
         Currently supports single LR for all parameters, TODO allow for per parameter LRs by
@@ -613,20 +622,46 @@ class OptimizerMixin:
             params = [params]
         elif isinstance(params, Generator):
             params = list(params)
+        elif isinstance(params, dict):
+            params = params
 
         # Ensure parameters require gradients
-        for p in params:
-            p.requires_grad_(True)
+        if isinstance(params, list):
+            for p in params:
+                p.requires_grad_(True)
 
-        match self._optimizer_params:
-            case OptimizerParams.Adam():
-                self._optimizer = torch.optim.Adam(params, **self._optimizer_params.params())
-            case OptimizerParams.AdamW():
-                self._optimizer = torch.optim.AdamW(params, **self._optimizer_params.params())
-            case OptimizerParams.SGD():
-                self._optimizer = torch.optim.SGD(params, **self._optimizer_params.params())
-            case _:
-                raise NotImplementedError(f"Unknown optimizer type: {self._optimizer_params}")
+            match self._optimizer_params:
+                case OptimizerParams.Adam():
+                    self._optimizer = torch.optim.Adam(params, **self._optimizer_params.params())
+                case OptimizerParams.AdamW():
+                    self._optimizer = torch.optim.AdamW(params, **self._optimizer_params.params())
+                case OptimizerParams.SGD():
+                    self._optimizer = torch.optim.SGD(params, **self._optimizer_params.params())
+                case _:
+                    raise NotImplementedError(f"Unknown optimizer type: {self._optimizer_params}")
+        elif isinstance(params, dict):
+            for key, values in params.items():
+                for p in values:
+                    p.requires_grad_(True)
+
+            self._optimizer = {}
+            for key, values in params.items():
+                # Get per-key OptimizerParams if available, else fall back to global
+                key_params = (
+                    self._optimizer_params[key]
+                    if isinstance(self._optimizer_params, dict)
+                    else self._optimizer_params
+                )
+                match key_params:
+                    case OptimizerParams.Adam():
+                        self._optimizer[key] = torch.optim.Adam(values, **key_params.params())
+                    case OptimizerParams.AdamW():
+                        self._optimizer[key] = torch.optim.AdamW(values, **key_params.params())
+                    case OptimizerParams.SGD():
+                        self._optimizer[key] = torch.optim.SGD(values, **key_params.params())
+                    case _:
+                        raise NotImplementedError(f"Unknown optimizer type: {key_params}")
+
 
     def set_scheduler(
         self, scheduler_params: SchedulerType | dict | None = None, num_iter: int | None = None
