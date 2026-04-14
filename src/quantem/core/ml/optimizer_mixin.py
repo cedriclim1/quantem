@@ -190,14 +190,12 @@ class OptimizerParams:
             """).strip()
 
     @classmethod
-    def parse_dict(cls, d: dict | torch.optim.Optimizer):
+    def parse_dict(cls, d: dict):
         """
         Parse dictionary to a optimizer params object.
         Accepts either ``"name"`` or ``"type"`` as the optimizer key.
         """
 
-        if isinstance(d, torch.optim.Optimizer):
-            return d
         d = dict(d)  # avoid mutating caller's dict
         name = d.pop("name", None)
         type_ = d.pop("type", None)
@@ -564,11 +562,7 @@ class OptimizerMixin:
 
         if isinstance(params, dict):
             params = OptimizerParams.parse_dict(d=params)
-        if isinstance(params, torch.optim.Optimizer):
-            self._optimizer = params
-            return
-        if not isinstance(params, OptimizerType) or not isinstance(params, torch.optim.Optimizer):
-            print(params)
+        if not isinstance(params, OptimizerType):
             raise TypeError(f"optimizer parameters must be a OptimizerType, got {type(params)}")
         self._optimizer_params = params
 
@@ -622,11 +616,7 @@ class OptimizerMixin:
 
         # Ensure parameters require gradients
         for p in params:
-            if isinstance(p, dict):
-                for tensor in p["params"]:
-                    tensor.requires_grad_(True)
-            elif isinstance(p, torch.Tensor):
-                p.requires_grad_(True)
+            p.requires_grad_(True)
 
         match self._optimizer_params:
             case OptimizerParams.Adam():
