@@ -76,10 +76,6 @@ class TomographyOpt(TomographyBase):
                 self.obj_model.set_optimizer(params)
             elif key == "pose":
                 self.dset.set_optimizer(params)
-            elif key == "grids":
-                self.obj_model.set_optimizer({"grids": params})
-            elif key == "sigma_net":
-                self.obj_model.set_optimizer({"sigma_net": params})
             else:
                 raise ValueError(f"Unknown optimization key: {key}")
 

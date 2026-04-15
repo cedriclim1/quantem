@@ -2,14 +2,14 @@
 Tensor Decomposition Methods for INR-based reconstructions
 """
 
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import tinycudann as tcnn
+import torch
 import torch.nn.functional as F
 from torch import nn
-import torch
 
-from .inr_td.utils import init_planes, query_planes, interpolate_ms_features
+from .inr_td.utils import init_planes, interpolate_ms_features, query_planes
 
 # -----------------------------------------------------------------------------
 # K-Planes Utilty Functions
@@ -41,6 +41,7 @@ class KPlanes(nn.Module):
         self.multiscale_res_multipliers = multiscale_res_multipliers or [1]
         self.concat_features = concat_features
         self.density_activation = density_activation
+
         
         # Initialize planes
         self.grids = nn.ParameterList()
@@ -72,6 +73,8 @@ class KPlanes(nn.Module):
             },
         )
 
+
+
     def get_densities(self, coords: torch.Tensor):
         """Computes and returns densities"""
 
@@ -97,9 +100,19 @@ class KPlanes(nn.Module):
         }
 
  
- 
+    def set_optimizer(self, optimizer_params: dict[str, Any]):
+        
+        self._grids.set_optimizer(optimizer_params["grids"])
+        self._sigmanet.set_optimizer(optimizer_params["sigmanet"])
 
- 
+
+    
+    def get_params(self) -> dict[str, list[torch.nn.Parameter]]:
+        return {
+            "grids": self._grids.params  # flatten ParameterLists
+            "sigma_net": self._sigma_net.params
+        }
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------

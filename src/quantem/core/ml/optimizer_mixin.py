@@ -549,7 +549,7 @@ class OptimizerMixin:
         # Don't call super().__init__() in mixin classes to avoid MRO issues
 
     @property
-    def optimizer(self) -> "torch.optim.Optimizer | None":
+    def optimizer(self) -> "torch.optim.Optimizer | dict | None":
         """Get the optimizer for this model."""
         return self._optimizer
 
