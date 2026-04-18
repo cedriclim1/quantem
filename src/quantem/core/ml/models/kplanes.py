@@ -10,7 +10,7 @@ import tinycudann as tcnn
 import torch
 import torch.nn.functional as F
 from torch import nn
-
+from quantem.core.ml.profiling import nvtx_range
 from .model_base import PPLR
 
 """
@@ -377,59 +377,38 @@ class SO3Param(nn.Module):
         diag[:, 2] = d                          # multiply last singular vector by sign
         return U @ (diag.unsqueeze(-1) * Vh)   # (T, 3, 3)
 
-def interpolate_ms_features_tilted(
-    pts: torch.Tensor,             # (B, 3)
-    ms_grids: nn.ParameterList,    # each grid: (3*T, C, H, W)
-    rotation_matrices: torch.Tensor,  # (T, 3, 3)
-) -> torch.Tensor:
-    """
-    Fully-vectorized multi-scale, multi-rotation K-Planes feature interpolation.
-    Returns features of shape (B, C * T * num_scales).
-    """
-    T = rotation_matrices.shape[0]
-    B = pts.shape[0]
+@torch.compile(mode="reduce-overhead")
+def interpolate_ms_features_tilted(pts, ms_grids, rotation_matrices):
 
-    # (T, B, 3)  — rotate all points by all rotations at once
-    rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
+    with nvtx_range(enabled=True, name="setup"):
+        T = rotation_matrices.shape[0]
+        B = pts.shape[0]
 
-    # Build (T, 3, B, 2) coords for planes XY, ZX, YZ in one shot.
-    # index_select is faster and cleaner than advanced indexing with python lists.
-    # Plane axis layout: XY=(0,1), ZX=(2,0), YZ=(1,2)
-    idx = torch.tensor([[0, 1],
-                        [2, 0],
-                        [1, 2]], device=pts.device)                  # (3, 2)
-    # rotated: (T, B, 3) -> gather along last dim with idx (3, 2)
-    # Result: (T, 3, B, 2)
-    coords = rotated.unsqueeze(1).expand(T, 3, B, 3).gather(
-        -1, idx.view(1, 3, 1, 2).expand(T, 3, B, 2)
-    )
+    with nvtx_range(enabled=True, name="rotate"):
+        rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
 
-    # Flatten (T, 3) -> 3*T so it matches grid's first dim, and add the H_out=1 axis
-    coord_tensor = coords.reshape(3 * T, B, 1, 2)                    # (3T, B, 1, 2)
-
-    per_scale_features = []
-    for plane_coef in ms_grids:
-        # plane_coef: (3T, C, H, W)
-        C = plane_coef.shape[1]
-
-        sampled = F.grid_sample(
-            plane_coef,
-            coord_tensor,
-            align_corners=True,
-            mode="bilinear",
-            padding_mode="border",
-        )  # (3T, C, B, 1)
-
-        # (3T, C, B) -> (T, 3, C, B) -> Hadamard across the "3" dim -> (T, C, B)
-        sampled = sampled.squeeze(-1).view(T, 3, C, B).prod(dim=1)
-
-        # (T, C, B) -> (B, T, C) -> (B, T*C) to concatenate rotations along feature dim
-        per_scale_features.append(
-            sampled.permute(2, 0, 1).reshape(B, T * C)
+    with nvtx_range(enabled=True, name="build_coords"):
+        idx = torch.tensor([[0, 1], [2, 0], [1, 2]], device=pts.device)
+        coords = rotated.unsqueeze(1).expand(T, 3, B, 3).gather(
+            -1, idx.view(1, 3, 1, 2).expand(T, 3, B, 2)
         )
+        coord_tensor = coords.reshape(3 * T, B, 1, 2).contiguous()
 
-    # Concatenate across scales -> (B, T * C * num_scales)
-    return torch.cat(per_scale_features, dim=-1)
+    with nvtx_range(enabled=True, name="per_scale_features"):
+        per_scale_features = []
+        for i, plane_coef in enumerate(ms_grids):
+            C = plane_coef.shape[1]
+            with nvtx_range(enabled=True, name=f"grid_sample_s{i}"):
+                sampled = F.grid_sample(
+                    plane_coef, coord_tensor,
+                    align_corners=True, mode="bilinear", padding_mode="border",
+                )
+            with nvtx_range(enabled=True, name=f"hadamard_s{i}"):
+                sampled = sampled.squeeze(-1).view(T, 3, C, B).prod(dim=1)
+                per_scale_features.append(sampled.permute(2, 0, 1).reshape(B, T * C))
+
+    with nvtx_range(enabled=True, name="cat_scales"):
+        return torch.cat(per_scale_features, dim=-1)
 
 # ---------------------------------------------------------------------------
 # KPlanesTILTED
@@ -606,16 +585,17 @@ class KPlanesTILTED(KPlanes):
     # Core forward
     # ------------------------------------------------------------------
  
-    def get_densities(self, coords: torch.Tensor) -> torch.Tensor:
+    def get_densities(self, coords):
         pts = coords.reshape(-1, 3)
-        R = self.so3.as_matrix()                       # (T, 3, 3)
-        features = interpolate_ms_features_tilted(
-            pts=pts,
-            ms_grids=self.grids,
-            rotation_matrices=R,
-        )
-        density_before_activation = self.sigma_net(features)
-        return self.density_activation(density_before_activation)
+        with nvtx_range(enabled=True, name="tilted_interp"):
+            with nvtx_range(enabled=True, name="so3_as_matrix"):
+                R = self.so3.as_matrix()
+            with nvtx_range(enabled=True, name="interpolate_ms_features_tilted"):
+                features = interpolate_ms_features_tilted(pts, self.grids, R)
+        with nvtx_range(enabled=True, name="sigma_net"):
+            density_pre = self.sigma_net(features)
+        with nvtx_range(enabled=True, name="density_act"):
+            return self.density_activation(density_pre)
  
     def forward(self, pts: torch.Tensor) -> torch.Tensor:
         return self.get_densities(pts)

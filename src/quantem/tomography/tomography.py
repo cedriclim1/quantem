@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml.loss_functions import get_loss_module
+from quantem.core.ml.profiling import nvtx_range
 from quantem.core.utils.filter import gaussian_filter_2d_stack, gaussian_kernel_1d
 from quantem.core.utils.tomography_utils import torch_phase_cross_correlation
 from quantem.tomography.dataset_models import (
@@ -176,71 +177,84 @@ class Tomography(TomographyOpt, TomographyBase):
 
         pbar = tqdm(range(num_iter), disable=not self.verbose)
         for a0 in pbar:
-            consistency_loss = torch.tensor(0.0, device=self.device)
-            total_loss = torch.tensor(0.0, device=self.device)
-            epoch_soft_constraint_loss = torch.tensor(0.0, device=self.device)
-            if isinstance(self.obj_model, ObjectINR):
-                self.obj_model.model.train()
-            else:
-                raise NotImplementedError(
-                    "AD Pixelated reconstruction is not yet implemented. Use ObjectINR instead."
-                )
-            self.dset.train()
-            # self._reset_iter_constraints()
-
-            if self.sampler is not None:
-                self.sampler.set_epoch(a0)
-
-            if isinstance(num_samples_per_ray, list):
-                curr_num_samples_per_ray = num_samples_per_ray[a0][1]
-            else:
-                curr_num_samples_per_ray = num_samples_per_ray
-
-            for batch_idx, batch in enumerate(self.dataloader):
-                self.zero_grad_all()
-                with torch.autocast(
-                    device_type=self.device.type,
-                    dtype=torch.bfloat16,
-                    enabled=False,
-                ):
-                    all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
-
-                    all_densities = self.obj_model.forward(all_coords)
-
-                    integrated_densities = self.dset.integrate_rays(
-                        all_densities,
-                        curr_num_samples_per_ray,
-                        len(batch["target_value"]),
+            with nvtx_range(enabled=profiling_mode, name=f"iter_{a0}"):
+                consistency_loss = torch.tensor(0.0, device=self.device)
+                total_loss = torch.tensor(0.0, device=self.device)
+                epoch_soft_constraint_loss = torch.tensor(0.0, device=self.device)
+                if isinstance(self.obj_model, ObjectINR):
+                    self.obj_model.model.train()
+                else:
+                    raise NotImplementedError(
+                        "AD Pixelated reconstruction is not yet implemented. Use ObjectINR instead."
                     )
+                self.dset.train()
+                # self._reset_iter_constraints()
 
-                pred = integrated_densities.float()
-                soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords, all_densities, pred)
+                if self.sampler is not None:
+                    self.sampler.set_epoch(a0)
 
-                target = batch["target_value"].to(self.device, non_blocking=True).float()
+                if isinstance(num_samples_per_ray, list):
+                    curr_num_samples_per_ray = num_samples_per_ray[a0][1]
+                else:
+                    curr_num_samples_per_ray = num_samples_per_ray
 
-                batch_consistency_loss = loss_func(pred, target)
 
-                soft_constraints_loss += self.dset.apply_soft_constraints()
+                    for batch_idx, batch in enumerate(self.dataloader):
+                        self.zero_grad_all()
+                        with torch.autocast(
+                            device_type=self.device.type,
+                            dtype=torch.bfloat16,
+                            enabled=False,
+                        ):
 
-                epoch_soft_constraint_loss += soft_constraints_loss.detach()
+                            with nvtx_range(enabled=profiling_mode, name=f"get_coords_{batch_idx}"):
+                                all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
 
-                batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
+                            with nvtx_range(enabled=profiling_mode, name=f"forward_{batch_idx}"):
+                                all_densities = self.obj_model.forward(all_coords)
 
-                batch_loss.backward()
-                # Clip gradients
-                torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)
-                self.step_optimizers()
-                total_loss += batch_loss.detach()
-                consistency_loss += batch_consistency_loss.detach()
+                            with nvtx_range(enabled=profiling_mode, name=f"integrate_rays_{batch_idx}"):
+                                integrated_densities = self.dset.integrate_rays(
+                                    all_densities,
+                                    curr_num_samples_per_ray,
+                                    len(batch["target_value"]),
+                                )
+
+                        pred = integrated_densities.float()
+
+                        with nvtx_range(enabled=profiling_mode, name=f"apply_soft_constraints_{batch_idx}"):
+                            soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords, all_densities, pred)
+
+                        target = batch["target_value"].to(self.device, non_blocking=True).float()
+
+                        batch_consistency_loss = loss_func(pred, target)
+
+                        soft_constraints_loss += self.dset.apply_soft_constraints()
+
+                        epoch_soft_constraint_loss += soft_constraints_loss.detach()
+
+                        batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
+
+                        with nvtx_range(enabled=profiling_mode, name=f"backward_{batch_idx}"):
+                            batch_loss.backward()
+                        # Clip gradients
+                        with nvtx_range(enabled=profiling_mode, name=f"clip_grads_{batch_idx}"):
+                            torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)
+                        with nvtx_range(enabled=profiling_mode, name=f"step_optimizers_{batch_idx}"):
+                            self.step_optimizers()
+                        with nvtx_range(enabled=profiling_mode, name=f"update_losses_detach_{batch_idx}"):
+                            total_loss += batch_loss.detach()
+                            consistency_loss += batch_consistency_loss.detach()
 
             if self.world_size > 1:
                 dist.all_reduce(total_loss, dist.ReduceOp.AVG)
                 dist.all_reduce(consistency_loss, dist.ReduceOp.AVG)
                 dist.all_reduce(epoch_soft_constraint_loss, dist.ReduceOp.AVG)
-
-            total_loss = total_loss.item() / len(self.dataloader)
-            consistency_loss = consistency_loss.item() / len(self.dataloader)
-            epoch_soft_constraint_loss = epoch_soft_constraint_loss.item() / len(self.dataloader)
+            
+            with nvtx_range(enabled=profiling_mode, name="compute_losses"):
+                total_loss = total_loss.item() / len(self.dataloader)
+                consistency_loss = consistency_loss.item() / len(self.dataloader)
+                epoch_soft_constraint_loss = epoch_soft_constraint_loss.item() / len(self.dataloader)
 
             self.step_schedulers(loss=total_loss)
             # TODO: Maybe reorganize the losses so that the order makes sense lol.
@@ -280,10 +294,11 @@ class Tomography(TomographyOpt, TomographyBase):
                             val_loss += batch_val_loss.detach()
 
                     avg_val_loss = val_loss.item() / len(self.val_dataloader)
-
-            metrics = torch.tensor(
-                [total_loss, consistency_loss, epoch_soft_constraint_loss], device=self.device
-            )
+            
+            with nvtx_range(enabled=profiling_mode, name="compute_metrics"):
+                metrics = torch.tensor(
+                    [total_loss, consistency_loss, epoch_soft_constraint_loss], device=self.device
+                )
 
             if self.world_size > 1:
                 dist.all_reduce(metrics, dist.ReduceOp.AVG)
@@ -294,10 +309,11 @@ class Tomography(TomographyOpt, TomographyBase):
                 f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}"
             )
 
-            self._epoch_losses.append(total_loss)
-            self._consistency_losses.append(consistency_loss)
-            self.append_learning_rates(self.get_current_lrs())
-            self.obj_model._soft_constraint_losses.append(epoch_soft_constraint_loss)
+            with nvtx_range(enabled=profiling_mode, name="append_metrics"):
+                self._epoch_losses.append(total_loss)
+                self._consistency_losses.append(consistency_loss)
+                self.append_learning_rates(self.get_current_lrs())
+                self.obj_model._soft_constraint_losses.append(epoch_soft_constraint_loss)
             if avg_val_loss is not None:
                 self._val_losses.append(avg_val_loss)
 

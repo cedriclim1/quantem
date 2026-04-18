@@ -100,6 +100,7 @@ class DDPMixin:
             sampler=train_sampler,
             shuffle=shuffle,
             pin_memory=pin_mem,
+            prefetch_factor=4,
             drop_last=True,
             persistent_workers=persist,
             multiprocessing_context="spawn",
