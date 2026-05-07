@@ -8,6 +8,7 @@ Getting started:
 - `git clone` the repo and `cd` into the directory
 - run `uv sync` to install all the dependencies in an editable environment
 - run `uv sync --all-packages` to also install `quantem.widget` (optional)
+- run `uv sync --python 3.14 --extra tomography` to also install [FastTomo](https://github.com/cedriclim1/FastTomo) and a venv-local CUDA 13.0 toolkit (optional; requires Python 3.14)
 
 For widget developers (requires [Node.js](https://nodejs.org/)):
 
