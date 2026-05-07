@@ -35,7 +35,7 @@ members = ["widget"]
 
 [tool.uv.sources]
 "quantem.widget" = { workspace = true }
-fasttomo = { git = "https://github.com/cedriclim1/FastTomo.git", branch = "feat/pip-cuda-toolkit-detect" }
+fasttomo = { git = "https://github.com/cedriclim1/FastTomo.git" }
 
 [project]
 name = "quantem"
