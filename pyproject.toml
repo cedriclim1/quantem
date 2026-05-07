@@ -44,7 +44,7 @@ description = "quantitative electron microscopy analysis toolkit."
 keywords = ["EM","TEM","STEM","4DSTEM"]
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
   "colorspacious",
   "dill",
@@ -71,22 +71,26 @@ widgets = [
     "quantem.widget",
 ]
 tomography = [
-    "fasttomo",
-    # CUDA toolkit wheels — gated to platforms where they actually
-    # publish (linux x86_64/aarch64, win_amd64). On macOS/other arches
-    # they're omitted and FastTomo's CMake falls back to a CPU-only
-    # build.
+    # The tomography extra is gated to Python >= 3.14 pending validation
+    # on older interpreters. On Python 3.12/3.13 the extra resolves to
+    # an empty set; users should run `uv sync --python 3.14 --extra
+    # tomography` (or set .python-version to 3.14) to opt in.
+    "fasttomo; python_version >= '3.14'",
+    # CUDA toolkit wheels — additionally gated to platforms where they
+    # actually publish (linux x86_64/aarch64, win_amd64). On macOS/
+    # other arches they're omitted and FastTomo's CMake falls back to
+    # a CPU-only build.
     #
     # Pin every component to 13.0.x. The wheels do not pin their own
     # transitive deps tightly, so a loose `nvidia-cuda-nvcc` alone
     # lets nvidia-nvvm/cuda-crt resolve to a newer minor whose cicc
     # emits PTX the older ptxas cannot assemble. Must also match
     # torch's cu130 build and the driver's max (CUDA 13.1).
-    "nvidia-cuda-nvcc==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
-    "nvidia-cuda-cccl==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
-    "nvidia-cuda-runtime==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
-    "nvidia-cuda-crt==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
-    "nvidia-nvvm==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-cuda-nvcc==13.0.*; python_version >= '3.14' and (sys_platform == 'linux' or sys_platform == 'win32')",
+    "nvidia-cuda-cccl==13.0.*; python_version >= '3.14' and (sys_platform == 'linux' or sys_platform == 'win32')",
+    "nvidia-cuda-runtime==13.0.*; python_version >= '3.14' and (sys_platform == 'linux' or sys_platform == 'win32')",
+    "nvidia-cuda-crt==13.0.*; python_version >= '3.14' and (sys_platform == 'linux' or sys_platform == 'win32')",
+    "nvidia-nvvm==13.0.*; python_version >= '3.14' and (sys_platform == 'linux' or sys_platform == 'win32')",
 ]
 
 [tool.hatch.build.targets.sdist]
