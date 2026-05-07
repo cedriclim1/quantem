@@ -9,6 +9,7 @@ Getting started:
 - run `uv sync` to install all the dependencies in an editable environment
 - run `uv sync --all-packages` to also install `quantem.widget` (optional)
 - run `uv sync --python 3.14 --extra tomography` to also install [FastTomo](https://github.com/cedriclim1/FastTomo) and a venv-local CUDA 13.0 toolkit (optional; requires Python 3.14)
+  - or `pip install -e ".[tomography]"` if you prefer plain pip (Colab uses this path)
 
 For widget developers (requires [Node.js](https://nodejs.org/)):
 
