@@ -19,13 +19,23 @@ exclude = ["*.ipynb"]
 line-length = 99
 
 [tool.uv]
-config-settings = { editable_mode = "compat" }
+config-settings-package = { quantem = { editable_mode = "compat" } }
+
+[tool.uv.extra-build-dependencies]
+fasttomo = [
+    { requirement = "nvidia-cuda-nvcc; sys_platform == 'linux' or sys_platform == 'win32'", match-runtime = true },
+    { requirement = "nvidia-cuda-cccl; sys_platform == 'linux' or sys_platform == 'win32'", match-runtime = true },
+    { requirement = "nvidia-cuda-runtime; sys_platform == 'linux' or sys_platform == 'win32'", match-runtime = true },
+    { requirement = "nvidia-cuda-crt; sys_platform == 'linux' or sys_platform == 'win32'", match-runtime = true },
+    { requirement = "nvidia-nvvm; sys_platform == 'linux' or sys_platform == 'win32'", match-runtime = true },
+]
 
 [tool.uv.workspace]
 members = ["widget"]
 
 [tool.uv.sources]
 "quantem.widget" = { workspace = true }
+fasttomo = { git = "https://github.com/cedriclim1/FastTomo.git", branch = "feat/pip-cuda-toolkit-detect" }
 
 [project]
 name = "quantem"
@@ -34,7 +44,7 @@ description = "quantitative electron microscopy analysis toolkit."
 keywords = ["EM","TEM","STEM","4DSTEM"]
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = [
   "colorspacious",
   "dill",
@@ -59,6 +69,24 @@ dependencies = [
 [project.optional-dependencies]
 widgets = [
     "quantem.widget",
+]
+tomography = [
+    "fasttomo",
+    # CUDA toolkit wheels — gated to platforms where they actually
+    # publish (linux x86_64/aarch64, win_amd64). On macOS/other arches
+    # they're omitted and FastTomo's CMake falls back to a CPU-only
+    # build.
+    #
+    # Pin every component to 13.0.x. The wheels do not pin their own
+    # transitive deps tightly, so a loose `nvidia-cuda-nvcc` alone
+    # lets nvidia-nvvm/cuda-crt resolve to a newer minor whose cicc
+    # emits PTX the older ptxas cannot assemble. Must also match
+    # torch's cu130 build and the driver's max (CUDA 13.1).
+    "nvidia-cuda-nvcc==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-cuda-cccl==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-cuda-runtime==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-cuda-crt==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-nvvm==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
 ]
 
 [tool.hatch.build.targets.sdist]
