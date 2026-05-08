@@ -760,9 +760,10 @@ wheels = [
 [[package]]
 name = "fasttomo"
 version = "0.1.0"
-source = { git = "https://github.com/cedriclim1/FastTomo.git#7428d3d4837d4c9d0b8025a588240545b475b970" }
+source = { git = "https://github.com/cedriclim1/FastTomo.git#c84363de18809ba2759f0ee82d66c4bd4342307d" }
 dependencies = [
     { name = "numpy", marker = "python_full_version >= '3.14'" },
+    { name = "packaging", marker = "python_full_version >= '3.14'" },
     { name = "torch", marker = "python_full_version >= '3.14'" },
     { name = "tqdm", marker = "python_full_version >= '3.14'" },
 ]

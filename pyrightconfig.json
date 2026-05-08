@@ -1,0 +1,6 @@
+{
+  "typeCheckingMode": "standard",
+  "reportPrivateImportUsage": "none",
+  "reportUnsafeMultipleInheritance": "none",
+  "exclude": ["**/node_modules", "**/__pycache__", ".venv"]
+}
