@@ -499,3 +499,65 @@ class TestSchedulerParamsArePure:
         assert p.params(base_LR=1.0)["min_lr"] == 1e-6
         e = SchedulerParams.Exponential(gamma=0.8)
         assert e.params(base_LR=1.0, num_iter=10)["gamma"] == 0.8
+
+
+@requires_torch
+class TestReconnectHyperparamAlignment:
+    """Regression: reconnect_optimizer_to_parameters restored per-group
+    hyperparameters by zip-index against get_optimization_parameters(),
+    silently attaching the wrong lr to every group whenever the group dict's
+    order (or membership) changed between optimizer creation and reconnect."""
+
+    def _model(self):
+        model = _FakeModel({"a": [_param()], "b": [_param(2.0)]})
+        model.set_optimizer({"a": OptimizerParams.SGD(lr=1e-2), "b": OptimizerParams.SGD(lr=1e-3)})
+        return model
+
+    def _lrs_by_name(self, model):
+        return {pg["name"]: pg["lr"] for pg in model.optimizer.param_groups}
+
+    def test_groups_carry_names(self):
+        model = self._model()
+        assert self._lrs_by_name(model) == {"a": 1e-2, "b": 1e-3}
+
+    def test_reordered_groups_keep_their_lr(self):
+        model = self._model()
+        # Simulate get_optimization_parameters returning a different order at
+        # reconnect time (group membership/order is not contractual).
+        model._groups = {"b": model._groups["b"], "a": model._groups["a"]}
+        model.reconnect_optimizer_to_parameters()
+        assert self._lrs_by_name(model) == {"a": 1e-2, "b": 1e-3}
+
+    def test_added_group_gets_defaults_others_keep_lr(self):
+        model = self._model()
+        model._groups = dict(model._groups)
+        model._groups["c"] = [_param(3.0)]
+        model.reconnect_optimizer_to_parameters()
+        lrs = self._lrs_by_name(model)
+        assert lrs["a"] == 1e-2 and lrs["b"] == 1e-3
+        assert "c" in lrs  # present, with optimizer defaults
+
+    def test_state_survives_reconnect(self):
+        # Adam: SGD without momentum keeps no per-param state to preserve.
+        model = _FakeModel({"a": [_param()], "b": [_param(2.0)]})
+        model.set_optimizer(
+            {"a": OptimizerParams.Adam(lr=1e-2), "b": OptimizerParams.Adam(lr=1e-3)}
+        )
+        params = [pg["params"][0] for pg in model.optimizer.param_groups]
+        for p in params:
+            p.grad = torch.ones_like(p)
+        model.optimizer.step()
+        assert len(model.optimizer.state) > 0
+        before = {id(p): dict(model.optimizer.state[p]) for p in params}
+        model.reconnect_optimizer_to_parameters()
+        for p in params:
+            assert id(p) in before and p in model.optimizer.state
+
+    def test_legacy_groups_without_names_fall_back_to_index(self):
+        model = self._model()
+        # Optimizers restored from older checkpoints carry no group names.
+        for pg in model.optimizer.param_groups:
+            del pg["name"]
+        model.reconnect_optimizer_to_parameters()
+        lrs = [pg["lr"] for pg in model.optimizer.param_groups]
+        assert lrs == [1e-2, 1e-3]
