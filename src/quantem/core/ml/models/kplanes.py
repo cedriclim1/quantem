@@ -243,6 +243,12 @@ class KPlanes(PPLR, TensorDecompositionModel):
             nn.init.zeros_(out.bias)
             layers.append(out)
             self.sigma_net = nn.Sequential(*layers)
+        else:
+            # Linear head fallback, matching KPlanesTILTED._build_sigma_net and
+            # CPTilted: forward/get_params reference sigma_net unconditionally.
+            self.sigma_net = nn.Linear(self.feature_dim, 1, bias=True)
+            nn.init.normal_(self.sigma_net.weight, std=0.01)
+            nn.init.zeros_(self.sigma_net.bias)
 
     def get_densities(self, coords: torch.Tensor):
         """Computes and returns densities"""
