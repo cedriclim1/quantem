@@ -13,6 +13,11 @@ from torch import nn
 from .model_base import PPLR, TensorDecompositionModel
 from .so3params import SO3ParamQuat, SO3ParamR9SVD
 
+try:  # optional fused CUDA kernels (pip install quantem-cuda)
+    from quantem.cuda.core.ml import kplanes_tilted_fuse as _kplanes_tilted_fuse_cuda
+except ImportError:
+    _kplanes_tilted_fuse_cuda = None
+
 """
 K-planes utility functions
 """
@@ -325,6 +330,23 @@ def interpolate_ms_features_tilted(
     """
     T = rotation_matrices.shape[0]
     B = pts.shape[0]
+
+    # Fused CUDA path: one kernel per level instead of einsum + grid_sample +
+    # prod. Falls through to torch for CPU/non-fp32/odd shapes.
+    if (
+        _kplanes_tilted_fuse_cuda is not None
+        and pts.is_cuda
+        and pts.dtype == torch.float32
+        and pts.ndim == 2
+        and pts.shape[-1] == 3
+        and rotation_matrices.dtype == torch.float32
+        and rotation_matrices.ndim == 3
+        and rotation_matrices.shape[-2:] == (3, 3)
+        and all(g.dtype == torch.float32 and g.ndim == 4 and g.shape[0] == 3 * T for g in ms_grids)
+    ):
+        return torch.cat(
+            [_kplanes_tilted_fuse_cuda(pts, rotation_matrices, g) for g in ms_grids], dim=-1
+        )
 
     # (T, B, 3)  — rotate all points by all rotations at once
     rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
