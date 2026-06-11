@@ -1,5 +1,28 @@
+import numpy as np
 import torch
 import torch.nn.functional as F
+
+
+def fourier_cropping(img, crop_size):
+    """
+    Crop a real-space image in Fourier space (band-limited downsampling).
+
+    Takes a real-space image, crops its centered FFT to ``crop_size``, and
+    returns the real part of the inverse transform. Distinct from
+    ``quantem.core.utils.imaging_utils.fourier_cropping``, which operates on an
+    already-FFT'd corner-centered array.
+    """
+    center = np.array(img.shape) // 2
+
+    fft_img = np.fft.fftshift(np.fft.fft2(img))
+
+    cropped_fft = fft_img[
+        center[0] - crop_size[0] // 2 : center[0] + crop_size[0] // 2,
+        center[1] - crop_size[1] // 2 : center[1] + crop_size[1] // 2,
+    ]
+    cropped_img = np.fft.ifft2(np.fft.ifftshift(cropped_fft)).real
+    return cropped_img
+
 
 # --- Projection Operator Utils ---
 
