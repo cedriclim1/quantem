@@ -13,6 +13,11 @@ from torch import nn
 from .model_base import PPLR, TensorDecompositionModel
 from .so3params import SO3ParamQuat, SO3ParamR9SVD
 
+try:  # optional fused CUDA kernels (pip install quantem-cuda)
+    from quantem.cuda.core.ml import kplanes_fuse as _kplanes_fuse_cuda
+except ImportError:
+    _kplanes_fuse_cuda = None
+
 """
 K-planes utility functions
 """
@@ -144,6 +149,18 @@ def interpolate_ms_features(
     pts: torch.Tensor,
     ms_grids: nn.ParameterList,
 ) -> torch.Tensor:
+    # Fused CUDA path: one kernel per level instead of grid_sample + prod,
+    # ~10x on fwd+bwd. Falls through to torch for CPU/non-fp32/odd shapes.
+    if (
+        _kplanes_fuse_cuda is not None
+        and pts.is_cuda
+        and pts.dtype == torch.float32
+        and pts.ndim == 2
+        and pts.shape[-1] == 3
+        and all(g.dtype == torch.float32 and g.ndim == 4 and g.shape[0] == 3 for g in ms_grids)
+    ):
+        return torch.cat([_kplanes_fuse_cuda(pts, g) for g in ms_grids], dim=-1)
+
     mat_mode = [[0, 1], [0, 2], [1, 2]]
     coord_plane = torch.stack(
         [
