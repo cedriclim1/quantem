@@ -51,6 +51,10 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         self._consistency_losses: list[float] = []
         self._val_losses: list[float] = []
         self._lrs: dict[str, list] = {}
+        # Best-validation checkpoint (populated only when reconstruct(track_best_val=True)).
+        self._best_val_loss: float | None = None
+        self._best_val_epoch: int | None = None
+        self._best_val_state: dict | None = None
         # DDP Initialization
         if isinstance(obj_model, ObjectINR) or isinstance(obj_model, ObjectTensorDecomp):
             self.setup_distributed(device=device)
@@ -127,6 +131,23 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         Returns the consistency loss for each epoch ran.
         """
         return np.array(self._consistency_losses)
+
+    @property
+    def val_losses(self) -> NDArray:
+        """
+        Returns the validation loss for each epoch ran (empty if val_fraction was 0).
+        """
+        return np.array(self._val_losses)
+
+    @property
+    def best_val_epoch(self) -> int | None:
+        """Epoch of the lowest validation loss seen under track_best_val (else None)."""
+        return self._best_val_epoch
+
+    @property
+    def best_val_loss(self) -> float | None:
+        """Lowest validation loss seen under track_best_val (else None)."""
+        return self._best_val_loss
 
     @property
     def learning_rates(self) -> dict[str, list]:

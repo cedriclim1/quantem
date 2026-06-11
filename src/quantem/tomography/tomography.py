@@ -84,6 +84,10 @@ class Tomography(TomographyOpt, TomographyBase):
         loss_func_kwargs: dict = {},
         reset_dset: DatasetModelType | None = None,
         show_metrics: bool = False,
+        track_best_val: bool = False,
+        volume_prior: torch.Tensor | None = None,
+        volume_prior_weight: float = 0.0,
+        volume_prior_n_samples: int = 10_000,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -234,6 +238,14 @@ class Tomography(TomographyOpt, TomographyBase):
 
                 soft_constraints_loss += self.dset.apply_soft_constraints()
 
+                if volume_prior is not None and volume_prior_weight > 0.0:
+                    soft_constraints_loss = (
+                        soft_constraints_loss
+                        + self.obj_model.volume_prior_loss(
+                            all_coords, volume_prior, volume_prior_weight, volume_prior_n_samples
+                        )
+                    )
+
                 epoch_soft_constraint_loss += soft_constraints_loss.detach()
 
                 batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
@@ -278,17 +290,19 @@ class Tomography(TomographyOpt, TomographyBase):
 
             avg_val_loss = None
             if self.val_dataloader is not None:
-                print("Validating...")
                 self.obj_model.model.eval()
                 self.dset.eval()
                 with torch.no_grad():
                     val_loss = torch.tensor(0.0, device=self.device)
 
                     for batch in self.val_dataloader:
+                        # Match the training pass (enabled=False): bf16 autocast breaks the
+                        # so3 pose solve (lu_factor has no BFloat16 kernel) and would make the
+                        # val loss inconsistent with the fp32 training loss it is compared to.
                         with torch.autocast(
                             device_type=self.device.type,
                             dtype=torch.bfloat16,
-                            enabled=True,
+                            enabled=False,
                         ):
                             all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
 
@@ -321,8 +335,10 @@ class Tomography(TomographyOpt, TomographyBase):
 
             total_loss, consistency_loss, epoch_soft_constraint_loss = metrics.tolist()
 
+            val_str = "" if avg_val_loss is None else f", Val Loss: {avg_val_loss:.5e}"
+
             pbar.set_description(
-                f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}"
+                f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}{val_str}"
             )
 
             self._epoch_losses.append(total_loss)
@@ -331,6 +347,17 @@ class Tomography(TomographyOpt, TomographyBase):
             self.obj_model._soft_constraint_losses.append(epoch_soft_constraint_loss)
             if avg_val_loss is not None:
                 self._val_losses.append(avg_val_loss)
+                if track_best_val and (
+                    self._best_val_loss is None or avg_val_loss < self._best_val_loss
+                ):
+                    self._best_val_loss = avg_val_loss
+                    self._best_val_epoch = self.num_epochs
+                    net = self.obj_model.model
+                    if isinstance(net, torch.nn.parallel.DistributedDataParallel):
+                        net = net.module
+                    self._best_val_state = {
+                        k: v.detach().cpu().clone() for k, v in net.state_dict().items()
+                    }
 
             if self.logger is not None:
                 if (
@@ -346,7 +373,7 @@ class Tomography(TomographyOpt, TomographyBase):
                             iter=self.num_epochs,
                         )
                     pbar.set_description(
-                        f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e} | Images Logged"
+                        f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}{val_str} | Images Logged"
                     )
 
                 if self.global_rank == 0:
@@ -364,12 +391,28 @@ class Tomography(TomographyOpt, TomographyBase):
             if not self.verbose:
                 if self.global_rank == 0:
                     print(
-                        f"Reconstruction Epoch {self.num_epochs} | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}"
+                        f"Reconstruction Epoch {self.num_epochs} | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}{val_str}"
                     )
         if show_metrics and self.world_size == 1:
             self.plot_losses()
 
     # --- Helper Functions ---
+
+    def load_best_val_state(self) -> None:
+        """Restore the object-model weights from the best-validation checkpoint.
+
+        Requires a prior ``reconstruct(track_best_val=True)`` run with ``val_fraction > 0``.
+        After this call the next ``obj_model.obj_view`` densifies the val-minimum volume.
+        """
+        if self._best_val_state is None:
+            raise RuntimeError(
+                "No best-val checkpoint recorded; run reconstruct(track_best_val=True) "
+                "with val_fraction > 0 first."
+            )
+        net = self.obj_model.model
+        if isinstance(net, torch.nn.parallel.DistributedDataParallel):
+            net = net.module
+        net.load_state_dict({k: v.to(self.device) for k, v in self._best_val_state.items()})
 
     def save_volume(self, path: str = "recon_volume.npz", overwrite: bool = False):
         """

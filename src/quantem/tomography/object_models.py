@@ -604,6 +604,36 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
         return self.constraints.tv_vol * grad_norm.mean()
 
+    def volume_prior_loss(
+        self,
+        coords: torch.Tensor,
+        ref_vol: torch.Tensor,
+        weight: float,
+        n_samples: int = 10_000,
+    ) -> torch.Tensor:
+        """Soft prior pulling the INR toward a reference volume (plug-and-play / RED).
+
+        Samples up to ``n_samples`` of the batch ray coordinates, queries the INR there and
+        compares to ``ref_vol`` trilinearly sampled at the same points. Lets a CNN-denoised
+        volume act as a learned regularizer without hand-tuning explicit penalties.
+        ``ref_vol`` is ``(Z, Y, X)``; ``coords`` are ``(x, y, z)`` in ``[-1, 1]``.
+        """
+        if weight <= 0.0 or ref_vol is None:
+            return torch.tensor(0.0, device=coords.device)
+        n = min(int(n_samples), coords.shape[0])
+        sel = torch.randperm(coords.shape[0], device=coords.device)[:n]
+        c = coords[sel]
+        pred = self.forward(c)
+        ref = ref_vol.to(coords.device, dtype=torch.float32)
+        samp = torch.nn.functional.grid_sample(
+            ref[None, None],
+            c.view(1, 1, 1, -1, 3),
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        ).view(-1)
+        return weight * torch.nn.functional.mse_loss(pred, samp)
+
     # --- Optimization Parameters ---
     @property
     def params(self) -> Generator[torch.nn.Parameter, None, None]:
