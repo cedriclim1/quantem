@@ -21,6 +21,7 @@ class ReconstructionContext(BaseContext):
     - pred: Predicted values per coordinate position from the model.
     - all_densities: Integrated densities per ray from the model.
     - obj: Object model (INR, TensorDecomp, etc.).
+    - target: Measured projection pixels for the batch, for data-coupled constraints (e.g. S3IM).
     """
 
     volume: Optional[torch.Tensor] = None
@@ -28,3 +29,4 @@ class ReconstructionContext(BaseContext):
     pred: Optional[torch.Tensor] = None
     all_densities: Optional[torch.Tensor] = None
     obj: Optional[torch.Tensor] = None
+    target: Optional[torch.Tensor] = None

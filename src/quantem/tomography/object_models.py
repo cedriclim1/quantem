@@ -14,6 +14,7 @@ from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.ddp import DDPMixin
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.models.model_base import PlanarDecompositionModel
+from quantem.core.ml.s3im import S3IMLoss
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
@@ -99,9 +100,15 @@ class ObjConstraintParams:
         shrinkage: float = 0.0
         tv_vol: float = 0.0
         sparsity: float = 0.0
+        # S3IM (stochastic structural similarity) multiplex loss. s3im_weight is
+        # the penalty weight; the rest are config for the SSIM patch (paper defaults).
+        s3im_weight: float = 0.0
+        s3im_repeat_time: int = 10
+        s3im_kernel: int = 4
+        s3im_value_range: float = 1.0
         _name: str = "obj_inr"
 
-        soft_constraint_keys = ["tv_vol", "sparsity"]
+        soft_constraint_keys = ["tv_vol", "sparsity", "s3im_weight"]
         hard_constraint_keys = ["positivity", "shrinkage"]
 
     @dataclass
@@ -128,9 +135,15 @@ class ObjConstraintParams:
         tv_vol: float = 0.0
         tv_plane: float = 0.0
         sparsity: float = 0.0
+        # S3IM (stochastic structural similarity) multiplex loss. s3im_weight is
+        # the penalty weight; the rest are config for the SSIM patch (paper defaults).
+        s3im_weight: float = 0.0
+        s3im_repeat_time: int = 10
+        s3im_kernel: int = 4
+        s3im_value_range: float = 1.0
         _name: str = "obj_tensor_decomp"
 
-        soft_constraint_keys = ["tv_vol", "tv_plane", "sparsity"]
+        soft_constraint_keys = ["tv_vol", "tv_plane", "sparsity", "s3im_weight"]
         hard_constraint_keys = ["positivity", "shrinkage"]
 
     @classmethod
@@ -558,6 +571,9 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             sparsity_loss = self.constraints.sparsity * torch.norm(ctx.pred, p=1)
             soft_loss += sparsity_loss
 
+        if getattr(self.constraints, "s3im_weight", 0.0) > 0:
+            soft_loss += self.get_s3im_loss(ctx)
+
         return soft_loss
 
     def apply_hard_constraints(self, pred: torch.Tensor) -> torch.Tensor:
@@ -602,6 +618,33 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         # Compute TV loss - gradient magnitude per sample
         grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
         return self.constraints.tv_vol * grad_norm.mean()
+
+    # --- Define get_s3im_loss ---
+
+    def get_s3im_loss(self, ctx: ReconstructionContext) -> torch.Tensor:
+        """
+        Compute the weighted S3IM (stochastic structural similarity) multiplex loss
+        between the predicted and measured projection pixels of the batch.
+
+        S3IM consumes the already-computed ``ctx.pred`` (kept attached to the graph)
+        and ``ctx.target`` -- it does NOT re-evaluate the model, so it adds no extra
+        forward pass and is covered by the single backward of the reconstruction step.
+        """
+        assert ctx.pred is not None, "pred must be provided to compute the S3IM loss"
+        assert ctx.target is not None, "target must be provided to compute the S3IM loss"
+
+        # Lazily build the (paramless) SSIM module and cache it without registering it
+        # as an nn.Module submodule (avoids perturbing state_dict / AutoSerialize / DDP).
+        s3im = getattr(self, "_s3im", None)
+        if s3im is None:
+            s3im = S3IMLoss(
+                repeat_time=self.constraints.s3im_repeat_time,
+                kernel_size=self.constraints.s3im_kernel,
+                value_range=self.constraints.s3im_value_range,
+            ).to(ctx.pred.device)
+            object.__setattr__(self, "_s3im", s3im)
+
+        return self.constraints.s3im_weight * s3im(ctx.pred, ctx.target)
 
     # --- Optimization Parameters ---
     @property
@@ -932,6 +975,9 @@ class ObjectTensorDecomp(ObjectINR):
             )
             sparsity_loss = self.constraints.sparsity * ctx.all_densities.abs().mean()
             soft_loss += sparsity_loss
+
+        if self.constraints.s3im_weight > 0:
+            soft_loss += self.get_s3im_loss(ctx)
 
         return soft_loss
 

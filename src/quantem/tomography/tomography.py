@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Literal, Self, Sequence
+from typing import Callable, Literal, Self, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -85,6 +85,8 @@ class Tomography(TomographyOpt, TomographyBase):
         loss_func_kwargs: dict = {},
         reset_dset: DatasetModelType | None = None,
         show_metrics: bool = False,
+        eval_callback: Callable[[int], None] | None = None,
+        eval_every: int = 0,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -214,15 +216,16 @@ class Tomography(TomographyOpt, TomographyBase):
 
                 pred = integrated_densities.float()
 
+                target = batch["target_value"].to(self.device, non_blocking=True).float()
+
                 soft_constraints_loss = self.obj_model.apply_soft_constraints(
                     ctx=ReconstructionContext(
                         coords=all_coords,
                         pred=pred,
                         all_densities=all_densities,
+                        target=target,
                     )
                 )
-
-                target = batch["target_value"].to(self.device, non_blocking=True).float()
 
                 batch_consistency_loss = loss_func(pred, target)
 
@@ -364,6 +367,13 @@ class Tomography(TomographyOpt, TomographyBase):
                     print(
                         f"Reconstruction Epoch {self.num_epochs} | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}"
                     )
+
+            # Opt-in per-epoch evaluation hook (e.g. SSIM-vs-ground-truth convergence
+            # curves). Note `obj_view` is collective, so the callback must be invoked on
+            # every rank; it is the caller's responsibility to guard rank-0-only work.
+            if eval_callback is not None and eval_every > 0 and (a0 + 1) % eval_every == 0:
+                eval_callback(a0 + 1)
+
         if show_metrics and self.world_size == 1:
             self.plot_losses()
 
