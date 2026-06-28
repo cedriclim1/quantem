@@ -135,6 +135,11 @@ class ObjConstraintParams:
         tv_vol: float = 0.0
         tv_plane: float = 0.0
         sparsity: float = 0.0
+        # Wedge-aware anisotropic volume TV: per-axis (z,y,x) weight multipliers applied to
+        # the volume-TV gradient norm. None => isotropic (original behaviour). Penalizing the
+        # missing-wedge (y/z) directions more than the resolved (x) direction suppresses
+        # streak/elongation artifacts without blurring the well-resolved in-plane structure.
+        tv_vol_aniso: tuple | None = None
         # S3IM (stochastic structural similarity) multiplex loss. s3im_weight is
         # the penalty weight; the rest are config for the SSIM patch (paper defaults).
         s3im_weight: float = 0.0
@@ -1054,7 +1059,16 @@ class ObjectTensorDecomp(ObjectINR):
         pred = all_pred[:n]  # (N, C)
         shifted_pred = all_pred[n:].view(3, n, -1)  # (3, N, C)
 
-        grad_stack = (shifted_pred - pred.unsqueeze(0)) / h  # (3, N, C)
+        grad_stack = (shifted_pred - pred.unsqueeze(0)) / h  # (3, N, C); axis0 = coord(0,1,2)=(x,y,z)
+
+        aniso = getattr(self.constraints, "tv_vol_aniso", None)
+        if aniso is not None:
+            # Weight per coordinate direction (coord0=x, coord1=y, coord2=z). The missing
+            # wedge lives in y/z, so set those weights high and x low to suppress streak
+            # smear without over-smoothing the resolved in-plane (x) structure.
+            w = torch.as_tensor(aniso, device=grad_stack.device, dtype=grad_stack.dtype).view(3, 1, 1)
+            grad_stack = grad_stack * w
+
         grad_norm = torch.norm(grad_stack, dim=0)  # (N, C)
 
         return self.constraints.tv_vol * grad_norm.mean()
