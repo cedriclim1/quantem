@@ -8,9 +8,12 @@ event files. Matplotlib backend is ``Agg`` (set in the root conftest), so figure
 headless.
 """
 
+import os
+import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from quantem.tomography.logger_tomography import LoggerTomography
@@ -101,3 +104,71 @@ def test_log_iter_images(tmp_path):
         assert list(logger.log_dir.glob("events.out.tfevents.*"))
     finally:
         logger.close()
+
+
+def test_invalid_mode_raises(tmp_path):
+    with pytest.raises(ValueError, match="tensorboard.*wandb"):
+        LoggerTomography(
+            log_dir=str(tmp_path),
+            run_prefix="test_tomo",
+            mode="invalid",
+        )
+
+
+def test_wandb_mode_logs_under_run_dir(tmp_path, monkeypatch):
+    monkeypatch.delenv("WANDB_MODE", raising=False)
+    init_calls = []
+    logged = []
+
+    class FakeConfig(dict):
+        def update(self, values, allow_val_change=False):
+            super().update(values)
+
+    class FakeRun:
+        def __init__(self):
+            self.config = FakeConfig()
+            self.finished = False
+
+        def log(self, data, step):
+            logged.append((data, step))
+
+        def finish(self):
+            self.finished = True
+
+    def fake_init(**kwargs):
+        init_calls.append(kwargs)
+        return FakeRun()
+
+    fake_wandb = SimpleNamespace(
+        Image=lambda image: ("image", image),
+        Histogram=lambda values: ("histogram", values),
+        init=fake_init,
+    )
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    logger = LoggerTomography(
+        log_dir=str(tmp_path),
+        run_prefix="test_tomo",
+        run_suffix="wandb",
+        log_images_every=1,
+        mode="wandb",
+        wandb_config={"batch_size": 4},
+    )
+    try:
+        assert logger.mode == "wandb"
+        assert os.environ["WANDB_MODE"] == "offline"
+        assert logger.log_dir.exists()
+        assert (logger.log_dir / "wandb").exists()
+        assert init_calls[-1]["dir"] == str(logger.log_dir)
+        assert init_calls[-1]["config"] == {"batch_size": 4}
+
+        logger.attach_config({"num_iter": 2})
+        logger.log_scalar("loss/total", 1.0, 0)
+        logger.log_image("volume/sum_z_0", np.ones((2, 2), dtype=np.float32), 0)
+        logger.flush()
+    finally:
+        logger.close()
+
+    assert logged[0] == ({"loss/total": 1.0}, 0)
+    assert "volume/sum_z_0" in logged[1][0]
+    assert logged[1][1] == 0

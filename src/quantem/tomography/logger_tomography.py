@@ -1,3 +1,5 @@
+from typing import Any, Literal, Mapping
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -10,6 +12,11 @@ from quantem.tomography.object_models import ObjectModelType
 class LoggerTomography(LoggerBase):
     """
     Logger for ML-based tomography reconstructions.
+
+    ``mode="tensorboard"`` preserves the original SummaryWriter behavior. ``mode="wandb"``
+    mirrors the same tags and steps to WandB, defaults to ``WANDB_MODE=offline`` unless the
+    environment already sets it, and writes offline run files under ``<log_dir>/wandb/``.
+    Upload offline runs with ``wandb sync <log_dir>/wandb/<offline-run-dir>``.
     """
 
     def __init__(
@@ -18,8 +25,17 @@ class LoggerTomography(LoggerBase):
         run_prefix: str,
         run_suffix: str = "",
         log_images_every: int = 10,
+        mode: Literal["tensorboard", "wandb"] | str = "tensorboard",
+        wandb_config: Mapping[str, Any] | None = None,
     ):
-        super().__init__(log_dir, run_prefix, run_suffix, log_images_every)
+        super().__init__(
+            log_dir,
+            run_prefix,
+            run_suffix,
+            log_images_every,
+            mode=mode,
+            wandb_config=wandb_config,
+        )
 
     def log_epoch(self, epoch: int, loss: float, tilt_series_loss: float, soft_loss: float):
         self.log_scalar("loss/total", loss, epoch)
