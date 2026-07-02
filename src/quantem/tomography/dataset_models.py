@@ -564,6 +564,8 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        ray_sampling: str = "box_fixed_ds",
+        ray_ds: float | None = None,
         seed: int = 42,
         _token: object | None = None,
     ):
@@ -586,6 +588,34 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         self.ray_ds: float | None = None
         # Per-batch ragged metadata stashed by get_coords for integrate_rays to consume.
         self._ray_meta: dict[str, torch.Tensor] | None = None
+
+    @classmethod
+    def from_data(
+        cls,
+        tilt_stack: Dataset3d | NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
+        learn_shift: bool = True,
+        learn_tilt_axis: bool = True,
+        ray_sampling: str = "box_fixed_ds",
+        ray_ds: float | None = None,
+    ):
+
+        if ray_sampling == "box_fixed_ds":
+            if ray_ds is None:
+                ray_ds = 2.0 / max(tilt_stack.shape)
+            else:
+                ray_ds = float(ray_ds)
+
+
+        return cls(
+            tilt_stack=tilt_stack,
+            tilt_angles=tilt_angles,
+            learn_shift=learn_shift,
+            learn_tilt_axis=learn_tilt_axis,
+            ray_sampling=ray_sampling,
+            ray_ds=ray_ds,
+            _token=cls._token,
+        )
 
     # --- Forward Pass w/ Params Method for OptimizerMixin ---
     def forward(self, dummy_input: Any = None):
