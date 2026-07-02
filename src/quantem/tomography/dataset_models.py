@@ -329,9 +329,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         if _token is not self._token:
             raise RuntimeError("Use TomographyPixDataset.from_* to instantiate this class.")
 
-        if not (
-            tilt_stack.shape[0] < tilt_stack.shape[1] or tilt_stack.shape[0] < tilt_stack.shape[2]
-        ):
+        if tilt_stack.shape[0] != len(tilt_angles):
             raise ValueError(
                 "The number of tilt projections should be in the first dimension of the dataset."
             )
