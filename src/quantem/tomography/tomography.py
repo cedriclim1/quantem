@@ -35,6 +35,36 @@ from quantem.tomography.tomography_context import ReconstructionContext
 from quantem.tomography.tomography_opt import TomographyOpt
 
 
+def _should_take_grad_step_snapshot(grad_step: int, snapshot_every: int) -> bool:
+    """Return whether a gradient-update snapshot should fire at ``grad_step``."""
+    return snapshot_every > 0 and grad_step > 0 and grad_step % snapshot_every == 0
+
+
+def _take_grad_step_snapshot(
+    *,
+    obj_model: ObjectINR | ObjectTensorDecomp,
+    grad_step: int,
+    global_rank: int,
+    logger: LoggerTomography | None,
+    snapshot_dir: str | Path | None,
+    snapshot_callback: Callable[[int, np.ndarray | None], None] | None,
+) -> None:
+    volume = obj_model.obj_view
+    volume_or_none = volume if global_rank == 0 else None
+
+    if global_rank == 0:
+        if snapshot_dir is not None:
+            snapshot_path = Path(snapshot_dir) / f"step_{grad_step}.npy"
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(snapshot_path, np.asarray(volume_or_none).astype(np.float32, copy=False))
+
+        if logger is not None:
+            logger.log_scalar("snapshots/last_grad_step", float(grad_step), grad_step)
+
+    if snapshot_callback is not None:
+        snapshot_callback(grad_step, volume_or_none)
+
+
 class Tomography(TomographyOpt, TomographyBase):
     """
     Class for handling all ML tomography reconstruction methods.
@@ -87,11 +117,17 @@ class Tomography(TomographyOpt, TomographyBase):
         show_metrics: bool = False,
         eval_callback: Callable[[int], None] | None = None,
         eval_every: int = 0,
+        snapshot_every: int = 0,
+        snapshot_dir: str | Path | None = None,
+        snapshot_callback: Callable[[int, np.ndarray | None], None] | None = None,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
         I.e, auto-detection through the obj model type, while both share the same pose optimization.
         """
+        if snapshot_every < 0:
+            raise ValueError("snapshot_every must be >= 0.")
+        snapshots_enabled = snapshot_every > 0
 
         # Check device consistency
         self.obj_model.to(self.device)
@@ -239,6 +275,18 @@ class Tomography(TomographyOpt, TomographyBase):
                 # Clip gradients
                 torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)
                 self.step_optimizers()
+                self._grad_steps = getattr(self, "_grad_steps", 0) + 1
+                if snapshots_enabled and _should_take_grad_step_snapshot(
+                    self._grad_steps, snapshot_every
+                ):
+                    _take_grad_step_snapshot(
+                        obj_model=self.obj_model,
+                        grad_step=self._grad_steps,
+                        global_rank=self.global_rank,
+                        logger=self.logger,
+                        snapshot_dir=snapshot_dir,
+                        snapshot_callback=snapshot_callback,
+                    )
                 total_loss += batch_loss.detach()
                 consistency_loss += batch_consistency_loss.detach()
 
