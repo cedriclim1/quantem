@@ -432,6 +432,7 @@ class Tomography(TomographyOpt, TomographyBase):
                         val_loss=avg_val_loss if validate_this_epoch else None,
                         val_fg_loss=avg_val_fg_loss,
                         val_bg_loss=avg_val_bg_loss,
+                        grad_step=self._grad_steps,
                     )
 
                 self.logger.flush()

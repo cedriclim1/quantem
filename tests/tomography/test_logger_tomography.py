@@ -168,18 +168,44 @@ def test_wandb_mode_logs_under_run_dir(tmp_path, monkeypatch):
         assert init_calls[-1]["config"] == {"batch_size": 4}
 
         logger.attach_config({"num_iter": 2})
-        logger.log_scalar("loss/total", 1.0, 1)
-        logger.log_image("volume/sum_z_0", np.ones((2, 2), dtype=np.float32), 1)
-        logger.log_histogram("weights/object", np.array([0.0, 1.0], dtype=np.float32), 1)
-        logger.log_text("config/notes", "offline test", 1)
+        extra_steps = {"grad_step": 10}
+        logger.log_scalar("loss/total", 1.0, 1, extra_steps=extra_steps)
+        logger.log_image(
+            "volume/sum_z_0", np.ones((2, 2), dtype=np.float32), 1, extra_steps=extra_steps
+        )
+        logger.log_histogram(
+            "weights/object",
+            np.array([0.0, 1.0], dtype=np.float32),
+            1,
+            extra_steps=extra_steps,
+        )
+        logger.log_text("config/notes", "offline test", 1, extra_steps=extra_steps)
         fig, ax = plt.subplots()
         ax.plot([0, 1], [1, 0])
-        logger.log_figure("figures/test", fig, 1)
+        logger.log_figure("figures/test", fig, 1, extra_steps=extra_steps)
         plt.close(fig)
         logger.log_scalar(
             "snapshots/last_grad_step", 48.0, 48, step_domain="grad_step"
         )
-        logger.log_scalar("loss/total", 0.8, 2)
+        logger.log_epoch(
+            epoch=2,
+            loss=0.8,
+            tilt_series_loss=0.6,
+            soft_loss=0.2,
+            grad_step=20,
+        )
+        logger.log_iter(
+            object_model=SimpleNamespace(_soft_constraint_losses=[0.1]),
+            iter=3,
+            consistency_loss=0.4,
+            total_loss=0.5,
+            learning_rates={"object": 1e-3},
+            num_samples_per_ray=8,
+            val_loss=0.3,
+            val_fg_loss=0.2,
+            val_bg_loss=0.1,
+            grad_step=30,
+        )
         logger.flush()
     finally:
         logger.close()
@@ -189,12 +215,20 @@ def test_wandb_mode_logs_under_run_dir(tmp_path, monkeypatch):
         ("snapshots/*", {"step_metric": "grad_step"}),
     ]
     assert all("step" not in kwargs for _, kwargs in logged)
-    assert logged[0] == ({"loss/total": 1.0, "epoch": 1}, {})
+    assert logged[0] == ({"loss/total": 1.0, "grad_step": 10, "epoch": 1}, {})
     assert "volume/sum_z_0" in logged[1][0]
     assert logged[1][0]["epoch"] == 1
+    assert logged[1][0]["grad_step"] == 10
     assert logged[2][0]["epoch"] == 1
-    assert logged[3] == ({"config/notes": "offline test", "epoch": 1}, {})
+    assert logged[2][0]["grad_step"] == 10
+    assert logged[3] == ({"config/notes": "offline test", "grad_step": 10, "epoch": 1}, {})
     assert "figures/test" in logged[4][0]
     assert logged[4][0]["epoch"] == 1
+    assert logged[4][0]["grad_step"] == 10
     assert logged[5] == ({"snapshots/last_grad_step": 48.0, "grad_step": 48}, {})
-    assert logged[6] == ({"loss/total": 0.8, "epoch": 2}, {})
+    assert logged[6] == ({"loss/total": 0.8, "grad_step": 20, "epoch": 2}, {})
+    assert logged[7] == ({"loss/tilt_series": 0.6, "grad_step": 20, "epoch": 2}, {})
+    assert logged[8] == ({"loss/soft": 0.2, "grad_step": 20, "epoch": 2}, {})
+    for data, _ in logged[9:]:
+        assert data["epoch"] == 3
+        assert data["grad_step"] == 30

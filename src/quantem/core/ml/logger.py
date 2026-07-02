@@ -75,11 +75,18 @@ class LoggerBase(AutoSerialize):
         else:
             self._init_wandb(wandb_config)
 
-    def log_scalar(self, tag: str, value: float, step: int, step_domain: str = "epoch") -> None:
+    def log_scalar(
+        self,
+        tag: str,
+        value: float,
+        step: int,
+        step_domain: str = "epoch",
+        extra_steps: dict[str, int] | None = None,
+    ) -> None:
         if self.mode == "tensorboard":
             self.writer.add_scalar(tag=tag, scalar_value=value, global_step=step)
         else:
-            self._log_wandb(tag, float(value), step, step_domain)
+            self._log_wandb(tag, float(value), step, step_domain, extra_steps=extra_steps)
 
     def log_image(
         self,
@@ -88,24 +95,37 @@ class LoggerBase(AutoSerialize):
         step: int,
         cmap: str = "turbo",
         step_domain: str = "epoch",
+        extra_steps: dict[str, int] | None = None,
     ) -> None:
         cmap_image = self.apply_colormap(image, cmap_name=cmap)
         if self.mode == "tensorboard":
             self.writer.add_image(tag, cmap_image, step)
         else:
             image_hwc = np.moveaxis(cmap_image, 0, -1)
-            self._log_wandb(tag, self._wandb.Image(image_hwc), step, step_domain)
+            self._log_wandb(
+                tag, self._wandb.Image(image_hwc), step, step_domain, extra_steps=extra_steps
+            )
 
     def log_figure(
-        self, tag: str, fig: Figure, step: int, step_domain: str = "epoch"
+        self,
+        tag: str,
+        fig: Figure,
+        step: int,
+        step_domain: str = "epoch",
+        extra_steps: dict[str, int] | None = None,
     ) -> None:
         if self.mode == "tensorboard":
             self.writer.add_figure(tag, fig, step)
         else:
-            self._log_wandb(tag, self._wandb.Image(fig), step, step_domain)
+            self._log_wandb(tag, self._wandb.Image(fig), step, step_domain, extra_steps=extra_steps)
 
     def log_histogram(
-        self, tag: str, values: NDArray | Tensor, step: int, step_domain: str = "epoch"
+        self,
+        tag: str,
+        values: NDArray | Tensor,
+        step: int,
+        step_domain: str = "epoch",
+        extra_steps: dict[str, int] | None = None,
     ) -> None:
         """Log histogram of values for monitoring distributions.
 
@@ -123,9 +143,18 @@ class LoggerBase(AutoSerialize):
         if self.mode == "tensorboard":
             self.writer.add_histogram(tag, values, step)
         else:
-            self._log_wandb(tag, self._wandb.Histogram(values), step, step_domain)
+            self._log_wandb(
+                tag, self._wandb.Histogram(values), step, step_domain, extra_steps=extra_steps
+            )
 
-    def log_text(self, tag: str, text: str, step: int, step_domain: str = "epoch") -> None:
+    def log_text(
+        self,
+        tag: str,
+        text: str,
+        step: int,
+        step_domain: str = "epoch",
+        extra_steps: dict[str, int] | None = None,
+    ) -> None:
         """Log text for configuration, hyperparameters, or notes.
 
         Parameters
@@ -140,7 +169,7 @@ class LoggerBase(AutoSerialize):
         if self.mode == "tensorboard":
             self.writer.add_text(tag, text, step)
         else:
-            self._log_wandb(tag, text, step, step_domain)
+            self._log_wandb(tag, text, step, step_domain, extra_steps=extra_steps)
 
     def attach_config(self, config: Mapping[str, Any]) -> None:
         """Attach a resolved run configuration to WandB.
@@ -330,6 +359,17 @@ class LoggerBase(AutoSerialize):
         self._wandb_run.define_metric("*", step_metric="epoch")
         self._wandb_run.define_metric("snapshots/*", step_metric="grad_step")
 
-    def _log_wandb(self, tag: str, value: Any, step: int, step_domain: str) -> None:
+    def _log_wandb(
+        self,
+        tag: str,
+        value: Any,
+        step: int,
+        step_domain: str,
+        extra_steps: dict[str, int] | None = None,
+    ) -> None:
         """Log WandB data with named step metrics instead of the global step."""
-        self._wandb_run.log({tag: value, step_domain: step})
+        payload = {tag: value}
+        if extra_steps is not None:
+            payload.update(extra_steps)
+        payload[step_domain] = step
+        self._wandb_run.log(payload)
