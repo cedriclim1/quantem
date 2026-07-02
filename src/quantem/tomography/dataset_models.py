@@ -152,6 +152,158 @@ class DatasetValue:
     )
 
 
+@dataclass(frozen=True)
+class PixelHoldoutSplit:
+    """Flat pixel indices for train and held-out validation rays."""
+
+    train_indices: torch.Tensor
+    val_indices: torch.Tensor
+    val_fg_indices: torch.Tensor
+    val_bg_indices: torch.Tensor
+
+
+def _allocate_pixel_holdout_counts(group_sizes: list[int], n_holdout: int) -> list[int]:
+    """Allocate an exact holdout count across groups by largest remainder."""
+    if n_holdout < 0:
+        raise ValueError("n_holdout must be >= 0.")
+    total = sum(group_sizes)
+    if n_holdout > total:
+        raise ValueError("n_holdout cannot exceed the total number of pixels.")
+    if total == 0 or n_holdout == 0:
+        return [0 for _ in group_sizes]
+
+    quotas = [n_holdout * size / total for size in group_sizes]
+    counts = [min(size, int(quota)) for size, quota in zip(group_sizes, quotas)]
+    remaining = n_holdout - sum(counts)
+    order = sorted(
+        range(len(group_sizes)),
+        key=lambda i: (quotas[i] - int(quotas[i]), group_sizes[i]),
+        reverse=True,
+    )
+    while remaining > 0:
+        progressed = False
+        for i in order:
+            if counts[i] < group_sizes[i]:
+                counts[i] += 1
+                remaining -= 1
+                progressed = True
+                if remaining == 0:
+                    break
+        if not progressed:
+            raise RuntimeError("Could not allocate holdout counts.")
+    return counts
+
+
+def _sample_intensity_strata(
+    *,
+    indices: torch.Tensor,
+    intensities: torch.Tensor,
+    n_holdout: int,
+    seed: int,
+    num_strata: int,
+) -> torch.Tensor:
+    """Sample held-out indices from intensity-quantile strata."""
+    if n_holdout == 0 or indices.numel() == 0:
+        return torch.empty(0, dtype=torch.long)
+
+    if n_holdout > indices.numel():
+        raise ValueError("n_holdout cannot exceed the number of candidate pixels.")
+    n_strata = max(1, min(int(num_strata), int(indices.numel())))
+    order = torch.argsort(intensities[indices], stable=True)
+    sorted_indices = indices[order]
+    strata = [s for s in torch.tensor_split(sorted_indices, n_strata) if s.numel() > 0]
+    counts = _allocate_pixel_holdout_counts([int(s.numel()) for s in strata], n_holdout)
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    selected: list[torch.Tensor] = []
+    for stratum, count in zip(strata, counts):
+        if count == 0:
+            continue
+        perm = torch.randperm(stratum.numel(), generator=generator)
+        selected.append(stratum[perm[:count]])
+
+    if not selected:
+        return torch.empty(0, dtype=torch.long)
+    return torch.cat(selected).to(dtype=torch.long)
+
+
+def build_pixel_holdout_split(
+    tilt_stack: Dataset3d | NDArray | torch.Tensor,
+    holdout_fraction: float,
+    holdout_seed: int = 0,
+    *,
+    num_strata: int = 8,
+    foreground_threshold: float = 0.0,
+) -> PixelHoldoutSplit:
+    """Build a seeded foreground-aware train/holdout split over flat pixel indices.
+
+    The split is rank-independent: all work happens on detached CPU tensors with a
+    local generator seeded only by ``holdout_seed``. Foreground/background groups are
+    split proportionally, then each group is sampled from intensity-quantile strata.
+    """
+    if not 0.0 <= holdout_fraction < 1.0:
+        raise ValueError("holdout_fraction must satisfy 0 <= holdout_fraction < 1.")
+    stack = torch.as_tensor(tilt_stack).detach().cpu()
+    intensities = stack.to(torch.float32).abs().flatten()
+    n_pixels = int(intensities.numel())
+    all_indices = torch.arange(n_pixels, dtype=torch.long)
+    n_holdout = int(n_pixels * float(holdout_fraction))
+
+    if n_holdout == 0:
+        empty = torch.empty(0, dtype=torch.long)
+        return PixelHoldoutSplit(
+            train_indices=all_indices,
+            val_indices=empty,
+            val_fg_indices=empty,
+            val_bg_indices=empty,
+        )
+
+    fg_mask = intensities > float(foreground_threshold)
+    fg_indices = all_indices[fg_mask]
+    bg_indices = all_indices[~fg_mask]
+    bg_count, fg_count = _allocate_pixel_holdout_counts(
+        [int(bg_indices.numel()), int(fg_indices.numel())], n_holdout
+    )
+
+    if (
+        n_holdout >= 2
+        and bg_indices.numel() > 0
+        and fg_indices.numel() > 0
+        and (bg_count == 0 or fg_count == 0)
+    ):
+        if bg_count == 0 and fg_count > 1:
+            bg_count, fg_count = 1, fg_count - 1
+        elif fg_count == 0 and bg_count > 1:
+            bg_count, fg_count = bg_count - 1, 1
+
+    bg_val = _sample_intensity_strata(
+        indices=bg_indices,
+        intensities=intensities,
+        n_holdout=bg_count,
+        seed=int(holdout_seed) * 2 + 1,
+        num_strata=num_strata,
+    )
+    fg_val = _sample_intensity_strata(
+        indices=fg_indices,
+        intensities=intensities,
+        n_holdout=fg_count,
+        seed=int(holdout_seed) * 2 + 2,
+        num_strata=num_strata,
+    )
+    val_indices = torch.sort(torch.cat([bg_val, fg_val])).values
+    train_mask = torch.ones(n_pixels, dtype=torch.bool)
+    train_mask[val_indices] = False
+    train_indices = all_indices[train_mask]
+
+    return PixelHoldoutSplit(
+        train_indices=train_indices,
+        val_indices=val_indices,
+        val_fg_indices=torch.sort(fg_val).values,
+        val_bg_indices=torch.sort(bg_val).values,
+    )
+
+
 class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
     """
     Base tomography dataset class for all tomography datasets to inherit from.
@@ -492,6 +644,7 @@ class DeviceBatchSampler:
         rank: int = 0,
         world_size: int = 1,
         seed: int = 0,
+        drop_last: bool = True,
     ):
         self.batch_size = batch_size
         self.device = torch.device(device)
@@ -499,6 +652,7 @@ class DeviceBatchSampler:
         self.rank = rank
         self.world_size = world_size
         self.seed = seed
+        self.drop_last = drop_last
         self._epoch = 0
         self._stack = dset.tilt_stack.to(self.device)
         self._angles = dset.tilt_angles.to(self.device)
@@ -516,7 +670,9 @@ class DeviceBatchSampler:
         self._epoch = epoch
 
     def __len__(self) -> int:
-        return self._per_rank // self.batch_size  # drop_last=True
+        if self.drop_last:
+            return self._per_rank // self.batch_size
+        return (self._per_rank + self.batch_size - 1) // self.batch_size
 
     def _epoch_shard(self) -> torch.Tensor:
         idx = self._indices
@@ -534,7 +690,7 @@ class DeviceBatchSampler:
         idx = self._epoch_shard()
         per_proj = self._s1 * self._s2
         for k in range(len(self)):
-            sel = idx[k * self.batch_size : (k + 1) * self.batch_size]
+            sel = idx[k * self.batch_size : min((k + 1) * self.batch_size, len(idx))]
             proj = sel // per_proj
             rem = sel - proj * per_proj
             pixel_i = rem // self._s1
@@ -581,11 +737,11 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         #                  per ray). Gives identical physical sampling spacing on every ray
         #                  regardless of tilt -- the consistent discretization of the line
         #                  integral. Ragged, so integrate_rays uses a scatter-add.
-        self.ray_sampling: str = "legacy"
+        self.ray_sampling: str = ray_sampling
         # Physical step between samples for "box_fixed_ds". None => derive per call from
         # num_samples_per_ray as 2/(num_samples_per_ray - 1) so the existing samples_per_ray
         # knob stays meaningful (a centered ray reproduces the legacy sample count).
-        self.ray_ds: float | None = None
+        self.ray_ds: float | None = ray_ds
         # Per-batch ragged metadata stashed by get_coords for integrate_rays to consume.
         self._ray_meta: dict[str, torch.Tensor] | None = None
 

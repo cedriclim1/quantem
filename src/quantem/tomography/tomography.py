@@ -20,6 +20,7 @@ from quantem.tomography.dataset_models import (
     DeviceBatchSampler,
     TomographyINRDataset,
     TomographyPixDataset,
+    build_pixel_holdout_split,
 )
 from quantem.tomography.logger_tomography import LoggerTomography
 from quantem.tomography.object_models import (
@@ -104,6 +105,9 @@ class Tomography(TomographyOpt, TomographyBase):
         num_samples_per_ray: int | list[tuple[int, int]] | None = None,
         profiling_mode: bool = False,
         val_fraction: float = 0.0,
+        holdout_fraction: float = 0.0,
+        holdout_seed: int = 0,
+        holdout_every: int = 1,
         loss_type: Literal[
             "l2",
             "l1",
@@ -127,15 +131,28 @@ class Tomography(TomographyOpt, TomographyBase):
         """
         if snapshot_every < 0:
             raise ValueError("snapshot_every must be >= 0.")
+        if holdout_every < 1:
+            raise ValueError("holdout_every must be >= 1.")
+        if val_fraction > 0.0 and holdout_fraction > 0.0:
+            raise ValueError("Use either val_fraction or holdout_fraction, not both.")
         snapshots_enabled = snapshot_every > 0
 
         # Check device consistency
         self.obj_model.to(self.device)
 
-        # Saving batch size, num workers, and val fraction for reloading
+        previous_batch_size = getattr(self, "batch_size", None)
+        previous_num_workers = getattr(self, "num_workers", None)
+        previous_val_fraction = getattr(self, "val_fraction", None)
+        previous_holdout_fraction = getattr(self, "holdout_fraction", None)
+        previous_holdout_seed = getattr(self, "holdout_seed", None)
+
+        # Saving batch size, num workers, and validation split settings for reloading
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.val_fraction = val_fraction
+        self.holdout_fraction = holdout_fraction
+        self.holdout_seed = holdout_seed
+        self.holdout_every = holdout_every
 
         if profiling_mode:
             if self.global_rank == 0:
@@ -168,8 +185,18 @@ class Tomography(TomographyOpt, TomographyBase):
                 dset_constraints = DatasetConstraintParams.parse_dict(dset_constraints)
 
             self.dset.constraints = dset_constraints
+        dataloader_needs_rebuild = (
+            not hasattr(self, "dataloader")
+            or reset_dset is not None
+            or previous_batch_size != batch_size
+            or previous_num_workers != num_workers
+            or previous_val_fraction != val_fraction
+            or previous_holdout_fraction != holdout_fraction
+            or previous_holdout_seed != holdout_seed
+        )
+
         # Setting up DDP
-        if not hasattr(self, "dataloader") or reset_dset is not None:
+        if dataloader_needs_rebuild:
             if reset_dset is not None:
                 print("Resetting Dataloader")
                 print("Putting in params from previous dataset.")
@@ -184,7 +211,9 @@ class Tomography(TomographyOpt, TomographyBase):
                     self.scheduler_params = scheduler_params
                     self.set_schedulers(self.scheduler_params, num_iter=num_iter)
 
-            self._setup_recon_dataloaders(batch_size, num_workers, val_fraction)
+            self._setup_recon_dataloaders(
+                batch_size, num_workers, val_fraction, holdout_fraction, holdout_seed
+            )
 
         # Type check for INR-based reconstruction
         if not isinstance(self.dset, TomographyINRDataset):
@@ -322,44 +351,36 @@ class Tomography(TomographyOpt, TomographyBase):
             # TODO: Maybe reorganize the losses so that the order makes sense lol.
 
             avg_val_loss = None
-            if self.val_dataloader is not None:
+            avg_val_fg_loss = None
+            avg_val_bg_loss = None
+            validate_this_epoch = self.val_dataloader is not None and (
+                holdout_fraction <= 0.0 or (a0 + 1) % holdout_every == 0
+            )
+            if validate_this_epoch:
                 print("Validating...")
                 self.obj_model.model.eval()
                 self.dset.eval()
                 with torch.no_grad():
-                    val_loss = torch.tensor(0.0, device=self.device)
-
-                    for batch in self.val_dataloader:
-                        # Match the training pass (enabled=False): bf16 autocast
-                        # breaks the so3 pose solve (lu_factor has no BFloat16
-                        # kernel) and would make the val loss inconsistent with
-                        # the fp32 training loss it is compared to.
-                        with torch.autocast(
-                            device_type=self.device.type,
-                            dtype=torch.bfloat16,
-                            enabled=False,
-                        ):
-                            all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
-
-                            all_densities = self.obj_model.forward(all_coords)
-
-                            integrated_densities = self.dset.integrate_rays(
-                                all_densities,
-                                curr_num_samples_per_ray,
-                                len(batch["target_value"]),
-                            )
-
-                            target = (
-                                batch["target_value"].to(self.device, non_blocking=True).float()
-                            )
-
-                            batch_val_loss = torch.nn.functional.mse_loss(
-                                integrated_densities, target
-                            )
-
-                            val_loss += batch_val_loss.detach()
-
-                    avg_val_loss = val_loss.item() / len(self.val_dataloader)
+                    avg_val_loss = self._evaluate_validation_loss(
+                        dataloader=self.val_dataloader,
+                        num_samples_per_ray=curr_num_samples_per_ray,
+                        object_extent=N,
+                        loss_func=loss_func,
+                    )
+                    if getattr(self, "val_fg_dataloader", None) is not None:
+                        avg_val_fg_loss = self._evaluate_validation_loss(
+                            dataloader=self.val_fg_dataloader,
+                            num_samples_per_ray=curr_num_samples_per_ray,
+                            object_extent=N,
+                            loss_func=loss_func,
+                        )
+                    if getattr(self, "val_bg_dataloader", None) is not None:
+                        avg_val_bg_loss = self._evaluate_validation_loss(
+                            dataloader=self.val_bg_dataloader,
+                            num_samples_per_ray=curr_num_samples_per_ray,
+                            object_extent=N,
+                            loss_func=loss_func,
+                        )
 
             metrics = torch.tensor(
                 [total_loss, consistency_loss, epoch_soft_constraint_loss], device=self.device
@@ -406,7 +427,9 @@ class Tomography(TomographyOpt, TomographyBase):
                         total_loss=total_loss,
                         learning_rates=self.get_current_lrs(),
                         num_samples_per_ray=curr_num_samples_per_ray,
-                        val_loss=avg_val_loss if self.val_dataloader is not None else None,
+                        val_loss=avg_val_loss if validate_this_epoch else None,
+                        val_fg_loss=avg_val_fg_loss,
+                        val_bg_loss=avg_val_bg_loss,
                     )
 
                 self.logger.flush()
@@ -426,6 +449,45 @@ class Tomography(TomographyOpt, TomographyBase):
             self.plot_losses()
 
     # --- Helper Functions ---
+
+    def _evaluate_validation_loss(
+        self,
+        *,
+        dataloader: DeviceBatchSampler,
+        num_samples_per_ray: int,
+        object_extent: int,
+        loss_func: torch.nn.Module,
+    ) -> float | None:
+        val_loss = torch.tensor(0.0, device=self.device)
+        val_batches = torch.tensor(0.0, device=self.device)
+
+        for batch in dataloader:
+            # Match the training pass (enabled=False): bf16 autocast breaks
+            # the so3 pose solve and would make validation inconsistent with
+            # the fp32 training loss it is compared to.
+            with torch.autocast(
+                device_type=self.device.type,
+                dtype=torch.bfloat16,
+                enabled=False,
+            ):
+                all_coords = self.dset.get_coords(batch, object_extent, num_samples_per_ray)
+                all_densities = self.obj_model.forward(all_coords)
+                integrated_densities = self.dset.integrate_rays(
+                    all_densities,
+                    num_samples_per_ray,
+                    len(batch["target_value"]),
+                )
+                target = batch["target_value"].to(self.device, non_blocking=True).float()
+                batch_val_loss = loss_func(integrated_densities.float(), target)
+                val_loss += batch_val_loss.detach()
+                val_batches += 1.0
+
+        stats = torch.stack([val_loss, val_batches])
+        if self.world_size > 1:
+            dist.all_reduce(stats, dist.ReduceOp.SUM)
+        if stats[1].item() == 0.0:
+            return None
+        return (stats[0] / stats[1]).item()
 
     def save_volume(self, path: str = "recon_volume.npz", overwrite: bool = False):
         """
@@ -460,16 +522,34 @@ class Tomography(TomographyOpt, TomographyBase):
             batch_size=tomography.batch_size,
             num_workers=tomography.num_workers,
             val_fraction=tomography.val_fraction,
+            holdout_fraction=getattr(tomography, "holdout_fraction", 0.0),
+            holdout_seed=getattr(tomography, "holdout_seed", 0),
         )
         return tomography
 
-    def _rebuild_dataloader(self, batch_size: int, num_workers: int, val_fraction: float):
+    def _rebuild_dataloader(
+        self,
+        batch_size: int,
+        num_workers: int,
+        val_fraction: float,
+        holdout_fraction: float = 0.0,
+        holdout_seed: int = 0,
+    ):
         """
         Rebuilds the dataloader due to persistent workers error when reloading the object.
         """
-        self._setup_recon_dataloaders(batch_size, num_workers, val_fraction)
+        self._setup_recon_dataloaders(
+            batch_size, num_workers, val_fraction, holdout_fraction, holdout_seed
+        )
 
-    def _setup_recon_dataloaders(self, batch_size: int, num_workers: int, val_fraction: float):
+    def _setup_recon_dataloaders(
+        self,
+        batch_size: int,
+        num_workers: int,
+        val_fraction: float,
+        holdout_fraction: float = 0.0,
+        holdout_seed: int = 0,
+    ):
         """Build the train/val batch iterators.
 
         INR datasets use ``DeviceBatchSampler`` — batches are built with
@@ -480,31 +560,81 @@ class Tomography(TomographyOpt, TomographyBase):
         ranks (DistributedSampler semantics; the loop's ``set_epoch`` drives
         reshuffling). Non-INR datasets keep the DataLoader path.
         """
+        self.val_fg_dataloader = None
+        self.val_bg_dataloader = None
         if isinstance(self.dset, TomographyINRDataset):
             n = len(self.dset)
-            n_val = int(n * val_fraction)
-            # Fixed-seed split: identical across DDP ranks (no train/val
-            # leakage between ranks) and stable across save/reload, so a
-            # resumed run keeps validating on the same held-out pixels.
-            split_gen = torch.Generator()
-            split_gen.manual_seed(0)
-            perm = torch.randperm(n, generator=split_gen)
+            if holdout_fraction > 0.0:
+                split = build_pixel_holdout_split(
+                    self.dset.tilt_stack,
+                    holdout_fraction=holdout_fraction,
+                    holdout_seed=holdout_seed,
+                )
+                train_indices = split.train_indices
+                val_indices = split.val_indices
+                val_fg_indices = split.val_fg_indices
+                val_bg_indices = split.val_bg_indices
+            else:
+                n_val = int(n * val_fraction)
+                # Fixed-seed split: identical across DDP ranks (no train/val
+                # leakage between ranks) and stable across save/reload, so a
+                # resumed run keeps validating on the same held-out pixels.
+                split_gen = torch.Generator()
+                split_gen.manual_seed(0)
+                perm = torch.randperm(n, generator=split_gen)
+                train_indices = perm[n_val:]
+                val_indices = perm[:n_val]
+                val_fg_indices = torch.empty(0, dtype=torch.long)
+                val_bg_indices = torch.empty(0, dtype=torch.long)
+
             ddp = dict(rank=self.global_rank, world_size=self.world_size)
             self.dataloader = DeviceBatchSampler(
-                self.dset, batch_size, self.device, indices=perm[n_val:], **ddp
+                self.dset, batch_size, self.device, indices=train_indices, **ddp
             )
             # The val sampler keeps its own device-resident copy of the tilt
             # stack; acceptable, since val_fraction > 0 is the rare case.
             val = (
                 DeviceBatchSampler(
-                    self.dset, batch_size, self.device, indices=perm[:n_val], shuffle=False, **ddp
+                    self.dset,
+                    batch_size,
+                    self.device,
+                    indices=val_indices,
+                    shuffle=False,
+                    drop_last=False,
+                    **ddp,
                 )
-                if n_val > 0
+                if len(val_indices) > 0
                 else None
             )
-            # A per-rank val shard smaller than one batch would divide by
-            # zero in the val-loss average.
             self.val_dataloader = val if val is not None and len(val) > 0 else None
+            val_fg = (
+                DeviceBatchSampler(
+                    self.dset,
+                    batch_size,
+                    self.device,
+                    indices=val_fg_indices,
+                    shuffle=False,
+                    drop_last=False,
+                    **ddp,
+                )
+                if len(val_fg_indices) > 0
+                else None
+            )
+            val_bg = (
+                DeviceBatchSampler(
+                    self.dset,
+                    batch_size,
+                    self.device,
+                    indices=val_bg_indices,
+                    shuffle=False,
+                    drop_last=False,
+                    **ddp,
+                )
+                if len(val_bg_indices) > 0
+                else None
+            )
+            self.val_fg_dataloader = val_fg if val_fg is not None and len(val_fg) > 0 else None
+            self.val_bg_dataloader = val_bg if val_bg is not None and len(val_bg) > 0 else None
             # The training loop calls set_epoch on self.sampler.
             self.sampler = self.dataloader
             self.val_sampler = None

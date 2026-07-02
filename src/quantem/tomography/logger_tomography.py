@@ -51,6 +51,8 @@ class LoggerTomography(LoggerBase):
         learning_rates: dict[str, float],
         num_samples_per_ray: int,
         val_loss: float | None = None,
+        val_fg_loss: float | None = None,
+        val_bg_loss: float | None = None,
     ):
         self.log_scalar("loss/consistency", consistency_loss, iter)
         self.log_scalar("loss/total", total_loss, iter)
@@ -59,7 +61,12 @@ class LoggerTomography(LoggerBase):
         for param_name, lr_value in learning_rates.items():
             self.log_scalar(f"learning_rate/{param_name}", float(lr_value), iter)
         if val_loss is not None:
+            self.log_scalar("loss/validation", val_loss, iter)
             self.log_scalar("loss/val", val_loss, iter)
+        if val_fg_loss is not None:
+            self.log_scalar("val/fg", val_fg_loss, iter)
+        if val_bg_loss is not None:
+            self.log_scalar("val/bg", val_bg_loss, iter)
 
     def log_iter_images(
         self,
