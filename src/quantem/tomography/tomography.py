@@ -358,29 +358,26 @@ class Tomography(TomographyOpt, TomographyBase):
             )
             if validate_this_epoch:
                 print("Validating...")
-                self.obj_model.model.eval()
-                self.dset.eval()
-                with torch.no_grad():
-                    avg_val_loss = self._evaluate_validation_loss(
-                        dataloader=self.val_dataloader,
+                avg_val_loss = self._evaluate_validation_loss(
+                    dataloader=self.val_dataloader,
+                    num_samples_per_ray=curr_num_samples_per_ray,
+                    object_extent=N,
+                    loss_func=loss_func,
+                )
+                if getattr(self, "val_fg_dataloader", None) is not None:
+                    avg_val_fg_loss = self._evaluate_validation_loss(
+                        dataloader=self.val_fg_dataloader,
                         num_samples_per_ray=curr_num_samples_per_ray,
                         object_extent=N,
                         loss_func=loss_func,
                     )
-                    if getattr(self, "val_fg_dataloader", None) is not None:
-                        avg_val_fg_loss = self._evaluate_validation_loss(
-                            dataloader=self.val_fg_dataloader,
-                            num_samples_per_ray=curr_num_samples_per_ray,
-                            object_extent=N,
-                            loss_func=loss_func,
-                        )
-                    if getattr(self, "val_bg_dataloader", None) is not None:
-                        avg_val_bg_loss = self._evaluate_validation_loss(
-                            dataloader=self.val_bg_dataloader,
-                            num_samples_per_ray=curr_num_samples_per_ray,
-                            object_extent=N,
-                            loss_func=loss_func,
-                        )
+                if getattr(self, "val_bg_dataloader", None) is not None:
+                    avg_val_bg_loss = self._evaluate_validation_loss(
+                        dataloader=self.val_bg_dataloader,
+                        num_samples_per_ray=curr_num_samples_per_ray,
+                        object_extent=N,
+                        loss_func=loss_func,
+                    )
 
             metrics = torch.tensor(
                 [total_loss, consistency_loss, epoch_soft_constraint_loss], device=self.device
@@ -460,27 +457,38 @@ class Tomography(TomographyOpt, TomographyBase):
     ) -> float | None:
         val_loss = torch.tensor(0.0, device=self.device)
         val_batches = torch.tensor(0.0, device=self.device)
+        model_was_training = self.obj_model.model.training
+        dset_was_training = self.dset.training
 
-        for batch in dataloader:
-            # Match the training pass (enabled=False): bf16 autocast breaks
-            # the so3 pose solve and would make validation inconsistent with
-            # the fp32 training loss it is compared to.
-            with torch.autocast(
-                device_type=self.device.type,
-                dtype=torch.bfloat16,
-                enabled=False,
-            ):
-                all_coords = self.dset.get_coords(batch, object_extent, num_samples_per_ray)
-                all_densities = self.obj_model.forward(all_coords)
-                integrated_densities = self.dset.integrate_rays(
-                    all_densities,
-                    num_samples_per_ray,
-                    len(batch["target_value"]),
-                )
-                target = batch["target_value"].to(self.device, non_blocking=True).float()
-                batch_val_loss = loss_func(integrated_densities.float(), target)
-                val_loss += batch_val_loss.detach()
-                val_batches += 1.0
+        self.obj_model.model.eval()
+        self.dset.eval()
+        try:
+            with torch.no_grad():
+                for batch in dataloader:
+                    # Match the training pass (enabled=False): bf16 autocast breaks
+                    # the so3 pose solve and would make validation inconsistent with
+                    # the fp32 training loss it is compared to.
+                    with torch.autocast(
+                        device_type=self.device.type,
+                        dtype=torch.bfloat16,
+                        enabled=False,
+                    ):
+                        all_coords = self.dset.get_coords(
+                            batch, object_extent, num_samples_per_ray
+                        )
+                        all_densities = self.obj_model.forward(all_coords)
+                        integrated_densities = self.dset.integrate_rays(
+                            all_densities,
+                            num_samples_per_ray,
+                            len(batch["target_value"]),
+                        )
+                        target = batch["target_value"].to(self.device, non_blocking=True).float()
+                        batch_val_loss = loss_func(integrated_densities.float(), target)
+                        val_loss += batch_val_loss.detach()
+                        val_batches += 1.0
+        finally:
+            self.obj_model.model.train(model_was_training)
+            self.dset.train(dset_was_training)
 
         stats = torch.stack([val_loss, val_batches])
         if self.world_size > 1:
