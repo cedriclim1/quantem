@@ -60,7 +60,12 @@ def _take_grad_step_snapshot(
             np.save(snapshot_path, np.asarray(volume_or_none).astype(np.float32, copy=False))
 
         if logger is not None:
-            logger.log_scalar("snapshots/last_grad_step", float(grad_step), grad_step)
+            logger.log_scalar(
+                "snapshots/last_grad_step",
+                float(grad_step),
+                grad_step,
+                step_domain="grad_step",
+            )
 
     if snapshot_callback is not None:
         snapshot_callback(grad_step, volume_or_none)

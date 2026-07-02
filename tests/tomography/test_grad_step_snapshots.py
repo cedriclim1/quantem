@@ -23,8 +23,8 @@ class _Logger:
     def __init__(self):
         self.scalars = []
 
-    def log_scalar(self, tag, value, step):
-        self.scalars.append((tag, value, step))
+    def log_scalar(self, tag, value, step, step_domain="epoch"):
+        self.scalars.append((tag, value, step, step_domain))
 
 
 @pytest.mark.parametrize(
@@ -78,7 +78,7 @@ def test_take_grad_step_snapshot_main_rank_writes_logs_and_callbacks(monkeypatch
     assert saved["path"] == Path("snapshots") / "step_4.npy"
     assert saved["array"].dtype == np.float32
     np.testing.assert_array_equal(saved["array"], obj_model.volume.astype(np.float32))
-    assert logger.scalars == [("snapshots/last_grad_step", 4.0, 4)]
+    assert logger.scalars == [("snapshots/last_grad_step", 4.0, 4, "grad_step")]
     assert callback_calls == [(4, obj_model.volume)]
 
 
