@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.cuda import nvtx
 from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
@@ -245,6 +246,7 @@ class Tomography(TomographyOpt, TomographyBase):
 
         pbar = tqdm(range(num_iter), disable=not self.verbose)
         for a0 in pbar:
+            nvtx.range_push(f"epoch_{a0}")
             consistency_loss = torch.tensor(0.0, device=self.device)
             total_loss = torch.tensor(0.0, device=self.device)
             epoch_soft_constraint_loss = torch.tensor(0.0, device=self.device)
@@ -268,26 +270,34 @@ class Tomography(TomographyOpt, TomographyBase):
                 curr_num_samples_per_ray = num_samples_per_ray
 
             for batch_idx, batch in enumerate(self.dataloader):
+                nvtx.range_push("batch")
                 self.zero_grad_all()
                 with torch.autocast(
                     device_type=self.device.type,
                     dtype=torch.bfloat16,
                     enabled=False,
                 ):
+                    nvtx.range_push("get_coords")
                     all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
+                    nvtx.range_pop()
 
+                    nvtx.range_push("obj_forward")
                     all_densities = self.obj_model.forward(all_coords)
+                    nvtx.range_pop()
 
+                    nvtx.range_push("integrate_rays")
                     integrated_densities = self.dset.integrate_rays(
                         all_densities,
                         curr_num_samples_per_ray,
                         len(batch["target_value"]),
                     )
+                    nvtx.range_pop()
 
                 pred = integrated_densities.float()
 
                 target = batch["target_value"].to(self.device, non_blocking=True).float()
 
+                nvtx.range_push("soft_constraints")
                 soft_constraints_loss = self.obj_model.apply_soft_constraints(
                     ctx=ReconstructionContext(
                         coords=all_coords,
@@ -296,7 +306,9 @@ class Tomography(TomographyOpt, TomographyBase):
                         target=target,
                     )
                 )
+                nvtx.range_pop()
 
+                nvtx.range_push("consistency_loss")
                 batch_consistency_loss = loss_func(pred, target)
 
                 soft_constraints_loss += self.dset.apply_soft_constraints()
@@ -304,11 +316,16 @@ class Tomography(TomographyOpt, TomographyBase):
                 epoch_soft_constraint_loss += soft_constraints_loss.detach()
 
                 batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
+                nvtx.range_pop()
 
+                nvtx.range_push("backward")
                 batch_loss.backward()
+                nvtx.range_pop()
                 # Clip gradients
+                nvtx.range_push("clip_and_optim_step")
                 torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)
                 self.step_optimizers()
+                nvtx.range_pop()
                 self._grad_steps = getattr(self, "_grad_steps", 0) + 1
                 if snapshots_enabled and _should_take_grad_step_snapshot(
                     self._grad_steps, snapshot_every
@@ -323,6 +340,7 @@ class Tomography(TomographyOpt, TomographyBase):
                     )
                 total_loss += batch_loss.detach()
                 consistency_loss += batch_consistency_loss.detach()
+                nvtx.range_pop()  # batch
 
             if isinstance(self.obj_model.model, CPTilted):
                 if a0 == 0:
@@ -344,9 +362,11 @@ class Tomography(TomographyOpt, TomographyBase):
                     prev_R = R_now.clone()
 
             if self.world_size > 1:
+                nvtx.range_push("ddp_allreduce_epoch_metrics")
                 dist.all_reduce(total_loss, dist.ReduceOp.AVG)
                 dist.all_reduce(consistency_loss, dist.ReduceOp.AVG)
                 dist.all_reduce(epoch_soft_constraint_loss, dist.ReduceOp.AVG)
+                nvtx.range_pop()
 
             total_loss = total_loss.item() / len(self.dataloader)
             consistency_loss = consistency_loss.item() / len(self.dataloader)
@@ -363,6 +383,7 @@ class Tomography(TomographyOpt, TomographyBase):
             )
             if validate_this_epoch:
                 print("Validating...")
+                nvtx.range_push("validation")
                 avg_val_loss = self._evaluate_validation_loss(
                     dataloader=self.val_dataloader,
                     num_samples_per_ray=curr_num_samples_per_ray,
@@ -383,6 +404,7 @@ class Tomography(TomographyOpt, TomographyBase):
                         object_extent=N,
                         loss_func=loss_func,
                     )
+                nvtx.range_pop()  # validation
 
             metrics = torch.tensor(
                 [total_loss, consistency_loss, epoch_soft_constraint_loss], device=self.device
@@ -447,6 +469,7 @@ class Tomography(TomographyOpt, TomographyBase):
             # every rank; it is the caller's responsibility to guard rank-0-only work.
             if eval_callback is not None and eval_every > 0 and (a0 + 1) % eval_every == 0:
                 eval_callback(a0 + 1)
+            nvtx.range_pop()  # epoch
 
         if show_metrics and self.world_size == 1:
             self.plot_losses()
