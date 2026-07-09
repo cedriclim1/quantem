@@ -276,7 +276,14 @@ class Tomography(TomographyOpt, TomographyBase):
                 ):
                     all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
 
-                    all_densities = self.obj_model.forward(all_coords)
+                    tap_coords = self.obj_model.sample_tv_tap_coords(all_coords)
+                    if tap_coords is not None:
+                        all_densities, tv_tap_raw = self.obj_model.forward_with_tv_taps(
+                            all_coords, tap_coords
+                        )
+                    else:
+                        all_densities = self.obj_model.forward(all_coords)
+                        tv_tap_raw = None
 
                     integrated_densities = self.dset.integrate_rays(
                         all_densities,
@@ -294,6 +301,7 @@ class Tomography(TomographyOpt, TomographyBase):
                         pred=pred,
                         all_densities=all_densities,
                         target=target,
+                        tv_tap_densities=tv_tap_raw,
                     )
                 )
 
@@ -343,14 +351,13 @@ class Tomography(TomographyOpt, TomographyBase):
                     )
                     prev_R = R_now.clone()
 
+            # One stacked all_reduce and one host sync instead of three of each.
+            losses = torch.stack([total_loss, consistency_loss, epoch_soft_constraint_loss])
             if self.world_size > 1:
-                dist.all_reduce(total_loss, dist.ReduceOp.AVG)
-                dist.all_reduce(consistency_loss, dist.ReduceOp.AVG)
-                dist.all_reduce(epoch_soft_constraint_loss, dist.ReduceOp.AVG)
-
-            total_loss = total_loss.item() / len(self.dataloader)
-            consistency_loss = consistency_loss.item() / len(self.dataloader)
-            epoch_soft_constraint_loss = epoch_soft_constraint_loss.item() / len(self.dataloader)
+                dist.all_reduce(losses, dist.ReduceOp.AVG)
+            total_loss, consistency_loss, epoch_soft_constraint_loss = (
+                losses / len(self.dataloader)
+            ).tolist()
 
             self.step_schedulers(loss=total_loss)
             # TODO: Maybe reorganize the losses so that the order makes sense lol.
@@ -384,15 +391,9 @@ class Tomography(TomographyOpt, TomographyBase):
                         loss_func=loss_func,
                     )
 
-            metrics = torch.tensor(
-                [total_loss, consistency_loss, epoch_soft_constraint_loss], device=self.device
-            )
-
-            if self.world_size > 1:
-                dist.all_reduce(metrics, dist.ReduceOp.AVG)
-
-            total_loss, consistency_loss, epoch_soft_constraint_loss = metrics.tolist()
-
+            # The three losses were already rank-averaged (and batch-normalized) right
+            # after the batch loop; re-reducing identical values here was a redundant
+            # all_reduce plus an extra host sync per epoch.
             pbar.set_description(
                 f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}"
             )

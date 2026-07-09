@@ -309,3 +309,28 @@ class TestObjectTensorDecompTV:
             obj._normalize_optimizer_params(
                 {"grids": OptimizerParams.Adam(), "wrong": OptimizerParams.Adam()}
             )
+
+
+class TestObjectINRCompileOptIn:
+    """compile_model=True must change performance only, never results."""
+
+    def _make(self, compile_model, device):
+        from quantem.core.ml.inr import HSiren
+
+        torch.manual_seed(0)
+        model = HSiren(hidden_layers=1, hidden_features=16, alpha=1)
+        return ObjectINR.from_model(
+            model, shape=(8, 8, 8), device=device, compile_model=compile_model
+        )
+
+    def test_default_is_eager(self, torch_device):
+        obj = self._make(False, torch_device)
+        assert obj._compile_model is False
+
+    @pytest.mark.slow
+    def test_compiled_forward_matches_eager(self, torch_device):
+        torch.manual_seed(1)
+        coords = (torch.rand(64, 3) * 2 - 1).to(torch_device)
+        out_eager = self._make(False, torch_device).forward(coords)
+        out_compiled = self._make(True, torch_device).forward(coords)
+        torch.testing.assert_close(out_compiled, out_eager, rtol=1e-5, atol=1e-6)

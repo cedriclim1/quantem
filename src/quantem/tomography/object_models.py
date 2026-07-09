@@ -1,3 +1,4 @@
+import weakref
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
 from quantem.tomography.tomography_context import ReconstructionContext
+from quantem.tomography.utils import tv_loss_vol_sq
 
 
 class ObjConstraintParams:
@@ -455,11 +457,9 @@ class ObjectPixelated(ObjectConstraints):
         # TV over the three trailing spatial dims, leaving any leading channel/batch axes
         # intact. Works for a 3-D volume, obj_view's [1, D, H, W], and a multimodal
         # [C, D, H, W] (channels = elemental compositions), matching the INR / tensor-decomp
-        # convention where the object carries a leading channel dimension.
-        tv_d = torch.pow(ctx.obj[..., 1:, :, :] - ctx.obj[..., :-1, :, :], 2).sum()
-        tv_h = torch.pow(ctx.obj[..., :, 1:, :] - ctx.obj[..., :, :-1, :], 2).sum()
-        tv_w = torch.pow(ctx.obj[..., :, :, 1:] - ctx.obj[..., :, :, :-1], 2).sum()
-        tv_loss = tv_d + tv_h + tv_w
+        # convention where the object carries a leading channel dimension. tv_loss_vol_sq
+        # dispatches to the fused quantem-cuda kernel when available.
+        tv_loss = tv_loss_vol_sq(ctx.obj)
 
         return tv_loss * self.constraints.tv_vol / ctx.obj.numel()
 
@@ -473,6 +473,14 @@ class ObjectPixelated(ObjectConstraints):
         return self
 
 
+# torch.compile artifacts keyed by the live model object. Kept outside the
+# instances so AutoSerialize never sees them and reset()/rebuild_model()
+# (which swap the model object) naturally invalidate the cache.
+_compiled_forward_cache: "weakref.WeakKeyDictionary[nn.Module, Callable]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
 class ObjectINR(ObjectConstraints, DDPMixin):
     DEFAULT_CONSTRAINTS = ObjConstraintParams.ObjINRConstraints()
 
@@ -482,6 +490,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
         model: nn.Module | None = None,
+        compile_model: bool = False,
         _token: object | None = None,
     ):
         super().__init__(
@@ -492,6 +501,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         )
         self._pretrain_losses = []
         self._pretrain_lrs = []
+        self._compile_model = bool(compile_model)
         self.constraints: ObjConstraintParams.ObjINRConstraints = self.DEFAULT_CONSTRAINTS.copy()
         # Register the network submodule (important: real nn.Module attribute)
         if model is not None:
@@ -505,17 +515,35 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         shape: tuple[int, int, int],
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
+        compile_model: bool = False,
     ):
         obj_model = cls(
             shape=shape,
             device=device,
             rng=rng,
             model=model,  # ✅ build/register in __init__
+            compile_model=compile_model,
         )
 
         obj_model.setup_distributed(device=device)
         obj_model.to(device)
         return obj_model
+
+    def _model_call(self, coords: torch.Tensor) -> torch.Tensor:
+        """Invoke the model, through torch.compile when compile_model was set.
+
+        Compiles the bound __call__ (a plain function, so nothing extra is
+        registered on the module tree or picked up by AutoSerialize) and
+        caches per model object.
+        """
+        model = self.model
+        if not getattr(self, "_compile_model", False):
+            return model(coords)
+        fn = _compiled_forward_cache.get(model)
+        if fn is None:
+            fn = torch.compile(model.__call__)
+            _compiled_forward_cache[model] = fn
+        return fn(coords)
 
     # --- Properties ---
 
@@ -592,6 +620,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             pred = torch.max(pred - self.constraints.shrinkage, torch.zeros_like(pred))
 
         return pred
+
+    def sample_tv_tap_coords(self, coords: torch.Tensor) -> Optional[torch.Tensor]:
+        """Hook for the training loop: returns None (INR TV uses autograd, no tap merging)."""
+        return None
 
     # --- Define get_tv_loss ---
 
@@ -704,7 +736,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         """forward pass for the INR model"""
         assert coords is not None, "ObjectINR.forward requires coords"
 
-        all_densities = self.model(coords)
+        # TV's autograd.grad recompute stays on the eager model (double
+        # backward through compiled graphs is not reliable); only this main
+        # forward goes through the compiled path.
+        all_densities = self._model_call(coords)
 
         if all_densities.dim() > 1:
             all_densities = all_densities.squeeze(-1)
@@ -725,6 +760,40 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         all_densities = self.apply_hard_constraints(all_densities)
 
         return all_densities
+
+    def forward_with_tv_taps(
+        self, coords: torch.Tensor, tap_coords: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Single model call covering the main batch and the volume-TV tap points.
+
+        The out-of-bounds mask and hard constraints apply to the main chunk
+        only; tap densities are returned raw (border-clamped), matching the
+        fallback path in ``get_volume_tv_loss``.
+        """
+        merged = self.model(torch.cat([coords, tap_coords], dim=0))
+        if isinstance(merged, tuple):
+            merged = merged[0]
+        main, taps = merged[: coords.shape[0]], merged[coords.shape[0] :]
+
+        if main.dim() > 1:
+            main = main.squeeze(-1)
+        valid_mask = (
+            (coords[:, 0] >= -1)
+            & (coords[:, 0] <= 1)
+            & (coords[:, 1] >= -1)
+            & (coords[:, 1] <= 1)
+            & (coords[:, 2] >= -1)
+            & (coords[:, 2] <= 1)
+        ).float()
+        if main.dim() > 1:
+            valid_mask = valid_mask.unsqueeze(-1)
+        main = main * valid_mask
+        main = self.apply_hard_constraints(main)
+
+        if taps.dim() == 1:
+            taps = taps.unsqueeze(-1)
+        return main, taps
 
     # Pretrain Loop
 
@@ -963,6 +1032,30 @@ class ObjectTensorDecomp(ObjectINR):
         obj_model.to(device)
         return obj_model
 
+    def sample_tv_tap_coords(self, coords: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        Sample the finite-difference tap coordinates for the volume TV loss.
+
+        Returns a (4*n, 3) tensor [base; base+h*ex; base+h*ey; base+h*ez] for n
+        sampled base points, or None when tv_vol == 0.  The training loop
+        concatenates this to all_coords so the TV taps are evaluated in the
+        same model call as the main forward pass.
+        """
+        if self.constraints.tv_vol == 0:
+            return None
+        model = _unwrap(self.model)
+        h = 2.0 / min(model.resolution)
+        num_tv_samples = min(10_000, coords.shape[0])
+        tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
+        tv_coords = coords[tv_indices]  # (n, 3)
+        ex = torch.zeros(3, device=tv_coords.device)
+        ex[0] = h
+        ey = torch.zeros(3, device=tv_coords.device)
+        ey[1] = h
+        ez = torch.zeros(3, device=tv_coords.device)
+        ez[2] = h
+        return torch.cat([tv_coords, tv_coords + ex, tv_coords + ey, tv_coords + ez], dim=0)
+
     # --- Constraints ---
 
     def apply_soft_constraints(self, ctx: ReconstructionContext) -> torch.Tensor:
@@ -1001,7 +1094,9 @@ class ObjectTensorDecomp(ObjectINR):
         if self.constraints.tv_plane > 0:
             tv_loss = tv_loss + self._get_plane_tv_loss()
         if self.constraints.tv_vol > 0:
-            tv_loss = tv_loss + self.get_volume_tv_loss(ctx.coords)
+            tv_loss = tv_loss + self.get_volume_tv_loss(
+                ctx.coords, precomputed_tap_densities=ctx.tv_tap_densities
+            )
         return tv_loss
 
     def _get_plane_tv_loss(self) -> torch.Tensor:
@@ -1029,33 +1124,48 @@ class ObjectTensorDecomp(ObjectINR):
 
         return self.constraints.tv_plane * torch.stack(per_level).sum()
 
-    def get_volume_tv_loss(self, coords: torch.Tensor) -> torch.Tensor:
+    def get_volume_tv_loss(
+        self,
+        coords: torch.Tensor,
+        precomputed_tap_densities: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Isotropic volume TV via finite differences. Same form as the autograd
         version (L1 of gradient L2-norm) but avoids double-backward, so it
         works for KPlanesTILTED, CPTilted, and anything else.
-        """
-        num_tv_samples = min(10_000, coords.shape[0])
-        tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
-        tv_coords = coords[tv_indices]  # (N, 3)
 
+        When *precomputed_tap_densities* is provided (a (4N, C) tensor from the
+        merged single-pass forward in the training loop), the model call is
+        skipped entirely and the supplied values are used directly.  When absent
+        the existing batched 4N-point fallback path runs unchanged.
+        """
         model = _unwrap(self.model)
         h = 2.0 / min(model.resolution)
 
-        # Evaluate the base points and the three axis-shifted copies in a single
-        # batched forward (4N points) instead of 4 sequential model calls.
-        offsets = h * torch.eye(3, device=tv_coords.device, dtype=tv_coords.dtype)  # (3, 3)
-        all_coords = torch.cat(
-            [tv_coords, (tv_coords.unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1, 3)]
-        )  # (4N, 3)
+        if precomputed_tap_densities is not None:
+            # (4N, C) tap densities from the merged single-pass forward in the
+            # training loop; layout [base; +ex; +ey; +ez] per sample_tv_tap_coords.
+            all_pred = precomputed_tap_densities
+        else:
+            num_tv_samples = min(10_000, coords.shape[0])
+            tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
+            tv_coords = coords[tv_indices]  # (N, 3)
 
-        all_pred = model(all_coords)
-        if isinstance(all_pred, tuple):
-            all_pred = all_pred[0]
+            # Evaluate the base points and the three axis-shifted copies in a single
+            # batched forward (4N points) instead of 4 sequential model calls.
+            offsets = h * torch.eye(3, device=tv_coords.device, dtype=tv_coords.dtype)  # (3, 3)
+            all_coords = torch.cat(
+                [tv_coords, (tv_coords.unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1, 3)]
+            )  # (4N, 3)
+
+            all_pred = model(all_coords)
+            if isinstance(all_pred, tuple):
+                all_pred = all_pred[0]
+
         if all_pred.dim() == 1:
             all_pred = all_pred.unsqueeze(-1)  # (4N, 1)
 
-        n = tv_coords.shape[0]
+        n = all_pred.shape[0] // 4
         pred = all_pred[:n]  # (N, C)
         shifted_pred = all_pred[n:].view(3, n, -1)  # (3, N, C)
 

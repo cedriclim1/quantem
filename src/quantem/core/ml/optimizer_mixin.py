@@ -662,7 +662,9 @@ class OptimizerMixin:
         for key, tensors in groups.items():
             for p in tensors:
                 p.requires_grad_(True)
-            param_groups.append({"params": tensors, **specs[key].params()})
+            # "name" records the group key so reconnect_optimizer_to_parameters
+            # can re-join hyperparameters to groups by key, not position.
+            param_groups.append({"params": tensors, **specs[key].params(), "name": key})
         self._optimizer = self._build_optimizer(spec_list[0], param_groups)
 
     def _build_optimizer(self, opt_params, param_groups) -> "torch.optim.Optimizer":
@@ -672,11 +674,15 @@ class OptimizerMixin:
         so each group's ``lr`` etc. overrides the optimizer-level default. ``NoneOptimizer`` must
         have been filtered out by the caller.
         """
+        # Fused Adam/AdamW runs the whole step in one CUDA kernel (~2x faster than the
+        # default foreach path on large grids, same update rule); only valid when every
+        # parameter lives on a CUDA device.
+        fused = all(p.is_cuda for group in param_groups for p in group["params"])
         match opt_params:
             case OptimizerParams.Adam():
-                return torch.optim.Adam(param_groups)
+                return torch.optim.Adam(param_groups, fused=fused)
             case OptimizerParams.AdamW():
-                return torch.optim.AdamW(param_groups)
+                return torch.optim.AdamW(param_groups, fused=fused)
             case OptimizerParams.SGD():
                 return torch.optim.SGD(param_groups)
             case OptimizerParams.NoneOptimizer():
@@ -804,14 +810,26 @@ class OptimizerMixin:
         old_hyperparams = [
             {k: v for k, v in pg.items() if k != "params"} for pg in self._optimizer.param_groups
         ]
+        old_by_name = {hp["name"]: hp for hp in old_hyperparams if "name" in hp}
 
         self._optimizer.param_groups.clear()
-        for tensors in new_groups.values():
-            self._optimizer.add_param_group({"params": tensors})
+        for key, tensors in new_groups.items():
+            self._optimizer.add_param_group({"params": tensors, "name": key})
 
-        # Restore per-group hyperparameters by index
-        for new_pg, old_pg in zip(self._optimizer.param_groups, old_hyperparams):
-            new_pg.update(old_pg)
+        if old_by_name:
+            # Re-join hyperparameters to groups by key: group order/membership
+            # from get_optimization_parameters() is not contractual, and index
+            # alignment silently attaches the wrong lr when it changes. Groups
+            # with no old counterpart keep the optimizer defaults.
+            for new_pg in self._optimizer.param_groups:
+                hp = old_by_name.get(new_pg["name"])
+                if hp is not None:
+                    new_pg.update(hp)
+        else:
+            # Optimizers restored from checkpoints predating group names:
+            # index alignment is the only association available.
+            for new_pg, old_pg in zip(self._optimizer.param_groups, old_hyperparams):
+                new_pg.update(old_pg)
 
         # Remap state for tensors that survived
         new_state = {}
