@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from quantem.core import config
+
 from .model_base import PPLR, TensorDecompositionModel
 from .so3params import SO3ParamQuat, SO3ParamR9SVD
 
@@ -328,9 +330,30 @@ def interpolate_ms_features_tilted(
     block before concatenation. Used for coarse-to-fine band-limiting: ramp the finer
     scales on over training so the model commits to view-consistent low-frequency structure
     first (a classical limited-angle prior). None => all scales fully on (default behaviour).
+
+    When the optional ``quantem-cuda`` package is installed, the tensors live
+    on a CUDA device, and the ``use_cuda_kernels`` config option is true
+    (default), each scale dispatches to the fused CUDA kernel (rotate +
+    grid_sample + Hadamard product in one launch, analytic backward) —
+    identical semantics to the torch path below, including scale_gates.
     """
     T = rotation_matrices.shape[0]
     B = pts.shape[0]
+
+    if (
+        pts.is_cuda
+        and pts.dtype == torch.float32
+        and rotation_matrices.dtype == torch.float32
+        and all(g.dtype == torch.float32 for g in ms_grids)
+        and config.get("has_quantem_cuda")
+        and config.get("use_cuda_kernels", default=True)
+    ):
+        from quantem.cuda.core.ml import kplanes_tilted_fuse
+
+        feats = [kplanes_tilted_fuse(pts, rotation_matrices, g) for g in ms_grids]
+        if scale_gates is not None:
+            feats = [f * scale_gates[si] for si, f in enumerate(feats)]
+        return torch.cat(feats, dim=-1)
 
     # (T, B, 3)  — rotate all points by all rotations at once
     rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
