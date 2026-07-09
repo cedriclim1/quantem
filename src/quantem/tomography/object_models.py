@@ -1,3 +1,4 @@
+import weakref
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
@@ -472,6 +473,14 @@ class ObjectPixelated(ObjectConstraints):
         return self
 
 
+# torch.compile artifacts keyed by the live model object. Kept outside the
+# instances so AutoSerialize never sees them and reset()/rebuild_model()
+# (which swap the model object) naturally invalidate the cache.
+_compiled_forward_cache: "weakref.WeakKeyDictionary[nn.Module, Callable]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
 class ObjectINR(ObjectConstraints, DDPMixin):
     DEFAULT_CONSTRAINTS = ObjConstraintParams.ObjINRConstraints()
 
@@ -481,6 +490,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
         model: nn.Module | None = None,
+        compile_model: bool = False,
         _token: object | None = None,
     ):
         super().__init__(
@@ -491,6 +501,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         )
         self._pretrain_losses = []
         self._pretrain_lrs = []
+        self._compile_model = bool(compile_model)
         self.constraints: ObjConstraintParams.ObjINRConstraints = self.DEFAULT_CONSTRAINTS.copy()
         # Register the network submodule (important: real nn.Module attribute)
         if model is not None:
@@ -504,17 +515,35 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         shape: tuple[int, int, int],
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
+        compile_model: bool = False,
     ):
         obj_model = cls(
             shape=shape,
             device=device,
             rng=rng,
             model=model,  # ✅ build/register in __init__
+            compile_model=compile_model,
         )
 
         obj_model.setup_distributed(device=device)
         obj_model.to(device)
         return obj_model
+
+    def _model_call(self, coords: torch.Tensor) -> torch.Tensor:
+        """Invoke the model, through torch.compile when compile_model was set.
+
+        Compiles the bound __call__ (a plain function, so nothing extra is
+        registered on the module tree or picked up by AutoSerialize) and
+        caches per model object.
+        """
+        model = self.model
+        if not getattr(self, "_compile_model", False):
+            return model(coords)
+        fn = _compiled_forward_cache.get(model)
+        if fn is None:
+            fn = torch.compile(model.__call__)
+            _compiled_forward_cache[model] = fn
+        return fn(coords)
 
     # --- Properties ---
 
@@ -707,7 +736,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         """forward pass for the INR model"""
         assert coords is not None, "ObjectINR.forward requires coords"
 
-        all_densities = self.model(coords)
+        # TV's autograd.grad recompute stays on the eager model (double
+        # backward through compiled graphs is not reliable); only this main
+        # forward goes through the compiled path.
+        all_densities = self._model_call(coords)
 
         if all_densities.dim() > 1:
             all_densities = all_densities.squeeze(-1)
