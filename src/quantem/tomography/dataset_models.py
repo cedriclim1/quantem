@@ -502,6 +502,7 @@ class DeviceBatchSampler:
         self._epoch = 0
         self._stack = dset.tilt_stack.to(self.device)
         self._angles = dset.tilt_angles.to(self.device)
+        self._target_gatherer = getattr(dset, "gather_targets", None)
         # __getitem__ decodes flat indices with shape[1] for both rows and
         # columns; replicate it exactly.
         self._s1 = dset.tilt_stack.shape[1]
@@ -539,12 +540,18 @@ class DeviceBatchSampler:
             rem = sel - proj * per_proj
             pixel_i = rem // self._s1
             pixel_j = rem - pixel_i * self._s1
+            if self._target_gatherer is None:
+                target = self._stack[proj, pixel_i, pixel_j]
+                extra = {}
+            else:
+                target, extra = self._target_gatherer(proj, pixel_i, pixel_j)
             yield {
                 "projection_idx": proj,
                 "pixel_i": pixel_i,
                 "pixel_j": pixel_j,
                 "phi": self._angles[proj],
-                "target_value": self._stack[proj, pixel_i, pixel_j],
+                "target_value": target,
+                **extra,
             }
 
 
@@ -826,4 +833,183 @@ class TomographyINRPretrainDataset(Dataset):
         return {"coords": self.coords[idx], "target": self.targets[idx]}
 
 
-DatasetModelType = TomographyINRDataset | TomographyPixDataset
+class TomographyEDSINRDataset(TomographyINRDataset):
+    """INR tomography dataset with sparse-view multi-channel EDS targets."""
+
+    def __init__(
+        self,
+        haadf_tilt_stack: Dataset3d | NDArray | torch.Tensor,
+        eds_signals_tilt_stack: NDArray | torch.Tensor,
+        sparse_view_tilt_angles: NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
+        learn_shift: bool = True,
+        learn_tilt_axis: bool = True,
+        seed: int = 42,
+        angle_tol: float = 1e-2,
+        _token: object | None = None,
+    ):
+        self.sparse_view_tilt_angles = self._as_tensor(sparse_view_tilt_angles)
+        self.eds_signals_tilt_stack = self._normalize_eds_stack(eds_signals_tilt_stack)
+        super().__init__(
+            tilt_stack=haadf_tilt_stack,
+            tilt_angles=tilt_angles,
+            learn_shift=learn_shift,
+            learn_tilt_axis=learn_tilt_axis,
+            seed=seed,
+            _token=_token,
+        )
+        if self.eds_signals_tilt_stack.shape[2:] != self.tilt_stack.shape[1:]:
+            raise ValueError("EDS and HAADF tilt stacks must have matching image dimensions.")
+        self.chem_idx_of_proj = self._build_chem_index_map(angle_tol)
+
+    @classmethod
+    def from_data(
+        cls,
+        haadf_tilt_stack: Dataset3d | NDArray | torch.Tensor,
+        eds_signals_tilt_stack: NDArray | torch.Tensor,
+        sparse_view_tilt_angles: NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
+        learn_shift: bool = True,
+        learn_tilt_axis: bool = True,
+        seed: int = 42,
+        angle_tol: float = 1e-2,
+    ):
+        return cls(
+            haadf_tilt_stack=haadf_tilt_stack,
+            eds_signals_tilt_stack=eds_signals_tilt_stack,
+            sparse_view_tilt_angles=sparse_view_tilt_angles,
+            tilt_angles=tilt_angles,
+            learn_shift=learn_shift,
+            learn_tilt_axis=learn_tilt_axis,
+            seed=seed,
+            angle_tol=angle_tol,
+            _token=cls._token,
+        )
+
+    @staticmethod
+    def _as_tensor(x: NDArray | torch.Tensor) -> torch.Tensor:
+        if isinstance(x, torch.Tensor):
+            return x.detach().clone()
+        return torch.from_numpy(x.copy())
+
+    @staticmethod
+    def _normalize_eds_stack(eds_stack: NDArray | torch.Tensor) -> torch.Tensor:
+        stack = TomographyEDSINRDataset._as_tensor(eds_stack)
+        if stack.ndim != 4:
+            raise ValueError(
+                "eds_signals_tilt_stack must have shape (channels, tilts, height, width)."
+            )
+        flat = stack.flatten(start_dim=1)
+        quantile = torch.quantile(flat, 0.95, dim=1).view(-1, 1, 1, 1)
+        fallback = flat.abs().amax(dim=1).view(-1, 1, 1, 1)
+        scale = torch.where(quantile > 0, quantile, fallback)
+        if torch.any(scale <= 0):
+            raise ValueError("An EDS channel is all zeros; cannot normalize.")
+        return stack / scale
+
+    def _build_chem_index_map(self, angle_tol: float) -> torch.Tensor:
+        tilt_angles = self.tilt_angles.detach().cpu().float()
+        sparse_angles = self.sparse_view_tilt_angles.detach().cpu().float()
+        if self.eds_signals_tilt_stack.shape[1] != sparse_angles.numel():
+            raise ValueError(
+                "eds_signals_tilt_stack tilt dimension must match sparse_view_tilt_angles."
+            )
+
+        diff = (tilt_angles[:, None] - sparse_angles[None, :]).abs()
+        nearest = diff.argmin(dim=0)
+        sparse_min = diff.min(dim=0).values
+        if torch.any(sparse_min >= angle_tol):
+            bad = sparse_angles[sparse_min >= angle_tol]
+            raise ValueError(f"Sparse EDS tilt angles do not match HAADF angles: {bad.tolist()}")
+
+        matches = diff < angle_tol
+        if torch.any(matches.sum(dim=0) != 1):
+            raise ValueError("Each sparse EDS tilt angle must match exactly one HAADF angle.")
+        if torch.unique(nearest).numel() != sparse_angles.numel():
+            raise ValueError("Sparse EDS tilt angles must map to unique HAADF projections.")
+
+        chem_idx = torch.full((tilt_angles.numel(),), -1, dtype=torch.long)
+        chem_idx[nearest] = torch.arange(sparse_angles.numel(), dtype=torch.long)
+        return chem_idx
+
+    @property
+    def n_channels(self) -> int:
+        return 1 + int(self.eds_signals_tilt_stack.shape[0])
+
+    def __getitem__(self, idx: int) -> dict:
+        projection_idx = idx // (self.tilt_stack.shape[1] * self.tilt_stack.shape[2])
+        remaining = idx % (self.tilt_stack.shape[1] * self.tilt_stack.shape[2])
+
+        pixel_i = remaining // self.tilt_stack.shape[2]
+        pixel_j = remaining % self.tilt_stack.shape[2]
+
+        haadf = self.tilt_stack[projection_idx, pixel_i, pixel_j].reshape(1)
+        chem_idx = int(self.chem_idx_of_proj[projection_idx])
+        eds_mask = chem_idx >= 0
+        chem = torch.zeros(
+            self.eds_signals_tilt_stack.shape[0],
+            dtype=self.eds_signals_tilt_stack.dtype,
+            device=self.eds_signals_tilt_stack.device,
+        )
+        if eds_mask:
+            chem = self.eds_signals_tilt_stack[:, chem_idx, pixel_i, pixel_j]
+
+        return {
+            "projection_idx": projection_idx,
+            "pixel_i": pixel_i,
+            "pixel_j": pixel_j,
+            "phi": self.tilt_angles[projection_idx],
+            "target_value": torch.cat([haadf.to(chem.dtype), chem], dim=0),
+            "eds_mask": eds_mask,
+        }
+
+    def _ensure_device_targets(self, device: torch.device | None = None):
+        device = self.device if hasattr(self, "_device") else device
+        if device is None:
+            raise RuntimeError("TomographyEDSINRDataset has no device for target gathering.")
+        if getattr(self, "_target_cache_device", None) == device:
+            return
+        self._haadf_stack_dev = self.tilt_stack.to(device)
+        self._eds_stack_dev = self.eds_signals_tilt_stack.to(device)
+        self._chem_idx_of_proj_dev = self.chem_idx_of_proj.to(device)
+        self._target_cache_device = device
+
+    def gather_targets(
+        self, proj: torch.Tensor, pixel_i: torch.Tensor, pixel_j: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        self._ensure_device_targets(proj.device)
+        haadf = self._haadf_stack_dev[proj, pixel_i, pixel_j].unsqueeze(-1)
+        chem_idx = self._chem_idx_of_proj_dev[proj]
+        eds_mask = chem_idx >= 0
+        chem = torch.zeros(
+            (proj.shape[0], self.eds_signals_tilt_stack.shape[0]),
+            dtype=self._eds_stack_dev.dtype,
+            device=self._eds_stack_dev.device,
+        )
+        if eds_mask.any():
+            chem[eds_mask] = self._eds_stack_dev[
+                :, chem_idx[eds_mask], pixel_i[eds_mask], pixel_j[eds_mask]
+            ].T
+        target = torch.cat([haadf.to(chem.dtype), chem], dim=1)
+        return target, {"eds_mask": eds_mask}
+
+    @staticmethod
+    @torch.compile(mode="reduce-overhead")
+    def _integrate_multichannel_rays(
+        rays: torch.Tensor, num_samples_per_ray: int, target_values_len: int
+    ) -> torch.Tensor:
+        ray_densities = rays.view(target_values_len, num_samples_per_ray, rays.shape[-1])
+        step_size = 2.0 / (num_samples_per_ray - 1)
+        return ray_densities.sum(dim=1) * step_size
+
+    def integrate_rays(
+        self, rays: torch.Tensor, num_samples_per_ray: int, target_values_len: int
+    ) -> torch.Tensor:
+        if rays.dim() > 1 and rays.shape[-1] > 1:
+            return self._integrate_multichannel_rays(
+                rays, num_samples_per_ray, target_values_len
+            )
+        return super().integrate_rays(rays, num_samples_per_ray, target_values_len)
+
+
+DatasetModelType = TomographyINRDataset | TomographyPixDataset | TomographyEDSINRDataset
