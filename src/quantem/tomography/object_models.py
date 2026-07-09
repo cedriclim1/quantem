@@ -747,7 +747,12 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         if main.dim() > 1:
             main = main.squeeze(-1)
         valid_mask = (
-            (coords[:, 0] >= -1) & (coords[:, 0] <= 1) & (coords[:, 1] >= -1) & (coords[:, 1] <= 1)
+            (coords[:, 0] >= -1)
+            & (coords[:, 0] <= 1)
+            & (coords[:, 1] >= -1)
+            & (coords[:, 1] <= 1)
+            & (coords[:, 2] >= -1)
+            & (coords[:, 2] <= 1)
         ).float()
         if main.dim() > 1:
             valid_mask = valid_mask.unsqueeze(-1)
