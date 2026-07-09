@@ -338,8 +338,9 @@ def interpolate_ms_features_tilted(
     on a CUDA device, and safe kernel dispatch is enabled, each scale dispatches
     to the fused CUDA kernel (rotate + grid_sample + Hadamard product in one
     launch, analytic backward). The extension path is currently restricted to
-    single-output, single-rank models: multi-channel EDS heads and DDP runs take
-    this torch path explicitly until those combinations are validated.
+    single-output models; multi-channel EDS heads take this torch path explicitly.
+    Multi-rank DDP is supported because every rank invokes the same rank-local
+    autograd operation before DDP all-reduces the resulting parameter gradients.
     """
     T = rotation_matrices.shape[0]
     B = pts.shape[0]

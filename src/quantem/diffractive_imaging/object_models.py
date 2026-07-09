@@ -397,6 +397,8 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
 
     def _calc_tv_loss(self, array: torch.Tensor, weight: tuple[float, float]) -> torch.Tensor:
         # Identical math via the fused quantem-cuda L1 kernel when available.
+        # The loss and its backward are rank-local, so DDP can all-reduce the
+        # resulting parameter gradients exactly as it does for the torch path.
         # Weighted size-1 axes fall through to torch so degenerate inputs
         # behave exactly as before.
         if (

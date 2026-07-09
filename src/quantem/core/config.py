@@ -58,27 +58,14 @@ deprecations: dict[str, str | None] = {}
 
 
 def cuda_kernels_enabled() -> bool:
-    """Return whether optional quantem-cuda dispatch is safe for this process.
+    """Return whether optional quantem-cuda dispatch is enabled.
 
-    The fused kernels have only been validated for single-process execution. Keep
-    every dispatch site on the torch implementation once an initialized process
-    group has more than one rank; this avoids making DDP behavior depend on an
-    unvalidated extension path while preserving the normal single-rank default.
+    The fused operations are rank-local autograd functions: DDP consumes their
+    parameter gradients through its normal all-reduce, so process-group size does
+    not affect dispatch. Individual call sites remain responsible for dtype,
+    shape, and device capability checks.
     """
-    if not get("has_quantem_cuda") or not get("use_cuda_kernels", default=True):
-        return False
-
-    try:
-        import torch
-    except ModuleNotFoundError:
-        return False
-
-    distributed = torch.distributed
-    return not (
-        distributed.is_available()
-        and distributed.is_initialized()
-        and distributed.get_world_size() > 1
-    )
+    return get("has_quantem_cuda") and get("use_cuda_kernels", default=True)
 
 
 class set:

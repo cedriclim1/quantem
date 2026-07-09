@@ -83,10 +83,11 @@ def tv_loss_vol_sq(obj: torch.Tensor) -> torch.Tensor:
     callers apply their own ``weight / numel`` scaling.
 
     When the optional ``quantem-cuda`` package is installed
-    (``pip install quantem[cuda]``), the tensor is on a CUDA device, and safe
-    single-rank kernel dispatch is enabled, this dispatches to the fused CUDA
-    forward/backward kernel — identical math, one kernel launch instead of
-    several large intermediates.
+    (``pip install quantem[cuda]``), the tensor is on a CUDA device, and kernel
+    dispatch is enabled, this dispatches to the fused CUDA forward/backward
+    kernel — identical math, one kernel launch instead of several large
+    intermediates. The operation is rank-local and therefore composes with DDP's
+    ordinary gradient all-reduce.
 
     Args:
         obj: Tensor of shape ``[..., D, H, W]`` (ndim >= 3).

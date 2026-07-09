@@ -16,8 +16,8 @@ dtype_complex: complex64
 verbose: 1
 
 # Dispatch to the fused quantem-cuda kernels when installed (pip install quantem[cuda])
-# and the tensors are on a CUDA device. Multi-rank DDP and unsupported multi-channel
-# paths fall back automatically; set false to force the pure-torch paths everywhere.
+# and the tensors are on a CUDA device. Unsupported multi-channel paths fall back
+# automatically; set false to force the pure-torch paths everywhere.
 use_cuda_kernels: true
 cupy:
   # The size of the fft cache in MB used by cupy
