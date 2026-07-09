@@ -34,6 +34,15 @@ except Exception as e:
     if "cuda" in str(e):
         NUM_DEVICES = 0
     _defaults["has_cupy"] = False
+try:
+    import quantem.cuda  # type: ignore  # noqa: F401
+
+    _defaults["has_quantem_cuda"] = True
+except ModuleNotFoundError:
+    _defaults["has_quantem_cuda"] = False
+except Exception:
+    # installed but unloadable (e.g. libcudart missing at runtime)
+    _defaults["has_quantem_cuda"] = False
 
 
 defaults: list[Mapping] = [_defaults]
@@ -46,6 +55,17 @@ config: dict = {}
 # aliases: dict[str, dict[str, str]] = {"device": {"gpu": "cuda:0"}}
 aliases: dict[str, dict[str, str]] = {}
 deprecations: dict[str, str | None] = {}
+
+
+def cuda_kernels_enabled() -> bool:
+    """Return whether optional quantem-cuda dispatch is enabled.
+
+    The fused operations are rank-local autograd functions: DDP consumes their
+    parameter gradients through its normal all-reduce, so process-group size does
+    not affect dispatch. Individual call sites remain responsible for dtype,
+    shape, and device capability checks.
+    """
+    return get("has_quantem_cuda") and get("use_cuda_kernels", default=True)
 
 
 class set:

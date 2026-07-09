@@ -8,9 +8,13 @@ event files. Matplotlib backend is ``Agg`` (set in the root conftest), so figure
 headless.
 """
 
+import os
+import sys
 from types import SimpleNamespace
 
+import matplotlib.pyplot as plt
 import numpy as np
+import pytest
 import torch
 
 from quantem.tomography.logger_tomography import LoggerTomography
@@ -101,3 +105,130 @@ def test_log_iter_images(tmp_path):
         assert list(logger.log_dir.glob("events.out.tfevents.*"))
     finally:
         logger.close()
+
+
+def test_invalid_mode_raises(tmp_path):
+    with pytest.raises(ValueError, match="tensorboard.*wandb"):
+        LoggerTomography(
+            log_dir=str(tmp_path),
+            run_prefix="test_tomo",
+            mode="invalid",
+        )
+
+
+def test_wandb_mode_logs_under_run_dir(tmp_path, monkeypatch):
+    monkeypatch.delenv("WANDB_MODE", raising=False)
+    init_calls = []
+    logged = []
+    defined_metrics = []
+
+    class FakeConfig(dict):
+        def update(self, values, allow_val_change=False):
+            super().update(values)
+
+    class FakeRun:
+        def __init__(self):
+            self.config = FakeConfig()
+            self.finished = False
+
+        def define_metric(self, name, **kwargs):
+            defined_metrics.append((name, kwargs))
+
+        def log(self, data, **kwargs):
+            logged.append((data, kwargs))
+
+        def finish(self):
+            self.finished = True
+
+    def fake_init(**kwargs):
+        init_calls.append(kwargs)
+        return FakeRun()
+
+    fake_wandb = SimpleNamespace(
+        Image=lambda image: ("image", image),
+        Histogram=lambda values: ("histogram", values),
+        init=fake_init,
+    )
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    logger = LoggerTomography(
+        log_dir=str(tmp_path),
+        run_prefix="test_tomo",
+        run_suffix="wandb",
+        log_images_every=1,
+        mode="wandb",
+        wandb_config={"batch_size": 4},
+    )
+    try:
+        assert logger.mode == "wandb"
+        assert os.environ["WANDB_MODE"] == "offline"
+        assert logger.log_dir.exists()
+        assert (logger.log_dir / "wandb").exists()
+        assert init_calls[-1]["dir"] == str(logger.log_dir)
+        assert init_calls[-1]["config"] == {"batch_size": 4}
+
+        logger.attach_config({"num_iter": 2})
+        extra_steps = {"grad_step": 10}
+        logger.log_scalar("loss/total", 1.0, 1, extra_steps=extra_steps)
+        logger.log_image(
+            "volume/sum_z_0", np.ones((2, 2), dtype=np.float32), 1, extra_steps=extra_steps
+        )
+        logger.log_histogram(
+            "weights/object",
+            np.array([0.0, 1.0], dtype=np.float32),
+            1,
+            extra_steps=extra_steps,
+        )
+        logger.log_text("config/notes", "offline test", 1, extra_steps=extra_steps)
+        fig, ax = plt.subplots()
+        ax.plot([0, 1], [1, 0])
+        logger.log_figure("figures/test", fig, 1, extra_steps=extra_steps)
+        plt.close(fig)
+        logger.log_scalar(
+            "snapshots/last_grad_step", 48.0, 48, step_domain="grad_step"
+        )
+        logger.log_epoch(
+            epoch=2,
+            loss=0.8,
+            tilt_series_loss=0.6,
+            soft_loss=0.2,
+            grad_step=20,
+        )
+        logger.log_iter(
+            object_model=SimpleNamespace(_soft_constraint_losses=[0.1]),
+            iter=3,
+            consistency_loss=0.4,
+            total_loss=0.5,
+            learning_rates={"object": 1e-3},
+            num_samples_per_ray=8,
+            val_loss=0.3,
+            val_fg_loss=0.2,
+            val_bg_loss=0.1,
+            grad_step=30,
+        )
+        logger.flush()
+    finally:
+        logger.close()
+
+    assert defined_metrics == [
+        ("*", {"step_metric": "epoch"}),
+        ("snapshots/*", {"step_metric": "grad_step"}),
+    ]
+    assert all("step" not in kwargs for _, kwargs in logged)
+    assert logged[0] == ({"loss/total": 1.0, "grad_step": 10, "epoch": 1}, {})
+    assert "volume/sum_z_0" in logged[1][0]
+    assert logged[1][0]["epoch"] == 1
+    assert logged[1][0]["grad_step"] == 10
+    assert logged[2][0]["epoch"] == 1
+    assert logged[2][0]["grad_step"] == 10
+    assert logged[3] == ({"config/notes": "offline test", "grad_step": 10, "epoch": 1}, {})
+    assert "figures/test" in logged[4][0]
+    assert logged[4][0]["epoch"] == 1
+    assert logged[4][0]["grad_step"] == 10
+    assert logged[5] == ({"snapshots/last_grad_step": 48.0, "grad_step": 48}, {})
+    assert logged[6] == ({"loss/total": 0.8, "grad_step": 20, "epoch": 2}, {})
+    assert logged[7] == ({"loss/tilt_series": 0.6, "grad_step": 20, "epoch": 2}, {})
+    assert logged[8] == ({"loss/soft": 0.2, "grad_step": 20, "epoch": 2}, {})
+    for data, _ in logged[9:]:
+        assert data["epoch"] == 3
+        assert data["grad_step"] == 30

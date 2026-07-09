@@ -42,7 +42,15 @@ class DDPMixin:
             if torch.cuda.is_available():
                 device = torch.device("cuda:0" if device is None else device)
                 if device.type == "cuda":
-                    torch.cuda.set_device(device.index)
+                    # ``torch.device("cuda")`` has no index. Resolve it to the
+                    # process's current device instead of passing None to
+                    # set_device; under DDP the branch above already pins the
+                    # equivalent index to LOCAL_RANK.
+                    cuda_index = (
+                        torch.cuda.current_device() if device.index is None else device.index
+                    )
+                    device = torch.device("cuda", cuda_index)
+                    torch.cuda.set_device(cuda_index)
             else:
                 device = torch.device("cpu")
 
