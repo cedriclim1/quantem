@@ -152,6 +152,158 @@ class DatasetValue:
     )
 
 
+@dataclass(frozen=True)
+class PixelHoldoutSplit:
+    """Flat pixel indices for train and held-out validation rays."""
+
+    train_indices: torch.Tensor
+    val_indices: torch.Tensor
+    val_fg_indices: torch.Tensor
+    val_bg_indices: torch.Tensor
+
+
+def _allocate_pixel_holdout_counts(group_sizes: list[int], n_holdout: int) -> list[int]:
+    """Allocate an exact holdout count across groups by largest remainder."""
+    if n_holdout < 0:
+        raise ValueError("n_holdout must be >= 0.")
+    total = sum(group_sizes)
+    if n_holdout > total:
+        raise ValueError("n_holdout cannot exceed the total number of pixels.")
+    if total == 0 or n_holdout == 0:
+        return [0 for _ in group_sizes]
+
+    quotas = [n_holdout * size / total for size in group_sizes]
+    counts = [min(size, int(quota)) for size, quota in zip(group_sizes, quotas)]
+    remaining = n_holdout - sum(counts)
+    order = sorted(
+        range(len(group_sizes)),
+        key=lambda i: (quotas[i] - int(quotas[i]), group_sizes[i]),
+        reverse=True,
+    )
+    while remaining > 0:
+        progressed = False
+        for i in order:
+            if counts[i] < group_sizes[i]:
+                counts[i] += 1
+                remaining -= 1
+                progressed = True
+                if remaining == 0:
+                    break
+        if not progressed:
+            raise RuntimeError("Could not allocate holdout counts.")
+    return counts
+
+
+def _sample_intensity_strata(
+    *,
+    indices: torch.Tensor,
+    intensities: torch.Tensor,
+    n_holdout: int,
+    seed: int,
+    num_strata: int,
+) -> torch.Tensor:
+    """Sample held-out indices from intensity-quantile strata."""
+    if n_holdout == 0 or indices.numel() == 0:
+        return torch.empty(0, dtype=torch.long)
+
+    if n_holdout > indices.numel():
+        raise ValueError("n_holdout cannot exceed the number of candidate pixels.")
+    n_strata = max(1, min(int(num_strata), int(indices.numel())))
+    order = torch.argsort(intensities[indices], stable=True)
+    sorted_indices = indices[order]
+    strata = [s for s in torch.tensor_split(sorted_indices, n_strata) if s.numel() > 0]
+    counts = _allocate_pixel_holdout_counts([int(s.numel()) for s in strata], n_holdout)
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    selected: list[torch.Tensor] = []
+    for stratum, count in zip(strata, counts):
+        if count == 0:
+            continue
+        perm = torch.randperm(stratum.numel(), generator=generator)
+        selected.append(stratum[perm[:count]])
+
+    if not selected:
+        return torch.empty(0, dtype=torch.long)
+    return torch.cat(selected).to(dtype=torch.long)
+
+
+def build_pixel_holdout_split(
+    tilt_stack: Dataset3d | NDArray | torch.Tensor,
+    holdout_fraction: float,
+    holdout_seed: int = 0,
+    *,
+    num_strata: int = 8,
+    foreground_threshold: float = 0.0,
+) -> PixelHoldoutSplit:
+    """Build a seeded foreground-aware train/holdout split over flat pixel indices.
+
+    The split is rank-independent: all work happens on detached CPU tensors with a
+    local generator seeded only by ``holdout_seed``. Foreground/background groups are
+    split proportionally, then each group is sampled from intensity-quantile strata.
+    """
+    if not 0.0 <= holdout_fraction < 1.0:
+        raise ValueError("holdout_fraction must satisfy 0 <= holdout_fraction < 1.")
+    stack = torch.as_tensor(tilt_stack).detach().cpu()
+    intensities = stack.to(torch.float32).abs().flatten()
+    n_pixels = int(intensities.numel())
+    all_indices = torch.arange(n_pixels, dtype=torch.long)
+    n_holdout = int(n_pixels * float(holdout_fraction))
+
+    if n_holdout == 0:
+        empty = torch.empty(0, dtype=torch.long)
+        return PixelHoldoutSplit(
+            train_indices=all_indices,
+            val_indices=empty,
+            val_fg_indices=empty,
+            val_bg_indices=empty,
+        )
+
+    fg_mask = intensities > float(foreground_threshold)
+    fg_indices = all_indices[fg_mask]
+    bg_indices = all_indices[~fg_mask]
+    bg_count, fg_count = _allocate_pixel_holdout_counts(
+        [int(bg_indices.numel()), int(fg_indices.numel())], n_holdout
+    )
+
+    if (
+        n_holdout >= 2
+        and bg_indices.numel() > 0
+        and fg_indices.numel() > 0
+        and (bg_count == 0 or fg_count == 0)
+    ):
+        if bg_count == 0 and fg_count > 1:
+            bg_count, fg_count = 1, fg_count - 1
+        elif fg_count == 0 and bg_count > 1:
+            bg_count, fg_count = bg_count - 1, 1
+
+    bg_val = _sample_intensity_strata(
+        indices=bg_indices,
+        intensities=intensities,
+        n_holdout=bg_count,
+        seed=int(holdout_seed) * 2 + 1,
+        num_strata=num_strata,
+    )
+    fg_val = _sample_intensity_strata(
+        indices=fg_indices,
+        intensities=intensities,
+        n_holdout=fg_count,
+        seed=int(holdout_seed) * 2 + 2,
+        num_strata=num_strata,
+    )
+    val_indices = torch.sort(torch.cat([bg_val, fg_val])).values
+    train_mask = torch.ones(n_pixels, dtype=torch.bool)
+    train_mask[val_indices] = False
+    train_indices = all_indices[train_mask]
+
+    return PixelHoldoutSplit(
+        train_indices=train_indices,
+        val_indices=val_indices,
+        val_fg_indices=torch.sort(fg_val).values,
+        val_bg_indices=torch.sort(bg_val).values,
+    )
+
+
 class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
     """
     Base tomography dataset class for all tomography datasets to inherit from.
@@ -177,9 +329,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         if _token is not self._token:
             raise RuntimeError("Use TomographyPixDataset.from_* to instantiate this class.")
 
-        if not (
-            tilt_stack.shape[0] < tilt_stack.shape[1] or tilt_stack.shape[0] < tilt_stack.shape[2]
-        ):
+        if tilt_stack.shape[0] != len(tilt_angles):
             raise ValueError(
                 "The number of tilt projections should be in the first dimension of the dataset."
             )
@@ -492,6 +642,7 @@ class DeviceBatchSampler:
         rank: int = 0,
         world_size: int = 1,
         seed: int = 0,
+        drop_last: bool = True,
     ):
         self.batch_size = batch_size
         self.device = torch.device(device)
@@ -499,6 +650,7 @@ class DeviceBatchSampler:
         self.rank = rank
         self.world_size = world_size
         self.seed = seed
+        self.drop_last = drop_last
         self._epoch = 0
         self._stack = dset.tilt_stack.to(self.device)
         self._angles = dset.tilt_angles.to(self.device)
@@ -517,7 +669,9 @@ class DeviceBatchSampler:
         self._epoch = epoch
 
     def __len__(self) -> int:
-        return self._per_rank // self.batch_size  # drop_last=True
+        if self.drop_last:
+            return self._per_rank // self.batch_size
+        return (self._per_rank + self.batch_size - 1) // self.batch_size
 
     def _epoch_shard(self) -> torch.Tensor:
         idx = self._indices
@@ -535,7 +689,7 @@ class DeviceBatchSampler:
         idx = self._epoch_shard()
         per_proj = self._s1 * self._s2
         for k in range(len(self)):
-            sel = idx[k * self.batch_size : (k + 1) * self.batch_size]
+            sel = idx[k * self.batch_size : min((k + 1) * self.batch_size, len(idx))]
             proj = sel // per_proj
             rem = sel - proj * per_proj
             pixel_i = rem // self._s1
@@ -571,10 +725,58 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        ray_sampling: str = "box_fixed_ds",
+        ray_ds: float | None = None,
         seed: int = 42,
         _token: object | None = None,
     ):
         super().__init__(tilt_stack, tilt_angles, learn_shift, learn_tilt_axis, _token=_token)
+
+        # --- Ray-sampling scheme ---
+        # "legacy"       : detector-frame z in [-1, 1] swept with a FIXED count of points,
+        #                  then rotated (create_batch_rays / transform_batch_rays). The
+        #                  segment is rotated with the object, so long diagonal chords are
+        #                  clipped and other rays waste samples outside the [-1,1]^3 cube.
+        # "box_fixed_ds" : per-ray ray-box intersection with the [-1,1]^3 cube, then a
+        #                  CONSTANT physical step `ds` along the true chord (variable count
+        #                  per ray). Gives identical physical sampling spacing on every ray
+        #                  regardless of tilt -- the consistent discretization of the line
+        #                  integral. Ragged, so integrate_rays uses a scatter-add.
+        self.ray_sampling: str = ray_sampling
+        # Physical step between samples for "box_fixed_ds". None => derive per call from
+        # num_samples_per_ray as 2/(num_samples_per_ray - 1) so the existing samples_per_ray
+        # knob stays meaningful (a centered ray reproduces the legacy sample count).
+        self.ray_ds: float | None = ray_ds
+        # Per-batch ragged metadata stashed by get_coords for integrate_rays to consume.
+        self._ray_meta: dict[str, torch.Tensor] | None = None
+
+    @classmethod
+    def from_data(
+        cls,
+        tilt_stack: Dataset3d | NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
+        learn_shift: bool = True,
+        learn_tilt_axis: bool = True,
+        ray_sampling: str = "box_fixed_ds",
+        ray_ds: float | None = None,
+    ):
+
+        if ray_sampling == "box_fixed_ds":
+            if ray_ds is None:
+                ray_ds = 2.0 / max(tilt_stack.shape)
+            else:
+                ray_ds = float(ray_ds)
+
+
+        return cls(
+            tilt_stack=tilt_stack,
+            tilt_angles=tilt_angles,
+            learn_shift=learn_shift,
+            learn_tilt_axis=learn_tilt_axis,
+            ray_sampling=ray_sampling,
+            ray_ds=ray_ds,
+            _token=cls._token,
+        )
 
     # --- Forward Pass w/ Params Method for OptimizerMixin ---
     def forward(self, dummy_input: Any = None):
@@ -612,13 +814,26 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         # target_values = batch["target_value"].to(self.device, non_blocking=True)
         phis = batch["phi"].to(self.device, non_blocking=True)
         projection_indices = batch["projection_idx"].to(self.device, non_blocking=True)
-        with torch.no_grad():
-            batch_ray_coords = self.create_batch_rays(pixel_i, pixel_j, N, num_samples_per_ray)
 
         shifts, z1_params, z3_params = self.forward(None)
         batch_shifts = torch.index_select(shifts, 0, projection_indices)
         batch_z1 = torch.index_select(z1_params, 0, projection_indices)
         batch_z3 = torch.index_select(z3_params, 0, projection_indices)
+
+        if getattr(self, "ray_sampling", "legacy") == "box_fixed_ds":
+            return self._get_coords_box_fixed_ds(
+                pixel_i=pixel_i,
+                pixel_j=pixel_j,
+                phis=phis,
+                batch_z1=batch_z1,
+                batch_z3=batch_z3,
+                batch_shifts=batch_shifts,
+                N=N,
+                num_samples_per_ray=num_samples_per_ray,
+            )
+
+        with torch.no_grad():
+            batch_ray_coords = self.create_batch_rays(pixel_i, pixel_j, N, num_samples_per_ray)
 
         transformed_rays = self.transform_batch_rays(
             batch_ray_coords,
@@ -670,9 +885,17 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             dim=2,
         )
 
-        # Compose the three Euler rotations Rz(-z1) @ Rx(x) @ Rz(-z3) into a single
-        # (B, 3, 3) matrix and apply it with one batched matmul, instead of nine
-        # elementwise passes over the full (B, S) ray tensors.
+        rot = TomographyINRDataset._compose_euler_rotation(z1, x, z3)  # (B, 3, 3)
+
+        return shifted @ rot.transpose(1, 2)
+
+    @staticmethod
+    def _compose_euler_rotation(
+        z1: torch.Tensor, x: torch.Tensor, z3: torch.Tensor
+    ) -> torch.Tensor:
+        """Compose the three Euler rotations Rz(-z1) @ Rx(x) @ Rz(-z3) into a single
+        (B, 3, 3) matrix. A point row-vector ``v`` is mapped to the object frame by
+        ``v @ rot.transpose`` (equivalently ``rot @ v``)."""
         a = torch.deg2rad(-z3).view(-1)
         b = torch.deg2rad(x).view(-1)
         g = torch.deg2rad(-z1).view(-1)
@@ -693,13 +916,192 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             [cos_g, -sin_g, zero, sin_g, cos_g, zero, zero, zero, one], dim=-1
         ).view(-1, 3, 3)
 
-        rot = rot_g @ rot_b @ rot_a  # (B, 3, 3)
+        return rot_g @ rot_b @ rot_a  # (B, 3, 3)
 
-        return shifted @ rot.transpose(1, 2)
+    # ------------------------------------------------------------------
+    # Box-intersection, fixed-distance ("box_fixed_ds") ray sampling.
+    # Ported from ray_sampling/geometry.py (ParallelBeamRayProjector), reusing the
+    # dataset's own Euler pose so gradients keep flowing to z1/z3/shifts.
+    # ------------------------------------------------------------------
+    def _resolve_ray_ds(self, num_samples_per_ray: int) -> float:
+        """Physical step `ds` between samples along every ray (object-space units,
+        where the cube spans [-1, 1])."""
+        if self.ray_ds is not None:
+            ds = float(self.ray_ds)
+            if ds <= 0.0:
+                raise ValueError(f"ray_ds must be > 0, got {ds}")
+            return ds
+        # Derive from the samples_per_ray knob so it stays meaningful: an untilted ray
+        # (chord length 2) then gets exactly num_samples_per_ray points, matching legacy.
+        return 2.0 / (num_samples_per_ray - 1)
+
+    def _build_ray_origins_directions(
+        self,
+        *,
+        pixel_i: torch.Tensor,
+        pixel_j: torch.Tensor,
+        z1: torch.Tensor,
+        x: torch.Tensor,
+        z3: torch.Tensor,
+        shifts: torch.Tensor,
+        N: int,
+        sampling_rate: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Ray origin/direction in the object frame for each detector pixel.
+
+        Rotates the two legacy endpoints (x, y, +/-1) by the same Euler pose used in
+        transform_batch_rays, so ``point(t) = origin + t * direction`` reproduces the
+        legacy z in [-1, 1] segment at t in [-1, 1] but lets t run past it to capture the
+        full chord through the cube. ``direction`` is unit-norm (rotation of (0,0,1)), so
+        t is true arc length and ``ds`` is a physical distance.
+        """
+        x_coords = (pixel_j / (N - 1)) * 2 - 1
+        y_coords = (pixel_i / (N - 1)) * 2 - 1
+        shift_x_norm = (shifts[:, 0] * sampling_rate * 2) / (N - 1)
+        shift_y_norm = (shifts[:, 1] * sampling_rate * 2) / (N - 1)
+        x_base = x_coords - shift_x_norm
+        y_base = y_coords - shift_y_norm
+
+        rot = self._compose_euler_rotation(z1, x, z3)  # (B, 3, 3)
+        ones = torch.ones_like(x_base)
+        p_plus_local = torch.stack((x_base, y_base, ones), dim=-1)
+        p_minus_local = torch.stack((x_base, y_base, -ones), dim=-1)
+        p_plus = torch.einsum("bij,bj->bi", rot, p_plus_local)
+        p_minus = torch.einsum("bij,bj->bi", rot, p_minus_local)
+
+        origins = 0.5 * (p_plus + p_minus)
+        directions = 0.5 * (p_plus - p_minus)
+        return origins, directions
+
+    @staticmethod
+    def _compute_ray_box_intersections(
+        origins: torch.Tensor,
+        directions: torch.Tensor,
+        eps: float = 1.0e-8,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Slab method: entry/exit t into the [-1, 1]^3 cube and a validity mask."""
+        parallel = directions.abs() < eps
+        safe_dirs = torch.where(parallel, torch.ones_like(directions), directions)
+
+        t0 = (-1.0 - origins) / safe_dirs
+        t1 = (1.0 - origins) / safe_dirs
+        t_min_dim = torch.minimum(t0, t1)
+        t_max_dim = torch.maximum(t0, t1)
+
+        neg_inf = torch.full_like(t_min_dim, -float("inf"))
+        pos_inf = torch.full_like(t_max_dim, float("inf"))
+        in_slab = (origins >= -1.0) & (origins <= 1.0)
+        valid_parallel = (~parallel) | in_slab
+
+        t_min_dim = torch.where(parallel, neg_inf, t_min_dim)
+        t_max_dim = torch.where(parallel, pos_inf, t_max_dim)
+
+        t_enter = t_min_dim.max(dim=1).values
+        t_exit = t_max_dim.min(dim=1).values
+        valid = valid_parallel.all(dim=1) & (t_exit > t_enter)
+        return t_enter, t_exit, valid
+
+    def _sample_ray_segment_coords_fixed_ds(
+        self,
+        origins: torch.Tensor,
+        directions: torch.Tensor,
+        t_enter: torch.Tensor,
+        t_exit: torch.Tensor,
+        ds: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Place points every ``ds`` along each ray's in-cube chord.
+
+        Variable count per ray (padded to the batch max), so a ``sample_mask`` marks the
+        real samples. Returns (coords, sample_mask, n_samples, lengths). The sample COUNT
+        is decided from detached lengths (ceil is non-differentiable anyway); the sample
+        POSITIONS stay differentiable in t_enter/lengths, so pose gradients flow.
+        """
+        lengths = t_exit - t_enter
+        n_samples = torch.ceil(lengths.detach() / float(ds)).to(torch.long) + 1
+        n_samples = torch.clamp(n_samples, min=2)
+
+        max_samples = int(n_samples.max().item())
+        sample_idx = torch.arange(max_samples, device=origins.device).unsqueeze(0)
+        sample_mask = sample_idx < n_samples.unsqueeze(1)
+
+        denom = (n_samples - 1).to(origins.dtype).unsqueeze(1)
+        u = sample_idx.to(origins.dtype) / denom
+        t_vals = t_enter.unsqueeze(1) + lengths.unsqueeze(1) * u
+        coords = origins.unsqueeze(1) + t_vals.unsqueeze(2) * directions.unsqueeze(1)
+        return coords, sample_mask, n_samples, lengths
+
+    def _get_coords_box_fixed_ds(
+        self,
+        *,
+        pixel_i: torch.Tensor,
+        pixel_j: torch.Tensor,
+        phis: torch.Tensor,
+        batch_z1: torch.Tensor,
+        batch_z3: torch.Tensor,
+        batch_shifts: torch.Tensor,
+        N: int,
+        num_samples_per_ray: int,
+    ) -> torch.Tensor:
+        origins, directions = self._build_ray_origins_directions(
+            pixel_i=pixel_i,
+            pixel_j=pixel_j,
+            z1=batch_z1,
+            x=phis,
+            z3=batch_z3,
+            shifts=batch_shifts,
+            N=N,
+            sampling_rate=1.0,
+        )
+        t_enter, t_exit, valid = self._compute_ray_box_intersections(origins, directions)
+
+        if not bool(valid.any()):
+            self._ray_meta = {
+                "valid": valid,
+                "local_ray_ids": torch.zeros(0, dtype=torch.long, device=origins.device),
+                "step_sizes": origins.new_zeros(0),
+                "num_valid": 0,
+            }
+            return origins.new_zeros((0, 3))
+
+        origins_v = origins[valid]
+        directions_v = directions[valid]
+        t_enter_v = t_enter[valid]
+        t_exit_v = t_exit[valid]
+
+        ds = self._resolve_ray_ds(num_samples_per_ray)
+        (
+            coords_v,
+            sample_mask_v,
+            n_samples_v,
+            lengths_v,
+        ) = self._sample_ray_segment_coords_fixed_ds(
+            origins_v, directions_v, t_enter_v, t_exit_v, ds
+        )
+
+        # nonzero() walks row-major, so local_ray_ids lines up with coords_v[sample_mask_v].
+        local_ray_ids = sample_mask_v.nonzero(as_tuple=False)[:, 0]
+        step_sizes_v = lengths_v / (n_samples_v.to(lengths_v.dtype) - 1.0)
+
+        self._ray_meta = {
+            "valid": valid,
+            "local_ray_ids": local_ray_ids,
+            "step_sizes": step_sizes_v,
+            "num_valid": int(origins_v.shape[0]),
+        }
+
+        all_coords = coords_v[sample_mask_v]
+        return all_coords.to(self.device, dtype=torch.float32)
+
+    def integrate_rays(
+        self, rays: torch.Tensor, num_samples_per_ray: int, target_values_len: int
+    ) -> torch.Tensor:
+        if getattr(self, "ray_sampling", "legacy") == "box_fixed_ds":
+            return self._integrate_rays_box_fixed_ds(rays, target_values_len)
+        return self._integrate_rays_legacy(rays, num_samples_per_ray, target_values_len)
 
     @staticmethod
     @torch.compile(mode="reduce-overhead")
-    def integrate_rays(
+    def _integrate_rays_legacy(
         rays: torch.Tensor, num_samples_per_ray: int, target_values_len: int
     ) -> torch.Tensor:
         ray_densities = rays.view(
@@ -711,6 +1113,47 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         predicted_values = ray_densities.sum(dim=1) * step_size
 
         return predicted_values
+
+    def _integrate_rays_box_fixed_ds(
+        self, densities: torch.Tensor, target_values_len: int
+    ) -> torch.Tensor:
+        """Riemann-sum integrate ragged fixed-ds samples back to one value per ray.
+
+        ``densities`` are the INR outputs for the flattened, mask-selected samples that
+        ``get_coords`` produced (same order). Scatter-add them per ray and scale by the
+        per-ray physical step, writing into a zero ``(B,)`` or ``(B, C)`` output
+        at the rays that actually intersected the cube.
+        """
+        meta = self._ray_meta
+        if meta is None:
+            raise RuntimeError(
+                "integrate_rays called in 'box_fixed_ds' mode without ray metadata; "
+                "get_coords must run first."
+            )
+        multichannel = densities.dim() > 1 and densities.shape[-1] > 1
+        output_shape = (
+            (target_values_len, densities.shape[-1])
+            if multichannel
+            else (target_values_len,)
+        )
+        predicted = torch.zeros(output_shape, device=densities.device, dtype=densities.dtype)
+        valid = meta["valid"]
+        if not bool(valid.any()):
+            self._ray_meta = None
+            return predicted
+
+        local_ray_ids = meta["local_ray_ids"]
+        step_sizes = meta["step_sizes"].to(densities.dtype)
+        num_valid = int(meta["num_valid"])
+
+        sum_shape = (num_valid, densities.shape[-1]) if multichannel else (num_valid,)
+        ray_sums = torch.zeros(sum_shape, device=densities.device, dtype=densities.dtype)
+        ray_sums.index_add_(0, local_ray_ids, densities)
+        scale = step_sizes.unsqueeze(-1) if multichannel else step_sizes
+        predicted[valid] = ray_sums * scale
+        # Consumed; clear so a stale batch can never be silently reused.
+        self._ray_meta = None
+        return predicted
 
     # --- Torch Dataset Methods ---
     def __getitem__(
@@ -844,6 +1287,8 @@ class TomographyEDSINRDataset(TomographyINRDataset):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        ray_sampling: str = "box_fixed_ds",
+        ray_ds: float | None = None,
         seed: int = 42,
         angle_tol: float = 1e-2,
         _token: object | None = None,
@@ -855,6 +1300,8 @@ class TomographyEDSINRDataset(TomographyINRDataset):
             tilt_angles=tilt_angles,
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
+            ray_sampling=ray_sampling,
+            ray_ds=ray_ds,
             seed=seed,
             _token=_token,
         )
@@ -871,9 +1318,14 @@ class TomographyEDSINRDataset(TomographyINRDataset):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        ray_sampling: str = "box_fixed_ds",
+        ray_ds: float | None = None,
         seed: int = 42,
         angle_tol: float = 1e-2,
     ):
+        if ray_sampling == "box_fixed_ds":
+            ray_ds = 2.0 / max(haadf_tilt_stack.shape) if ray_ds is None else float(ray_ds)
+
         return cls(
             haadf_tilt_stack=haadf_tilt_stack,
             eds_signals_tilt_stack=eds_signals_tilt_stack,
@@ -881,6 +1333,8 @@ class TomographyEDSINRDataset(TomographyINRDataset):
             tilt_angles=tilt_angles,
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
+            ray_sampling=ray_sampling,
+            ray_ds=ray_ds,
             seed=seed,
             angle_tol=angle_tol,
             _token=cls._token,
@@ -1005,6 +1459,10 @@ class TomographyEDSINRDataset(TomographyINRDataset):
     def integrate_rays(
         self, rays: torch.Tensor, num_samples_per_ray: int, target_values_len: int
     ) -> torch.Tensor:
+        # The box sampler is ragged, so its metadata-driven scatter-add must run
+        # before the fixed-count EDS path. The base implementation is channel-safe.
+        if getattr(self, "ray_sampling", "legacy") == "box_fixed_ds":
+            return super().integrate_rays(rays, num_samples_per_ray, target_values_len)
         if rays.dim() > 1 and rays.shape[-1] > 1:
             return self._integrate_multichannel_rays(
                 rays, num_samples_per_ray, target_values_len

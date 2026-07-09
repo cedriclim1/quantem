@@ -176,10 +176,15 @@ class TestINRRayMath:
         assert torch.allclose(out, rays, atol=1e-5)
 
     def test_integrate_rays_sums_with_step_size(self):
+        # integrate_rays became an instance method dispatching on ray_sampling
+        # (box_fixed_ds vs legacy); the default legacy path keeps the original
+        # step-size summation this test pins down.
         B, S = 3, 5
-        out = TomographyINRDataset.integrate_rays(
-            torch.ones(B, S), num_samples_per_ray=S, target_values_len=B
+        stack = _stack(nang=3, n=4)
+        d = TomographyINRDataset.from_data(
+            stack, np.linspace(-60, 60, 3, dtype="f4"), ray_sampling="legacy"
         )
+        out = d.integrate_rays(torch.ones(B * S), num_samples_per_ray=S, target_values_len=B)
         step = 2.0 / (S - 1)
         assert out.shape == (B,)
         assert torch.allclose(out, torch.full((B,), S * step))

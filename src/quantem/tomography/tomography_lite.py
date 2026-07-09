@@ -1,5 +1,6 @@
 import os
-from typing import Literal, Self
+from pathlib import Path
+from typing import Callable, Literal, Self
 
 import numpy as np
 import torch
@@ -94,6 +95,12 @@ class TomographyLiteINR(Tomography):
         obj_constraints: ObjConstraintsType | dict | None = None,
         dset_constraints: DatasetConstraintsType | dict | None = None,
         show_metrics: bool = False,
+        holdout_fraction: float = 0.0,
+        holdout_seed: int = 0,
+        holdout_every: int = 1,
+        snapshot_every: int = 0,
+        snapshot_dir: str | Path | None = None,
+        snapshot_callback: Callable[[int, np.ndarray | None], None] | None = None,
     ):
         if self.num_epochs == 0:
             opt_params = {
@@ -135,6 +142,12 @@ class TomographyLiteINR(Tomography):
             obj_constraints=obj_constraints,
             dset_constraints=dset_constraints,
             show_metrics=show_metrics,
+            holdout_fraction=holdout_fraction,
+            holdout_seed=holdout_seed,
+            holdout_every=holdout_every,
+            snapshot_every=snapshot_every,
+            snapshot_dir=snapshot_dir,
+            snapshot_callback=snapshot_callback,
         )
 
 

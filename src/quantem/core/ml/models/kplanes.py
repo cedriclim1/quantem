@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from quantem.core import config
+
 from .model_base import PPLR, TensorDecompositionModel
 from .so3params import SO3ParamQuat, SO3ParamR9SVD
 
@@ -320,13 +322,42 @@ def interpolate_ms_features_tilted(
     pts: torch.Tensor,  # (B, 3)
     ms_grids: nn.ParameterList,  # each grid: (3*T, C, H, W)
     rotation_matrices: torch.Tensor,  # (T, 3, 3)
+    scale_gates: Optional[Sequence[float]] = None,  # per-scale multiplier (coarse-to-fine)
+    out_features: int = 1,
 ) -> torch.Tensor:
     """
     Fully-vectorized multi-scale, multi-rotation K-Planes feature interpolation.
     Returns features of shape (B, C * T * num_scales).
+
+    scale_gates (optional): one scalar per scale in [0,1] applied to that scale's feature
+    block before concatenation. Used for coarse-to-fine band-limiting: ramp the finer
+    scales on over training so the model commits to view-consistent low-frequency structure
+    first (a classical limited-angle prior). None => all scales fully on (default behaviour).
+
+    When the optional ``quantem-cuda`` package is installed, the tensors live
+    on a CUDA device, and safe kernel dispatch is enabled, each scale dispatches
+    to the fused CUDA kernel (rotate + grid_sample + Hadamard product in one
+    launch, analytic backward). The extension path is currently restricted to
+    single-output, single-rank models: multi-channel EDS heads and DDP runs take
+    this torch path explicitly until those combinations are validated.
     """
     T = rotation_matrices.shape[0]
     B = pts.shape[0]
+
+    if (
+        pts.is_cuda
+        and pts.dtype == torch.float32
+        and rotation_matrices.dtype == torch.float32
+        and all(g.dtype == torch.float32 for g in ms_grids)
+        and out_features == 1
+        and config.cuda_kernels_enabled()
+    ):
+        from quantem.cuda.core.ml import kplanes_tilted_fuse
+
+        feats = [kplanes_tilted_fuse(pts, rotation_matrices, g) for g in ms_grids]
+        if scale_gates is not None:
+            feats = [f * scale_gates[si] for si, f in enumerate(feats)]
+        return torch.cat(feats, dim=-1)
 
     # (T, B, 3)  — rotate all points by all rotations at once
     rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
@@ -349,7 +380,7 @@ def interpolate_ms_features_tilted(
     coord_tensor = coords.reshape(3 * T, B, 1, 2)  # (3T, B, 1, 2)
 
     per_scale_features = []
-    for plane_coef in ms_grids:
+    for si, plane_coef in enumerate(ms_grids):
         # plane_coef: (3T, C, H, W)
         C = plane_coef.shape[1]
 
@@ -365,7 +396,10 @@ def interpolate_ms_features_tilted(
         sampled = sampled.squeeze(-1).view(T, 3, C, B).prod(dim=1)
 
         # (T, C, B) -> (B, T, C) -> (B, T*C) to concatenate rotations along feature dim
-        per_scale_features.append(sampled.permute(2, 0, 1).reshape(B, T * C))
+        feat = sampled.permute(2, 0, 1).reshape(B, T * C)
+        if scale_gates is not None:
+            feat = feat * scale_gates[si]
+        per_scale_features.append(feat)
 
     # Concatenate across scales -> (B, T * C * num_scales)
     return torch.cat(per_scale_features, dim=-1)
@@ -422,6 +456,9 @@ class KPlanesTILTED(KPlanes):
         hybrid_hidden_dim: int = 64,
         hybrid_num_layers: int = 2,
         so3_param_type: str = "r9svd",
+        # Coarse-to-fine band-limiting: if > 0, finer scales are gated on over the first
+        # c2f_warmup_frac of training via set_progress() (0 => disabled, all scales on).
+        c2f_warmup_frac: float = 0.0,
     ):
         self._td_type = "tilted"
         if input_coords_dims != 3:
@@ -471,6 +508,25 @@ class KPlanesTILTED(KPlanes):
         # ---- Learnable rotations ----
         self.set_so3_param_type(so3_param_type, init=tau_init)
 
+        # ---- Coarse-to-fine scale gating ----
+        self.num_scales = num_scales
+        self.c2f_warmup_frac = float(c2f_warmup_frac)
+        # gate per scale (coarse..fine); all-on by default so behaviour is unchanged at frac=0
+        self._scale_gates = [1.0] * num_scales
+        if self.c2f_warmup_frac > 0:
+            self.set_progress(0.0)
+
+    def set_progress(self, frac: float) -> None:
+        """Update coarse-to-fine gates given training progress frac in [0,1].
+        Coarsest scale (index 0) opens first; each successive (finer) scale ramps on
+        later, all fully open by the end of the warmup window. No-op if c2f disabled."""
+        if self.c2f_warmup_frac <= 0:
+            return
+        p = min(1.0, max(0.0, frac / self.c2f_warmup_frac))  # 0..1 over the warmup window
+        S = self.num_scales
+        # gate_i = clamp(p*S - i, 0, 1): scale 0 opens over [0,1/S], scale 1 over [1/S,2/S], ...
+        self._scale_gates = [min(1.0, max(0.0, p * S - i)) for i in range(S)]
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -510,10 +566,13 @@ class KPlanesTILTED(KPlanes):
     def get_densities(self, coords: torch.Tensor) -> torch.Tensor:
         pts = coords.reshape(-1, 3)
         R = self.so3.as_matrix()  # (T, 3, 3)
+        gates = self._scale_gates if getattr(self, "c2f_warmup_frac", 0.0) > 0 else None
         features = interpolate_ms_features_tilted(
             pts=pts,
             ms_grids=self.grids,
             rotation_matrices=R,
+            scale_gates=gates,
+            out_features=self.out_features,
         )
         density_before_activation = self.sigma_net(features)
         return self.density_activation(density_before_activation)

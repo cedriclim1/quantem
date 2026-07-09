@@ -1,3 +1,5 @@
+from typing import Any, Literal, Mapping
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -10,6 +12,11 @@ from quantem.tomography.object_models import ObjectModelType
 class LoggerTomography(LoggerBase):
     """
     Logger for ML-based tomography reconstructions.
+
+    ``mode="tensorboard"`` preserves the original SummaryWriter behavior. ``mode="wandb"``
+    mirrors the same tags and steps to WandB, defaults to ``WANDB_MODE=offline`` unless the
+    environment already sets it, and writes offline run files under ``<log_dir>/wandb/``.
+    Upload offline runs with ``wandb sync <log_dir>/wandb/<offline-run-dir>``.
     """
 
     def __init__(
@@ -18,13 +25,30 @@ class LoggerTomography(LoggerBase):
         run_prefix: str,
         run_suffix: str = "",
         log_images_every: int = 10,
+        mode: Literal["tensorboard", "wandb"] | str = "tensorboard",
+        wandb_config: Mapping[str, Any] | None = None,
     ):
-        super().__init__(log_dir, run_prefix, run_suffix, log_images_every)
+        super().__init__(
+            log_dir,
+            run_prefix,
+            run_suffix,
+            log_images_every,
+            mode=mode,
+            wandb_config=wandb_config,
+        )
 
-    def log_epoch(self, epoch: int, loss: float, tilt_series_loss: float, soft_loss: float):
-        self.log_scalar("loss/total", loss, epoch)
-        self.log_scalar("loss/tilt_series", tilt_series_loss, epoch)
-        self.log_scalar("loss/soft", soft_loss, epoch)
+    def log_epoch(
+        self,
+        epoch: int,
+        loss: float,
+        tilt_series_loss: float,
+        soft_loss: float,
+        grad_step: int | None = None,
+    ):
+        extra_steps = {"grad_step": grad_step} if grad_step is not None else None
+        self.log_scalar("loss/total", loss, epoch, extra_steps=extra_steps)
+        self.log_scalar("loss/tilt_series", tilt_series_loss, epoch, extra_steps=extra_steps)
+        self.log_scalar("loss/soft", soft_loss, epoch, extra_steps=extra_steps)
 
     def log_iter(
         self,
@@ -35,15 +59,31 @@ class LoggerTomography(LoggerBase):
         learning_rates: dict[str, float],
         num_samples_per_ray: int,
         val_loss: float | None = None,
+        val_fg_loss: float | None = None,
+        val_bg_loss: float | None = None,
+        grad_step: int | None = None,
     ):
-        self.log_scalar("loss/consistency", consistency_loss, iter)
-        self.log_scalar("loss/total", total_loss, iter)
-        self.log_scalar("loss/soft", object_model._soft_constraint_losses[-1], iter)
-        self.log_scalar("num_samples_per_ray", num_samples_per_ray, iter)
+        extra_steps = {"grad_step": grad_step} if grad_step is not None else None
+        self.log_scalar("loss/consistency", consistency_loss, iter, extra_steps=extra_steps)
+        self.log_scalar("loss/total", total_loss, iter, extra_steps=extra_steps)
+        self.log_scalar(
+            "loss/soft",
+            object_model._soft_constraint_losses[-1],
+            iter,
+            extra_steps=extra_steps,
+        )
+        self.log_scalar("num_samples_per_ray", num_samples_per_ray, iter, extra_steps=extra_steps)
         for param_name, lr_value in learning_rates.items():
-            self.log_scalar(f"learning_rate/{param_name}", float(lr_value), iter)
+            self.log_scalar(
+                f"learning_rate/{param_name}", float(lr_value), iter, extra_steps=extra_steps
+            )
         if val_loss is not None:
-            self.log_scalar("loss/val", val_loss, iter)
+            self.log_scalar("loss/validation", val_loss, iter, extra_steps=extra_steps)
+            self.log_scalar("loss/val", val_loss, iter, extra_steps=extra_steps)
+        if val_fg_loss is not None:
+            self.log_scalar("val/fg", val_fg_loss, iter, extra_steps=extra_steps)
+        if val_bg_loss is not None:
+            self.log_scalar("val/bg", val_bg_loss, iter, extra_steps=extra_steps)
 
     def log_iter_images(
         self,

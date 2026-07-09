@@ -51,6 +51,7 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         self._consistency_losses: list[float] = []
         self._val_losses: list[float] = []
         self._lrs: dict[str, list] = {}
+        self._grad_steps: int = 0
         # DDP Initialization
         if isinstance(obj_model, ObjectINR) or isinstance(obj_model, ObjectTensorDecomp):
             self.setup_distributed(device=device)

@@ -133,6 +133,26 @@ def test_multichannel_integrate_rays_matches_loop_reference():
     torch.testing.assert_close(actual, expected)
 
 
+def test_box_fixed_ds_integrates_multichannel_eds_rays_with_ragged_metadata():
+    dset = _eds_dset(n_proj=3, n=4, n_chem=2, sparse_step=1)
+    assert dset.ray_sampling == "box_fixed_ds"
+    dset._ray_meta = {
+        "valid": torch.tensor([True, False, True]),
+        "local_ray_ids": torch.tensor([0, 0, 1, 1, 1]),
+        "step_sizes": torch.tensor([0.5, 0.25]),
+        "num_valid": 2,
+    }
+    densities = torch.tensor(
+        [[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0], [5.0, 50.0]]
+    )
+
+    actual = dset.integrate_rays(densities, num_samples_per_ray=4, target_values_len=3)
+    expected = torch.tensor([[1.5, 15.0], [0.0, 0.0], [3.0, 30.0]])
+
+    torch.testing.assert_close(actual, expected)
+    assert dset._ray_meta is None
+
+
 def test_legacy_masking_reproduces_aa621fc_formula_by_hand():
     pred = torch.tensor([[2.0, 3.0, 5.0], [7.0, 11.0, 13.0]])
     target = torch.tensor([[1.0, 4.0, 6.0], [8.0, 0.0, 0.0]])
