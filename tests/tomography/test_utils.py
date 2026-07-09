@@ -89,6 +89,7 @@ class TestRotZXZGradients:
         out.sum().backward()
         assert x.grad is not None
         assert torch.isfinite(x.grad)
+
     @pytest.mark.parametrize(
         "rot_fn", [differentiable_rotz_vectorized, differentiable_rotx_vectorized]
     )
@@ -111,3 +112,55 @@ class TestRotZXZGradients:
         batched = rot_fn(vols, angles)
         per_volume = torch.cat([rot_fn(vols[i : i + 1], angles[i]) for i in range(3)])
         assert torch.allclose(batched, per_volume, atol=1e-6)
+
+
+class TestFourierCropping:
+    """Regression tests for the real-space fourier_cropping removed when the
+    corner-centered variant moved to core.utils.imaging_utils (tutorials 01/02
+    import it from quantem.tomography.utils and pass real-space images)."""
+
+    def test_importable_from_tomography_utils(self):
+        from quantem.tomography.utils import fourier_cropping  # noqa: F401
+
+    def test_matches_legacy_implementation(self):
+        import numpy as np
+
+        from quantem.tomography.utils import fourier_cropping
+
+        rng = np.random.default_rng(0)
+        img = rng.normal(size=(64, 64))
+        crop = (32, 32)
+
+        # legacy reference: fft -> shift -> center crop -> ifft -> real
+        center = np.array(img.shape) // 2
+        fft_img = np.fft.fftshift(np.fft.fft2(img))
+        ref = np.fft.ifft2(
+            np.fft.ifftshift(
+                fft_img[
+                    center[0] - crop[0] // 2 : center[0] + crop[0] // 2,
+                    center[1] - crop[1] // 2 : center[1] + crop[1] // 2,
+                ]
+            )
+        ).real
+
+        out = fourier_cropping(img, crop)
+        assert out.shape == crop
+        assert np.isrealobj(out)
+        assert np.allclose(out, ref)
+
+    def test_real_space_content_preserved(self):
+        # Band-limited downsample of a smooth blob must stay smooth and
+        # non-degenerate -- the corner-centered core variant fed a real-space
+        # image instead returns a ~all-zero array.
+        import numpy as np
+
+        from quantem.tomography.utils import fourier_cropping
+
+        y, x = np.mgrid[:128, :128]
+        img = np.exp(-(((y - 64) ** 2 + (x - 64) ** 2) / (2 * 20.0**2)))
+        out = fourier_cropping(img, (64, 64))
+
+        assert out.shape == (64, 64)
+        # peak stays near the center and the result is far from all-zero
+        assert np.unravel_index(np.argmax(out), out.shape) == (32, 32)
+        assert (np.abs(out) > 1e-3 * np.abs(out).max()).mean() > 0.05
