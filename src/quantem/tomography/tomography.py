@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
@@ -33,6 +34,43 @@ from quantem.tomography.radon.radon import iradon_torch, radon_torch
 from quantem.tomography.tomography_base import TomographyBase
 from quantem.tomography.tomography_context import ReconstructionContext
 from quantem.tomography.tomography_opt import TomographyOpt
+
+
+def _multimodal_consistency_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    eds_mask: torch.Tensor,
+    loss_func: torch.nn.Module,
+    loss_func_noreduce: torch.nn.Module,
+    haadf_weight: float,
+    chem_loss_weight: float,
+    legacy_masking: bool,
+) -> torch.Tensor:
+    eds = eds_mask.reshape(-1).to(device=pred.device, dtype=torch.bool)
+    target = target.to(device=pred.device, dtype=pred.dtype)
+
+    if legacy_masking:
+        masked_pred = pred.clone()
+        masked_pred[~eds, 1:] = 0
+        loss = F.mse_loss(masked_pred, target)
+        if haadf_weight > 0.0:
+            haadf_signal = masked_pred[:, 0]
+            chemical_signals = masked_pred[:, 1:]
+            haadf_stack = haadf_signal.unsqueeze(1).expand(-1, chemical_signals.size(1))
+            loss = loss + haadf_weight * F.mse_loss(haadf_stack, chemical_signals)
+        return loss
+
+    haadf_loss = loss_func(pred[:, 0], target[:, 0])
+
+    mask = eds.unsqueeze(1).to(dtype=pred.dtype)
+    per_elem = loss_func_noreduce(pred[:, 1:] * mask, target[:, 1:] * mask)
+    chem_loss = per_elem.sum() / (mask.sum() * per_elem.shape[1]).clamp_min(1.0)
+
+    loss = haadf_loss + chem_loss_weight * chem_loss
+    if haadf_weight > 0.0:
+        haadf_signal = pred[:, 0].unsqueeze(1).expand(-1, pred.shape[1] - 1)
+        loss = loss + haadf_weight * F.mse_loss(haadf_signal, pred[:, 1:])
+    return loss
 
 
 class Tomography(TomographyOpt, TomographyBase):
@@ -87,6 +125,9 @@ class Tomography(TomographyOpt, TomographyBase):
         show_metrics: bool = False,
         eval_callback: Callable[[int], None] | None = None,
         eval_every: int = 0,
+        haadf_weight: float = 0.0,
+        chem_loss_weight: float = 1.0,
+        legacy_masking: bool = False,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -172,6 +213,11 @@ class Tomography(TomographyOpt, TomographyBase):
                     print("num_samples_per_ray schedule provided.")
 
         loss_func = get_loss_module(name=loss_type, dtype=self.obj_model.dtype, **loss_func_kwargs)
+        loss_func_noreduce_kwargs = dict(loss_func_kwargs)
+        loss_func_noreduce_kwargs["reduction"] = "none"
+        loss_func_noreduce = get_loss_module(
+            name=loss_type, dtype=self.obj_model.dtype, **loss_func_noreduce_kwargs
+        )
 
         pbar = tqdm(range(num_iter), disable=not self.verbose)
         for a0 in pbar:
@@ -217,17 +263,32 @@ class Tomography(TomographyOpt, TomographyBase):
                 pred = integrated_densities.float()
 
                 target = batch["target_value"].to(self.device, non_blocking=True).float()
+                multimodal = "eds_mask" in batch
+                ctx_pred = pred[:, 0] if multimodal else pred
+                ctx_target = target[:, 0] if multimodal else target
 
                 soft_constraints_loss = self.obj_model.apply_soft_constraints(
                     ctx=ReconstructionContext(
                         coords=all_coords,
-                        pred=pred,
+                        pred=ctx_pred,
                         all_densities=all_densities,
-                        target=target,
+                        target=ctx_target,
                     )
                 )
 
-                batch_consistency_loss = loss_func(pred, target)
+                if multimodal:
+                    batch_consistency_loss = _multimodal_consistency_loss(
+                        pred=pred,
+                        target=target,
+                        eds_mask=batch["eds_mask"],
+                        loss_func=loss_func,
+                        loss_func_noreduce=loss_func_noreduce,
+                        haadf_weight=haadf_weight,
+                        chem_loss_weight=chem_loss_weight,
+                        legacy_masking=legacy_masking,
+                    )
+                else:
+                    batch_consistency_loss = loss_func(pred, target)
 
                 soft_constraints_loss += self.dset.apply_soft_constraints()
 
@@ -305,9 +366,19 @@ class Tomography(TomographyOpt, TomographyBase):
                                 batch["target_value"].to(self.device, non_blocking=True).float()
                             )
 
-                            batch_val_loss = torch.nn.functional.mse_loss(
-                                integrated_densities, target
-                            )
+                            if "eds_mask" in batch:
+                                batch_val_loss = _multimodal_consistency_loss(
+                                    pred=integrated_densities.float(),
+                                    target=target,
+                                    eds_mask=batch["eds_mask"],
+                                    loss_func=loss_func,
+                                    loss_func_noreduce=loss_func_noreduce,
+                                    haadf_weight=haadf_weight,
+                                    chem_loss_weight=chem_loss_weight,
+                                    legacy_masking=legacy_masking,
+                                )
+                            else:
+                                batch_val_loss = loss_func(integrated_densities.float(), target)
 
                             val_loss += batch_val_loss.detach()
 
