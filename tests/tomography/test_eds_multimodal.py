@@ -6,6 +6,7 @@ import torch.nn as nn
 from quantem.core.ml.inr import HSiren
 from quantem.core.ml.optimizer_mixin import OptimizerParams
 from quantem.tomography.dataset_models import DeviceBatchSampler, TomographyEDSINRDataset
+from quantem.tomography.logger_tomography import LoggerTomography
 from quantem.tomography.object_models import ObjectINR
 from quantem.tomography.tomography import Tomography, _multimodal_consistency_loss
 
@@ -210,6 +211,65 @@ def test_s3im_soft_constraint_context_gets_haadf_only_for_eds(monkeypatch):
     assert captured
     assert all(len(pred_shape) == 1 for pred_shape, _ in captured)
     assert all(len(target_shape) == 1 for _, target_shape in captured)
+
+
+def test_multimodal_reconstruct_with_holdout_reports_finite_fg_bg_validation_losses(
+    monkeypatch,
+):
+    class CaptureLogger(LoggerTomography):
+        def __init__(self):
+            self.log_images_every = 0
+            self.records = []
+
+        def log_iter(self, **kwargs):
+            self.records.append(kwargs)
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    n = 6
+    angles = np.linspace(-45, 45, 4, dtype=np.float32)
+    sparse_angles = angles[::2]
+    haadf = np.zeros((len(angles), n, n), dtype=np.float32)
+    haadf[:, 2:5, 2:5] = 1.0
+    chemical = np.zeros((2, len(sparse_angles), n, n), dtype=np.float32)
+    chemical[0, :, 1:4, 1:4] = 1.0
+    chemical[1, :, 2:5, 2:5] = 2.0
+    dset = TomographyEDSINRDataset.from_data(
+        haadf_tilt_stack=haadf,
+        eds_signals_tilt_stack=chemical,
+        sparse_view_tilt_angles=sparse_angles,
+        tilt_angles=angles,
+    )
+    model = HSiren(in_features=3, out_features=3, hidden_layers=1, hidden_features=8)
+    obj = ObjectINR.from_model(model, shape=(n, n, n), device="cpu")
+    logger = CaptureLogger()
+    tomo = Tomography.from_models(
+        dset=dset,
+        obj_model=obj,
+        logger=logger,
+        device="cpu",
+        verbose=False,
+    )
+
+    tomo.reconstruct(
+        num_iter=2,
+        batch_size=36,
+        num_workers=0,
+        num_samples_per_ray=4,
+        holdout_fraction=0.25,
+        holdout_every=1,
+        optimizer_params={"object": {"default": OptimizerParams.Adam(lr=1e-4)}},
+    )
+
+    assert len(logger.records) == 2
+    assert tomo.val_fg_dataloader is not None
+    assert tomo.val_bg_dataloader is not None
+    for record in logger.records:
+        assert np.isfinite(record["val_loss"])
+        assert np.isfinite(record["val_fg_loss"])
+        assert np.isfinite(record["val_bg_loss"])
 
 
 @pytest.mark.slow
