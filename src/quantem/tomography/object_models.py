@@ -892,9 +892,14 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                 for rank, size in enumerate(all_sizes):
                     trimmed_outputs.append(gathered_outputs[rank][: size.item(), :])
 
-                pred_full = torch.cat(trimmed_outputs, dim=0).reshape(C, N, N, N).float()
+                pred_full = (
+                    torch.cat(trimmed_outputs, dim=0)
+                    .reshape(N, N, N, C)
+                    .permute(3, 0, 1, 2)
+                    .float()
+                )
             else:
-                pred_full = outputs.reshape(C, N, N, N).float()
+                pred_full = outputs.reshape(N, N, N, C).permute(3, 0, 1, 2).float()
 
             if return_vol:
                 return pred_full.detach().cpu()

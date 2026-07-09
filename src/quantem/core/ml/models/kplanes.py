@@ -182,6 +182,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
         density_activation: Callable = lambda x: F.softplus(
             x - 1
         ),  # Keep playing around with this and trunc_exp
+        out_features: int = 1,
         # Hybrid MLP parameters
         use_hybrid_mlp: bool = False,
         hybrid_hidden_dim: int = 64,
@@ -199,6 +200,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
         self.multiscale_res_multipliers = multiscale_res_multipliers or [1]
         self.concat_features = concat_features
         self.density_activation = density_activation
+        self.out_features = out_features
 
         # All three planes share one (3, C, res[1], res[0]) tensor, which ignores
         # res[2]: an anisotropic resolution would silently give the XZ/YZ planes the
@@ -238,7 +240,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
                 layers.append(nn.ReLU(inplace=True))
                 in_dim = hybrid_hidden_dim
 
-            out = nn.Linear(in_dim, 1, bias=True, **factory)
+            out = nn.Linear(in_dim, self.out_features, bias=True, **factory)
             nn.init.normal_(out.weight, std=0.01)
             nn.init.zeros_(out.bias)
             layers.append(out)
@@ -411,6 +413,7 @@ class KPlanesTILTED(KPlanes):
         resolution: Sequence[int] = (200, 200, 200),
         multiscale_res_multipliers: Optional[Sequence[float]] = None,
         density_activation: Callable = lambda x: F.softplus(x - 1),
+        out_features: int = 1,
         # TILTED parameters
         T: int = 4,
         tau_init: str = "random",
@@ -443,6 +446,7 @@ class KPlanesTILTED(KPlanes):
             multiscale_res_multipliers=multiscale_res_multipliers,
             concat_features=True,
             density_activation=density_activation,
+            out_features=out_features,
             use_hybrid_mlp=use_hybrid_mlp,
             hybrid_hidden_dim=hybrid_hidden_dim,
             hybrid_num_layers=hybrid_num_layers,
@@ -488,14 +492,14 @@ class KPlanesTILTED(KPlanes):
                 layers.append(lin)
                 layers.append(nn.ReLU(inplace=True))
                 in_dim = hybrid_hidden_dim
-            out = nn.Linear(in_dim, 1, bias=True)
+            out = nn.Linear(in_dim, self.out_features, bias=True)
             nn.init.normal_(out.weight, std=0.01)
             nn.init.zeros_(out.bias)
             layers.append(out)
             self.sigma_net = nn.Sequential(*layers)
         else:
             # Single-linear "explicit" decoder. Small init -> density ~ 0 initially.
-            self.sigma_net = nn.Linear(self.feature_dim, 1, bias=True)
+            self.sigma_net = nn.Linear(self.feature_dim, self.out_features, bias=True)
             nn.init.normal_(self.sigma_net.weight, std=0.01)
             nn.init.zeros_(self.sigma_net.bias)
 
@@ -678,6 +682,7 @@ class CPTilted(PPLR, TensorDecompositionModel):
         T: int = 4,
         tau_init: str = "random",
         density_activation: Callable = lambda x: F.softplus(x - 1),
+        out_features: int = 1,
         so3_param_type: str = "r9svd",
     ):
         super().__init__()
@@ -686,6 +691,7 @@ class CPTilted(PPLR, TensorDecompositionModel):
         self.C = C
         self.multiscale_res_multipliers = list(multiscale_res_multipliers or [1])
         self.density_activation = density_activation
+        self.out_features = out_features
 
         # 1D feature lines, one per axis per transform per scale.
         # Shape per scale: (3*T, C, L).  We use max(resolution) for L; if your
@@ -700,7 +706,7 @@ class CPTilted(PPLR, TensorDecompositionModel):
         self.feature_dim = C * T * len(self.multiscale_res_multipliers)
 
         # Same minimal single-linear decoder as your KPlanesTILTED default.
-        self.sigma_net = nn.Linear(self.feature_dim, 1, bias=True)
+        self.sigma_net = nn.Linear(self.feature_dim, self.out_features, bias=True)
         nn.init.normal_(self.sigma_net.weight, std=0.01)
         nn.init.zeros_(self.sigma_net.bias)
 

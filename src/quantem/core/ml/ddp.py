@@ -41,7 +41,8 @@ class DDPMixin:
 
             if torch.cuda.is_available():
                 device = torch.device("cuda:0" if device is None else device)
-                torch.cuda.set_device(device.index)
+                if device.type == "cuda":
+                    torch.cuda.set_device(device.index)
             else:
                 device = torch.device("cpu")
 
