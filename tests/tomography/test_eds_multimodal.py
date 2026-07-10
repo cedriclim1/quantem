@@ -119,6 +119,90 @@ def test_multimodal_loss_zero_chemical_contribution_and_defined_gradients():
     assert torch.isfinite(head.weight.grad).all()
 
 
+def test_sum_coupling_is_zero_for_exact_nonnegative_linear_mixture():
+    chemical = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 1.0]]
+    )
+    weights = torch.tensor([2.0, 3.0])
+    haadf = chemical @ weights
+    pred = torch.column_stack((haadf, chemical))
+    target = pred.clone()
+
+    loss = _multimodal_consistency_loss(
+        pred,
+        target,
+        torch.ones(4, dtype=torch.bool),
+        nn.MSELoss(),
+        nn.MSELoss(reduction="none"),
+        haadf_weight=7.0,
+        chem_loss_weight=1.0,
+        legacy_masking=False,
+        coupling_form="sum",
+    )
+
+    torch.testing.assert_close(loss, torch.tensor(0.0), atol=1e-12, rtol=0.0)
+
+
+def test_per_channel_default_exactly_matches_previous_formula():
+    torch.manual_seed(613)
+    pred = torch.randn(7, 4)
+    target = torch.randn(7, 4)
+    eds_mask = torch.tensor([True, False, True, False, True, True, False])
+    loss_func = nn.SmoothL1Loss(beta=0.3)
+    loss_func_noreduce = nn.SmoothL1Loss(beta=0.3, reduction="none")
+
+    actual = _multimodal_consistency_loss(
+        pred,
+        target,
+        eds_mask,
+        loss_func,
+        loss_func_noreduce,
+        haadf_weight=0.7,
+        chem_loss_weight=1.4,
+        legacy_masking=False,
+    )
+
+    mask = eds_mask.unsqueeze(1).to(dtype=pred.dtype)
+    per_elem = loss_func_noreduce(pred[:, 1:] * mask, target[:, 1:] * mask)
+    chem_loss = per_elem.sum() / (mask.sum() * per_elem.shape[1]).clamp_min(1.0)
+    haadf_signal = pred[:, 0].unsqueeze(1).expand(-1, pred.shape[1] - 1)
+    expected = (
+        loss_func(pred[:, 0], target[:, 0])
+        + 1.4 * chem_loss
+        + 0.7 * nn.functional.mse_loss(haadf_signal, pred[:, 1:])
+    )
+
+    assert torch.equal(actual, expected)
+    assert actual.view(torch.int32).item() == 1080990623
+
+
+def test_sum_coupling_gradient_flows_to_chemical_predictions():
+    chemical = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 1.0]],
+        requires_grad=True,
+    )
+    haadf_target = torch.tensor([1.0, 2.0, 4.0, 8.0])
+    pred = torch.column_stack((haadf_target, chemical))
+    target = torch.column_stack((haadf_target, torch.zeros_like(chemical)))
+
+    loss = _multimodal_consistency_loss(
+        pred,
+        target,
+        torch.zeros(4, dtype=torch.bool),
+        nn.MSELoss(),
+        nn.MSELoss(reduction="none"),
+        haadf_weight=1.0,
+        chem_loss_weight=1.0,
+        legacy_masking=False,
+        coupling_form="sum",
+    )
+    loss.backward()
+
+    assert chemical.grad is not None
+    assert torch.isfinite(chemical.grad).all()
+    assert torch.count_nonzero(chemical.grad) > 0
+
+
 def test_multichannel_integrate_rays_matches_loop_reference():
     torch.manual_seed(0)
     batch = 5

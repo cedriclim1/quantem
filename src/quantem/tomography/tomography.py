@@ -46,6 +46,7 @@ def _multimodal_consistency_loss(
     haadf_weight: float,
     chem_loss_weight: float,
     legacy_masking: bool,
+    coupling_form: str = "per_channel",
 ) -> torch.Tensor:
     eds = eds_mask.reshape(-1).to(device=pred.device, dtype=torch.bool)
     target = target.to(device=pred.device, dtype=pred.dtype)
@@ -69,8 +70,21 @@ def _multimodal_consistency_loss(
 
     loss = haadf_loss + chem_loss_weight * chem_loss
     if haadf_weight > 0.0:
-        haadf_signal = pred[:, 0].unsqueeze(1).expand(-1, pred.shape[1] - 1)
-        loss = loss + haadf_weight * F.mse_loss(haadf_signal, pred[:, 1:])
+        if coupling_form == "sum":
+            C = pred[:, 1:].detach()
+            h = target[:, 0]
+            if C.shape[0] >= C.shape[1]:
+                try:
+                    w = torch.linalg.lstsq(C, h.unsqueeze(1)).solution.squeeze(1)
+                except RuntimeError:
+                    pass
+                else:
+                    w = w.clamp_min(0.0).detach()
+                    coupling = F.mse_loss(pred[:, 1:] @ w, h)
+                    loss = loss + haadf_weight * coupling
+        else:
+            haadf_signal = pred[:, 0].unsqueeze(1).expand(-1, pred.shape[1] - 1)
+            loss = loss + haadf_weight * F.mse_loss(haadf_signal, pred[:, 1:])
     return loss
 
 
@@ -167,6 +181,7 @@ class Tomography(TomographyOpt, TomographyBase):
         haadf_weight: float = 0.0,
         chem_loss_weight: float = 1.0,
         legacy_masking: bool = False,
+        coupling_form: str = "per_channel",
         snapshot_every: int = 0,
         snapshot_dir: str | Path | None = None,
         snapshot_callback: Callable[[int, np.ndarray | None], None] | None = None,
@@ -364,6 +379,7 @@ class Tomography(TomographyOpt, TomographyBase):
                         haadf_weight=haadf_weight,
                         chem_loss_weight=chem_loss_weight,
                         legacy_masking=legacy_masking,
+                        coupling_form=coupling_form,
                     )
                 else:
                     batch_consistency_loss = loss_func(pred, target)
@@ -441,6 +457,7 @@ class Tomography(TomographyOpt, TomographyBase):
                     haadf_weight=haadf_weight,
                     chem_loss_weight=chem_loss_weight,
                     legacy_masking=legacy_masking,
+                    coupling_form=coupling_form,
                 )
                 if getattr(self, "val_fg_dataloader", None) is not None:
                     avg_val_fg_loss = self._evaluate_validation_loss(
@@ -452,6 +469,7 @@ class Tomography(TomographyOpt, TomographyBase):
                         haadf_weight=haadf_weight,
                         chem_loss_weight=chem_loss_weight,
                         legacy_masking=legacy_masking,
+                        coupling_form=coupling_form,
                     )
                 if getattr(self, "val_bg_dataloader", None) is not None:
                     avg_val_bg_loss = self._evaluate_validation_loss(
@@ -463,6 +481,7 @@ class Tomography(TomographyOpt, TomographyBase):
                         haadf_weight=haadf_weight,
                         chem_loss_weight=chem_loss_weight,
                         legacy_masking=legacy_masking,
+                        coupling_form=coupling_form,
                     )
 
             metrics = torch.tensor(
@@ -545,6 +564,7 @@ class Tomography(TomographyOpt, TomographyBase):
         haadf_weight: float = 0.0,
         chem_loss_weight: float = 1.0,
         legacy_masking: bool = False,
+        coupling_form: str = "per_channel",
     ) -> float | None:
         val_loss = torch.tensor(0.0, device=self.device)
         val_batches = torch.tensor(0.0, device=self.device)
@@ -589,6 +609,7 @@ class Tomography(TomographyOpt, TomographyBase):
                                 haadf_weight=haadf_weight,
                                 chem_loss_weight=chem_loss_weight,
                                 legacy_masking=legacy_masking,
+                                coupling_form=coupling_form,
                             )
                         else:
                             batch_val_loss = loss_func(pred, target)
