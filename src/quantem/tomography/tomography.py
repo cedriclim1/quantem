@@ -74,13 +74,17 @@ def _multimodal_consistency_loss(
             C = pred[:, 1:].detach()
             h = target[:, 0]
             if C.shape[0] >= C.shape[1]:
-                try:
-                    w = torch.linalg.lstsq(C, h.unsqueeze(1)).solution.squeeze(1)
-                except RuntimeError:
-                    pass
-                else:
-                    w = w.clamp_min(0.0).detach()
-                    coupling = F.mse_loss(pred[:, 1:] @ w, h)
+                gram = C.T @ C
+                lam = (1e-6 * gram.diagonal().mean()).clamp_min(
+                    torch.finfo(C.dtype).eps
+                )
+                w = torch.linalg.solve(
+                    gram + lam * torch.eye(C.shape[1], device=C.device, dtype=C.dtype),
+                    C.T @ h,
+                )
+                w = w.clamp_min(0.0).detach()
+                coupling = F.mse_loss(pred[:, 1:] @ w, h)
+                if torch.isfinite(coupling):
                     loss = loss + haadf_weight * coupling
         else:
             haadf_signal = pred[:, 0].unsqueeze(1).expand(-1, pred.shape[1] - 1)

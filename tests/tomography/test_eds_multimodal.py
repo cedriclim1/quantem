@@ -119,7 +119,7 @@ def test_multimodal_loss_zero_chemical_contribution_and_defined_gradients():
     assert torch.isfinite(head.weight.grad).all()
 
 
-def test_sum_coupling_is_zero_for_exact_nonnegative_linear_mixture():
+def test_sum_coupling_is_near_zero_for_exact_nonnegative_linear_mixture():
     chemical = torch.tensor(
         [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 1.0]]
     )
@@ -140,7 +140,30 @@ def test_sum_coupling_is_zero_for_exact_nonnegative_linear_mixture():
         coupling_form="sum",
     )
 
-    torch.testing.assert_close(loss, torch.tensor(0.0), atol=1e-12, rtol=0.0)
+    torch.testing.assert_close(loss, torch.tensor(0.0), atol=1e-9, rtol=0.0)
+
+
+def test_sum_coupling_is_finite_for_rank_deficient_chemical_signals():
+    chemical = torch.tensor(
+        [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]]
+    )
+    haadf = chemical.sum(dim=1)
+    pred = torch.column_stack((haadf, chemical))
+    target = pred.clone()
+
+    loss = _multimodal_consistency_loss(
+        pred,
+        target,
+        torch.ones(4, dtype=torch.bool),
+        nn.MSELoss(),
+        nn.MSELoss(reduction="none"),
+        haadf_weight=1.0,
+        chem_loss_weight=1.0,
+        legacy_masking=False,
+        coupling_form="sum",
+    )
+
+    assert torch.isfinite(loss)
 
 
 def test_per_channel_default_exactly_matches_previous_formula():
