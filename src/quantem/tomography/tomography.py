@@ -11,6 +11,7 @@ from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml.loss_functions import get_loss_module
+from quantem.core.ml.profiling import nsys_capture_tick
 from quantem.core.ml.models.kplanes import CPTilted
 from quantem.core.utils.filter import gaussian_filter_2d_stack, gaussian_kernel_1d
 from quantem.core.utils.tomography_utils import torch_phase_cross_correlation
@@ -335,6 +336,7 @@ class Tomography(TomographyOpt, TomographyBase):
                 self.step_optimizers()
                 nvtx.range_pop()
                 self._grad_steps = getattr(self, "_grad_steps", 0) + 1
+                nsys_capture_tick(self._grad_steps)
                 if snapshots_enabled and _should_take_grad_step_snapshot(
                     self._grad_steps, snapshot_every
                 ):
