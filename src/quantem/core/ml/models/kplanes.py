@@ -146,12 +146,15 @@ def interpolate_ms_features(
     pts: torch.Tensor,
     ms_grids: nn.ParameterList,
 ) -> torch.Tensor:
-    mat_mode = [[0, 1], [0, 2], [1, 2]]
+    # Plane axis layout: XY=(0,1), XZ=(0,2), YZ=(1,2). Stacking views avoids the
+    # per-call index-tensor allocation (a host-to-device copy) that list-based
+    # advanced indexing does three times per forward.
+    x, y, z = pts.unbind(-1)
     coord_plane = torch.stack(
         [
-            pts[:, mat_mode[0]],
-            pts[:, mat_mode[1]],
-            pts[:, mat_mode[2]],
+            torch.stack((x, y), dim=-1),
+            torch.stack((x, z), dim=-1),
+            torch.stack((y, z), dim=-1),
         ]
     ).view(3, -1, 1, 2)
 
@@ -247,6 +250,12 @@ class KPlanes(PPLR, TensorDecompositionModel):
             nn.init.zeros_(out.bias)
             layers.append(out)
             self.sigma_net = nn.Sequential(*layers)
+        else:
+            # Linear head fallback, matching KPlanesTILTED._build_sigma_net and
+            # CPTilted: forward/get_params reference sigma_net unconditionally.
+            self.sigma_net = nn.Linear(self.feature_dim, self.out_features, bias=True)
+            nn.init.normal_(self.sigma_net.weight, std=0.01)
+            nn.init.zeros_(self.sigma_net.bias)
 
     def get_densities(self, coords: torch.Tensor):
         """Computes and returns densities"""
@@ -682,33 +691,29 @@ def interpolate_ms_features_cp_tilted(
     # Rotate all points by all rotations: (T, B, 3)
     rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
 
+    # For each transform t, we need three 1D samples: at x_t, y_t, z_t.
+    # Lay them out as (3T, B) coords, matching each line grid's first dim.
+    # Axis order per transform: x, y, z.
+    coords_1d = rotated.reshape(T, B, 3).permute(0, 2, 1).reshape(3 * T, B)
+
+    # grid_sample wants 4D input for 2D sampling: sample the (3T, C, 1, L) lines
+    # with 2D coords whose y is fixed at 0. The grid only depends on the points,
+    # so it is built once here rather than per scale inside the loop.
+    grid = torch.stack(
+        [
+            coords_1d,  # x
+            torch.zeros_like(coords_1d),  # y
+        ],
+        dim=-1,
+    ).unsqueeze(1)  # (3T, 1, B, 2)
+
     per_scale_features = []
     for line_coef in ms_grids:
         # line_coef: (3T, C, L)  — three 1D feature lines per transform (x, y, z)
-        C, _ = line_coef.shape[1], line_coef.shape[2]
-
-        # For each transform t, we need three 1D samples: at x_t, y_t, z_t.
-        # Lay them out as (3T, B) coords, matching line_coef's first dim.
-        # Axis order per transform: x, y, z.
-        coords_1d = rotated.reshape(T, B, 3).permute(0, 2, 1).reshape(3 * T, B)
-        # coords_1d: (3T, B), each row is samples along one axis for one transform
-
-        # grid_sample wants 4D input for 2D sampling, or we can use 1D via a
-        # (3T, C, 1, L) reshape and pass 2D coords with y fixed at 0.
-        # Simpler: use F.grid_sample with a 4D trick, or just do manual linear interp.
-        # Here's the grid_sample way:
-        line_coef_4d = line_coef.unsqueeze(2)  # (3T, C, 1, L)
-        # grid: need (3T, Hout=1, Wout=B, 2), with x = coord, y = 0
-        grid = torch.stack(
-            [
-                coords_1d,  # x
-                torch.zeros_like(coords_1d),  # y
-            ],
-            dim=-1,
-        ).unsqueeze(1)  # (3T, 1, B, 2)
+        C = line_coef.shape[1]
 
         sampled = F.grid_sample(
-            line_coef_4d,
+            line_coef.unsqueeze(2),  # (3T, C, 1, L)
             grid,
             align_corners=True,
             mode="bilinear",
