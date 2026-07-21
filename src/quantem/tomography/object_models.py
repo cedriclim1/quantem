@@ -136,6 +136,7 @@ class ObjConstraintParams:
         tv_vol: float = 0.0
         tv_plane: float = 0.0
         sparsity: float = 0.0
+        sparsity_chem: float | None = None
         # Wedge-aware anisotropic volume TV: per-axis (z,y,x) weight multipliers applied to
         # the volume-TV gradient norm. None => isotropic (original behaviour). Penalizing the
         # missing-wedge (y/z) directions more than the resolved (x) direction suppresses
@@ -149,7 +150,13 @@ class ObjConstraintParams:
         s3im_value_range: float = 1.0
         _name: str = "obj_tensor_decomp"
 
-        soft_constraint_keys = ["tv_vol", "tv_plane", "sparsity", "s3im_weight"]
+        soft_constraint_keys = [
+            "tv_vol",
+            "tv_plane",
+            "sparsity",
+            "sparsity_chem",
+            "s3im_weight",
+        ]
         hard_constraint_keys = ["positivity", "shrinkage"]
 
     @classmethod
@@ -1040,7 +1047,25 @@ class ObjectTensorDecomp(ObjectINR):
             assert ctx.pred is not None, "Prediction must be provided for TV loss"
             soft_loss += self.get_tv_loss(ctx)
 
-        if self.constraints.sparsity > 0:  # NOTE: For the linter, I must make this :)
+        if self.constraints.sparsity_chem is not None:
+            assert ctx.all_densities is not None, (
+                "All densities must be provided for sparsity loss"
+            )
+            if ctx.all_densities.ndim < 2 or ctx.all_densities.shape[-1] < 2:
+                raise ValueError(
+                    "sparsity_chem requires multichannel densities with channels "
+                    "on the last axis"
+                )
+            # KPlanes returns [samples, channels]: channel 0 is HAADF and the
+            # remaining channels are chemical densities.  Reduce each group
+            # independently so both weights retain mean-absolute-value scaling.
+            sparsity_loss = (
+                self.constraints.sparsity * ctx.all_densities[..., 0].abs().mean()
+                + self.constraints.sparsity_chem
+                * ctx.all_densities[..., 1:].abs().mean()
+            )
+            soft_loss += sparsity_loss
+        elif self.constraints.sparsity > 0:  # Preserve the shared-weight path exactly.
             assert ctx.all_densities is not None, (
                 "All densities must be provided for sparsity loss"
             )
