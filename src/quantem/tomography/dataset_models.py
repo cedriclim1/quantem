@@ -1294,7 +1294,11 @@ class TomographyEDSINRDataset(TomographyINRDataset):
         _token: object | None = None,
     ):
         self.sparse_view_tilt_angles = self._as_tensor(sparse_view_tilt_angles)
-        self.eds_signals_tilt_stack = self._normalize_eds_stack(eds_signals_tilt_stack)
+        raw_eds_stack = self._as_tensor(eds_signals_tilt_stack)
+        self.eds_normalization_scales = self._eds_channel_scales(raw_eds_stack)
+        self.eds_signals_tilt_stack = raw_eds_stack / self.eds_normalization_scales.view(
+            -1, 1, 1, 1
+        )
         super().__init__(
             tilt_stack=haadf_tilt_stack,
             tilt_angles=tilt_angles,
@@ -1347,8 +1351,7 @@ class TomographyEDSINRDataset(TomographyINRDataset):
         return torch.from_numpy(x.copy())
 
     @staticmethod
-    def _normalize_eds_stack(eds_stack: NDArray | torch.Tensor) -> torch.Tensor:
-        stack = TomographyEDSINRDataset._as_tensor(eds_stack)
+    def _eds_channel_scales(stack: torch.Tensor) -> torch.Tensor:
         if stack.ndim != 4:
             raise ValueError(
                 "eds_signals_tilt_stack must have shape (channels, tilts, height, width)."
@@ -1359,7 +1362,14 @@ class TomographyEDSINRDataset(TomographyINRDataset):
         scale = torch.where(quantile > 0, quantile, fallback)
         if torch.any(scale <= 0):
             raise ValueError("An EDS channel is all zeros; cannot normalize.")
-        return stack / scale
+        return scale.reshape(-1)
+
+    @staticmethod
+    def _normalize_eds_stack(eds_stack: NDArray | torch.Tensor) -> torch.Tensor:
+        """Normalize EDS channels while preserving the historical public helper."""
+        stack = TomographyEDSINRDataset._as_tensor(eds_stack)
+        scale = TomographyEDSINRDataset._eds_channel_scales(stack)
+        return stack / scale.view(-1, 1, 1, 1)
 
     def _build_chem_index_map(self, angle_tol: float) -> torch.Tensor:
         tilt_angles = self.tilt_angles.detach().cpu().float()

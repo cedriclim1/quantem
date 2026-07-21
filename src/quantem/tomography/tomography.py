@@ -37,6 +37,46 @@ from quantem.tomography.tomography_context import ReconstructionContext
 from quantem.tomography.tomography_opt import TomographyOpt
 
 
+def _masked_poisson_nll(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+    counts_scale: torch.Tensor | Sequence[float] | None = None,
+) -> torch.Tensor:
+    """Masked-mean Poisson NLL for normalized EDS projections.
+
+    EDS datasets retain normalized targets for legacy reconstruction paths.  The
+    per-channel ``counts_scale`` reverses that normalization so both the prediction
+    and target enter this likelihood in observed-count units.  Field densities are
+    normally nonnegative by activation; the defensive clamp keeps the log domain
+    physical if a caller supplies an unconstrained prediction.
+    """
+    if eps <= 0.0:
+        raise ValueError("Poisson epsilon must be positive.")
+    if pred.shape != target.shape or pred.ndim != 2:
+        raise ValueError("Poisson prediction and target must be matching [rays, channels].")
+
+    target = target.to(device=pred.device, dtype=pred.dtype)
+    supervised = mask.reshape(-1, 1).to(device=pred.device, dtype=pred.dtype)
+    if supervised.shape[0] != pred.shape[0]:
+        raise ValueError("Poisson mask must contain one value per ray.")
+
+    if counts_scale is None:
+        scale = torch.ones(pred.shape[1], device=pred.device, dtype=pred.dtype)
+    else:
+        scale = torch.as_tensor(counts_scale, device=pred.device, dtype=pred.dtype).reshape(-1)
+        if scale.numel() != pred.shape[1] or torch.any(scale <= 0):
+            raise ValueError("Poisson counts_scale must be positive with one value per channel.")
+
+    pred_counts = pred.clamp_min(0.0) * scale
+    target_counts = target * scale
+    per_elem = pred_counts - target_counts * torch.log(pred_counts + eps)
+    denominator = (supervised.sum() * pred.shape[1]).clamp_min(1.0)
+    return (per_elem * supervised).sum() / denominator
+
+
 def _multimodal_consistency_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -47,6 +87,9 @@ def _multimodal_consistency_loss(
     chem_loss_weight: float,
     legacy_masking: bool,
     coupling_form: str = "per_channel",
+    chem_loss_type: str | None = None,
+    poisson_eps: float = 1e-6,
+    chem_counts_scale: torch.Tensor | Sequence[float] | None = None,
 ) -> torch.Tensor:
     eds = eds_mask.reshape(-1).to(device=pred.device, dtype=torch.bool)
     target = target.to(device=pred.device, dtype=pred.dtype)
@@ -65,8 +108,19 @@ def _multimodal_consistency_loss(
     haadf_loss = loss_func(pred[:, 0], target[:, 0])
 
     mask = eds.unsqueeze(1).to(dtype=pred.dtype)
-    per_elem = loss_func_noreduce(pred[:, 1:] * mask, target[:, 1:] * mask)
-    chem_loss = per_elem.sum() / (mask.sum() * per_elem.shape[1]).clamp_min(1.0)
+    if chem_loss_type == "poisson":
+        chem_loss = _masked_poisson_nll(
+            pred[:, 1:],
+            target[:, 1:],
+            eds,
+            eps=poisson_eps,
+            counts_scale=chem_counts_scale,
+        )
+    elif chem_loss_type is None:
+        per_elem = loss_func_noreduce(pred[:, 1:] * mask, target[:, 1:] * mask)
+        chem_loss = per_elem.sum() / (mask.sum() * per_elem.shape[1]).clamp_min(1.0)
+    else:
+        raise ValueError(f"Unsupported chemical loss type: {chem_loss_type!r}")
 
     loss = haadf_loss + chem_loss_weight * chem_loss
     if haadf_weight > 0.0:
@@ -186,6 +240,8 @@ class Tomography(TomographyOpt, TomographyBase):
         chem_loss_weight: float = 1.0,
         legacy_masking: bool = False,
         coupling_form: str = "per_channel",
+        chem_loss_type: Literal["poisson"] | None = None,
+        poisson_eps: float = 1e-6,
         snapshot_every: int = 0,
         snapshot_dir: str | Path | None = None,
         snapshot_callback: Callable[[int, np.ndarray | None], None] | None = None,
@@ -198,6 +254,8 @@ class Tomography(TomographyOpt, TomographyBase):
             raise ValueError("snapshot_every must be >= 0.")
         if holdout_every < 1:
             raise ValueError("holdout_every must be >= 1.")
+        if poisson_eps <= 0.0:
+            raise ValueError("poisson_eps must be positive.")
         if val_fraction > 0.0 and holdout_fraction > 0.0:
             raise ValueError("Use either val_fraction or holdout_fraction, not both.")
         snapshots_enabled = snapshot_every > 0
@@ -307,6 +365,13 @@ class Tomography(TomographyOpt, TomographyBase):
         loss_func_noreduce = get_loss_module(
             name=loss_type, dtype=self.obj_model.dtype, **loss_func_noreduce_kwargs
         )
+        chem_counts_scale = None
+        if chem_loss_type == "poisson":
+            chem_counts_scale = getattr(self.dset, "eds_normalization_scales", None)
+            if chem_counts_scale is None:
+                raise ValueError(
+                    "Poisson chemical loss requires EDS channel normalization scales."
+                )
 
         pbar = tqdm(range(num_iter), disable=not self.verbose)
         for a0 in pbar:
@@ -384,6 +449,9 @@ class Tomography(TomographyOpt, TomographyBase):
                         chem_loss_weight=chem_loss_weight,
                         legacy_masking=legacy_masking,
                         coupling_form=coupling_form,
+                        chem_loss_type=chem_loss_type,
+                        poisson_eps=poisson_eps,
+                        chem_counts_scale=chem_counts_scale,
                     )
                 else:
                     batch_consistency_loss = loss_func(pred, target)
@@ -462,6 +530,9 @@ class Tomography(TomographyOpt, TomographyBase):
                     chem_loss_weight=chem_loss_weight,
                     legacy_masking=legacy_masking,
                     coupling_form=coupling_form,
+                    chem_loss_type=chem_loss_type,
+                    poisson_eps=poisson_eps,
+                    chem_counts_scale=chem_counts_scale,
                 )
                 if getattr(self, "val_fg_dataloader", None) is not None:
                     avg_val_fg_loss = self._evaluate_validation_loss(
@@ -474,6 +545,9 @@ class Tomography(TomographyOpt, TomographyBase):
                         chem_loss_weight=chem_loss_weight,
                         legacy_masking=legacy_masking,
                         coupling_form=coupling_form,
+                        chem_loss_type=chem_loss_type,
+                        poisson_eps=poisson_eps,
+                        chem_counts_scale=chem_counts_scale,
                     )
                 if getattr(self, "val_bg_dataloader", None) is not None:
                     avg_val_bg_loss = self._evaluate_validation_loss(
@@ -486,6 +560,9 @@ class Tomography(TomographyOpt, TomographyBase):
                         chem_loss_weight=chem_loss_weight,
                         legacy_masking=legacy_masking,
                         coupling_form=coupling_form,
+                        chem_loss_type=chem_loss_type,
+                        poisson_eps=poisson_eps,
+                        chem_counts_scale=chem_counts_scale,
                     )
 
             metrics = torch.tensor(
@@ -569,6 +646,9 @@ class Tomography(TomographyOpt, TomographyBase):
         chem_loss_weight: float = 1.0,
         legacy_masking: bool = False,
         coupling_form: str = "per_channel",
+        chem_loss_type: Literal["poisson"] | None = None,
+        poisson_eps: float = 1e-6,
+        chem_counts_scale: torch.Tensor | Sequence[float] | None = None,
     ) -> float | None:
         val_loss = torch.tensor(0.0, device=self.device)
         val_batches = torch.tensor(0.0, device=self.device)
@@ -614,6 +694,9 @@ class Tomography(TomographyOpt, TomographyBase):
                                 chem_loss_weight=chem_loss_weight,
                                 legacy_masking=legacy_masking,
                                 coupling_form=coupling_form,
+                                chem_loss_type=chem_loss_type,
+                                poisson_eps=poisson_eps,
+                                chem_counts_scale=chem_counts_scale,
                             )
                         else:
                             batch_val_loss = loss_func(pred, target)
