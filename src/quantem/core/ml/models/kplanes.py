@@ -351,9 +351,10 @@ def interpolate_ms_features_tilted(
 
     When the optional ``quantem-cuda`` package is installed, the tensors live
     on a CUDA device, and the ``use_cuda_kernels`` config option is true
-    (default), each scale dispatches to the fused CUDA kernel (rotate +
-    grid_sample + Hadamard product in one launch, analytic backward) —
-    identical semantics to the torch path below, including scale_gates.
+    (default), a three-scale model dispatches to one multiscale CUDA op
+    (rotate + grid_sample + Hadamard product + scale gate, analytic backward).
+    Older ``quantem-cuda`` packages and other scale counts fall back to the
+    per-level fused op. Both paths preserve the torch semantics below.
     """
     T = rotation_matrices.shape[0]
     B = pts.shape[0]
@@ -366,7 +367,28 @@ def interpolate_ms_features_tilted(
         and config.get("has_quantem_cuda")
         and config.get("use_cuda_kernels", default=True)
     ):
-        from quantem.cuda.core.ml import kplanes_tilted_fuse
+        import quantem.cuda.core.ml as cuda_ml
+
+        kplanes_tilted_fuse = cuda_ml.kplanes_tilted_fuse
+        kplanes_tilted_fuse_ms = getattr(cuda_ml, "kplanes_tilted_fuse_ms", None)
+        # Respect instrumentation/overrides of the public single-level op.
+        # The built-in identity is absent in older packages, which naturally
+        # selects the compatible per-level path too.
+        single_level_is_builtin = (
+            getattr(cuda_ml, "_kplanes_tilted_fuse_builtin", None) is kplanes_tilted_fuse
+        )
+        if kplanes_tilted_fuse_ms is not None and len(ms_grids) == 3 and single_level_is_builtin:
+            gates = scale_gates if scale_gates is not None else (1.0, 1.0, 1.0)
+            return kplanes_tilted_fuse_ms(
+                pts,
+                rotation_matrices,
+                ms_grids[0],
+                ms_grids[1],
+                ms_grids[2],
+                float(gates[0]),
+                float(gates[1]),
+                float(gates[2]),
+            )
 
         feats = [kplanes_tilted_fuse(pts, rotation_matrices, g) for g in ms_grids]
         if scale_gates is not None:
