@@ -7,7 +7,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch.cuda import nvtx
 from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
@@ -37,6 +36,21 @@ from quantem.tomography.radon.radon import iradon_torch, radon_torch
 from quantem.tomography.tomography_base import TomographyBase
 from quantem.tomography.tomography_context import ReconstructionContext
 from quantem.tomography.tomography_opt import TomographyOpt
+
+if torch.cuda.is_available():
+    from torch.cuda import nvtx
+else:
+
+    class _NvtxNoop:
+        @staticmethod
+        def range_push(msg: str) -> None:
+            pass
+
+        @staticmethod
+        def range_pop() -> None:
+            pass
+
+    nvtx = _NvtxNoop()
 
 
 def _should_take_grad_step_snapshot(grad_step: int, snapshot_every: int) -> bool:
