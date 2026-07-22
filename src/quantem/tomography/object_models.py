@@ -15,8 +15,8 @@ from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.ddp import DDPMixin
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.models.model_base import PlanarDecompositionModel
-from quantem.core.ml.s3im import S3IMLoss
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
+from quantem.core.ml.s3im import S3IMLoss
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
 from quantem.tomography.tomography_context import ReconstructionContext
@@ -995,12 +995,14 @@ class ObjectTensorDecomp(ObjectINR):
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
         model: nn.Module | None = None,
+        compile_model: bool = False,
         _token: object | None = None,
     ):
         super().__init__(
             shape=shape,
             device=device,
             rng=rng,
+            compile_model=compile_model,
             _token=self._token,
         )
         self._pretrain_losses = []
@@ -1020,12 +1022,14 @@ class ObjectTensorDecomp(ObjectINR):
         shape: tuple[int, int, int],
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
+        compile_model: bool = False,
     ):
         obj_model = cls(
             shape=shape,
             device=device,
             rng=rng,
             model=model,  # ✅ build/register in __init__
+            compile_model=compile_model,
         )
 
         obj_model.setup_distributed(device=device)
@@ -1169,14 +1173,18 @@ class ObjectTensorDecomp(ObjectINR):
         pred = all_pred[:n]  # (N, C)
         shifted_pred = all_pred[n:].view(3, n, -1)  # (3, N, C)
 
-        grad_stack = (shifted_pred - pred.unsqueeze(0)) / h  # (3, N, C); axis0 = coord(0,1,2)=(x,y,z)
+        grad_stack = (
+            shifted_pred - pred.unsqueeze(0)
+        ) / h  # (3, N, C); axis0 = coord(0,1,2)=(x,y,z)
 
         aniso = getattr(self.constraints, "tv_vol_aniso", None)
         if aniso is not None:
             # Weight per coordinate direction (coord0=x, coord1=y, coord2=z). The missing
             # wedge lives in y/z, so set those weights high and x low to suppress streak
             # smear without over-smoothing the resolved in-plane (x) structure.
-            w = torch.as_tensor(aniso, device=grad_stack.device, dtype=grad_stack.dtype).view(3, 1, 1)
+            w = torch.as_tensor(aniso, device=grad_stack.device, dtype=grad_stack.dtype).view(
+                3, 1, 1
+            )
             grad_stack = grad_stack * w
 
         grad_norm = torch.norm(grad_stack, dim=0)  # (N, C)
