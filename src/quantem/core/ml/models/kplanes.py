@@ -101,6 +101,7 @@ def init_planes(
             nn.init.ones_(param)
         else:
             nn.init.uniform_(param, a=a, b=b)
+        param.data = param.data.contiguous(memory_format=torch.channels_last)
         planes.append(param)
     return planes
 
@@ -220,6 +221,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
             scaled_res = [int(r * res_mult) for r in self.resolution]
             plane = nn.Parameter(torch.empty(3, self.M_features, scaled_res[1], scaled_res[0]))
             nn.init.uniform_(plane, 0.1, 0.5)
+            plane.data = plane.data.contiguous(memory_format=torch.channels_last)
             self.grids.append(plane)
             self.feature_dim += self.M_features
 
@@ -254,6 +256,13 @@ class KPlanes(PPLR, TensorDecompositionModel):
             self.sigma_net = nn.Linear(self.feature_dim, 1, bias=True)
             nn.init.normal_(self.sigma_net.weight, std=0.01)
             nn.init.zeros_(self.sigma_net.bias)
+
+    def __setstate__(self, state) -> None:
+        """Restore channels-last grids when loading legacy whole-module checkpoints."""
+        super().__setstate__(state)
+        for plane in self.grids:
+            if plane.ndim == 4:
+                plane.data = plane.data.contiguous(memory_format=torch.channels_last)
 
     def get_densities(self, coords: torch.Tensor):
         """Computes and returns densities"""
@@ -500,6 +509,7 @@ class KPlanesTILTED(KPlanes):
             scaled_res = [int(r * res_mult) for r in resolution]
             plane = nn.Parameter(torch.empty(3 * T, M_features, scaled_res[1], scaled_res[0]))
             nn.init.uniform_(plane, 0.1, 0.5)
+            plane.data = plane.data.contiguous(memory_format=torch.channels_last)
             self.grids.append(plane)
 
         # ---- Rebuild sigma_net with the correct feature_dim ----

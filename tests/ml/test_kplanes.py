@@ -1,5 +1,7 @@
 """Tests for ``quantem.core.ml.models.kplanes`` construction guards."""
 
+import io
+
 import pytest
 import torch
 
@@ -29,6 +31,39 @@ class TestResolutionValidation:
             KPlanes(M_features=2, resolution=(16, 16, 8))
         with pytest.raises(ValueError, match="isotropic"):
             KPlanesTILTED(M_features=2, T=2, resolution=(16, 8, 16))
+
+
+@pytest.mark.parametrize(
+    ("model_type", "kwargs"),
+    [
+        (KPlanes, {}),
+        (KPlanesTILTED, {"T": 2}),
+    ],
+)
+def test_grid_parameters_are_channels_last(model_type, kwargs):
+    model = model_type(M_features=2, resolution=(8, 8, 8), **kwargs)
+
+    for plane in model.grids:
+        assert plane.is_contiguous(memory_format=torch.channels_last)
+        assert plane.permute(0, 2, 3, 1).is_contiguous()
+
+
+def test_whole_module_load_reformats_legacy_grids():
+    model = KPlanesTILTED(
+        M_features=2,
+        T=2,
+        resolution=(8, 8, 8),
+        density_activation=torch.relu,
+    )
+    for plane in model.grids:
+        plane.data = plane.data.contiguous()
+
+    checkpoint = io.BytesIO()
+    torch.save(model, checkpoint)
+    checkpoint.seek(0)
+    restored = torch.load(checkpoint, weights_only=False)
+
+    assert all(plane.is_contiguous(memory_format=torch.channels_last) for plane in restored.grids)
 
 
 class TestDefaultHeadConstruction:
