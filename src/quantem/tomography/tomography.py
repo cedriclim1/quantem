@@ -152,6 +152,7 @@ class Tomography(TomographyOpt, TomographyBase):
         pose_warmup_epochs: int = 0,
         *,
         autocast_dtype: str | None = None,
+        grad_scaler: bool | None = None,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -168,9 +169,12 @@ class Tomography(TomographyOpt, TomographyBase):
         autocast_dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16}
         if autocast_dtype is not None and autocast_dtype not in autocast_dtypes:
             raise ValueError("autocast_dtype must be one of None, 'bf16', or 'fp16'.")
+        grad_scaler_enabled = autocast_dtype == "fp16" if grad_scaler is None else grad_scaler
+        if grad_scaler_enabled and autocast_dtype is None:
+            raise ValueError("grad_scaler=True requires autocast_dtype to be set.")
         autocast_enabled = autocast_dtype is not None
         torch_autocast_dtype = autocast_dtypes.get(autocast_dtype, torch.bfloat16)
-        grad_scaler = torch.amp.GradScaler(self.device.type, enabled=autocast_dtype == "fp16")
+        grad_scaler = torch.amp.GradScaler(self.device.type, enabled=grad_scaler_enabled)
         snapshots_enabled = snapshot_every > 0
 
         # Check device consistency
@@ -371,7 +375,7 @@ class Tomography(TomographyOpt, TomographyBase):
                 nvtx.range_pop()
 
                 nvtx.range_push("backward")
-                if autocast_dtype == "fp16":
+                if grad_scaler_enabled:
                     grad_scaler.scale(batch_loss).backward()
                 else:
                     batch_loss.backward()
@@ -379,13 +383,13 @@ class Tomography(TomographyOpt, TomographyBase):
                 # Clip gradients
                 nvtx.range_push("clip_and_optim_step")
                 self._sync_pose_gradients_ddp()
-                if autocast_dtype == "fp16":
+                if grad_scaler_enabled:
                     if "object" in self.optimizer_params and self.obj_model.has_optimizer():
                         grad_scaler.unscale_(self.obj_model.optimizer)
                     if "pose" in self.optimizer_params and self.dset.has_optimizer():
                         grad_scaler.unscale_(self.dset.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)
-                if autocast_dtype == "fp16":
+                if grad_scaler_enabled:
                     scaler_stepped = False
                     if "object" in self.optimizer_params and self.obj_model.has_optimizer():
                         grad_scaler.step(self.obj_model.optimizer)
