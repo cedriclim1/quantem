@@ -85,3 +85,19 @@ class TestDefaultHeadConstruction:
         out = model(torch.rand(5, 3) * 2 - 1)
         assert out.shape == (5, 1)
         assert torch.isfinite(out).all()
+
+
+def test_tilted_forward_is_dynamo_traceable():
+    """The public ``grids`` child must not be hidden behind a broken property.
+
+    ``nn.Module.__setattr__`` registers the ParameterList as ``grids``.  Eager
+    lookup tolerates a same-named property whose getter reads missing ``_grids``,
+    but Dynamo traces that getter and turns its AttributeError into Unsupported.
+    """
+    model = KPlanesTILTED(M_features=2, T=2, resolution=(4, 4, 4))
+    coords = torch.rand(8, 3) * 2 - 1
+
+    eager = model(coords)
+    compiled = torch.compile(model, backend="eager", fullgraph=True)(coords)
+
+    torch.testing.assert_close(compiled, eager)

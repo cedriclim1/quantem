@@ -309,16 +309,6 @@ class KPlanes(PPLR, TensorDecompositionModel):
         self._tilted = tilted
 
     @property
-    def grids(self) -> torch.nn.ParameterList:
-        return self._grids
-
-    @grids.setter
-    def grids(self, grids: torch.nn.ParameterList):
-        if not isinstance(grids, torch.nn.ParameterList):
-            raise TypeError("Grids must be a ParameterList")
-        self._grids = grids
-
-    @property
     def resolution(self) -> list[int]:
         return self._resolution
 
