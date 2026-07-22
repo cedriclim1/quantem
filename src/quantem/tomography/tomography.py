@@ -11,8 +11,8 @@ from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml.loss_functions import get_loss_module
-from quantem.core.ml.profiling import nsys_capture_tick
 from quantem.core.ml.models.kplanes import CPTilted
+from quantem.core.ml.profiling import nsys_capture_tick
 from quantem.core.utils.filter import gaussian_filter_2d_stack, gaussian_kernel_1d
 from quantem.core.utils.tomography_utils import torch_phase_cross_correlation
 from quantem.tomography.dataset_models import (
@@ -150,6 +150,8 @@ class Tomography(TomographyOpt, TomographyBase):
         snapshot_dir: str | Path | None = None,
         snapshot_callback: Callable[[int, np.ndarray | None], None] | None = None,
         pose_warmup_epochs: int = 0,
+        *,
+        autocast_dtype: str | None = None,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -163,6 +165,12 @@ class Tomography(TomographyOpt, TomographyBase):
             raise ValueError("holdout_every must be >= 1.")
         if val_fraction > 0.0 and holdout_fraction > 0.0:
             raise ValueError("Use either val_fraction or holdout_fraction, not both.")
+        autocast_dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16}
+        if autocast_dtype is not None and autocast_dtype not in autocast_dtypes:
+            raise ValueError("autocast_dtype must be one of None, 'bf16', or 'fp16'.")
+        autocast_enabled = autocast_dtype is not None
+        torch_autocast_dtype = autocast_dtypes.get(autocast_dtype, torch.bfloat16)
+        grad_scaler = torch.amp.GradScaler(self.device.type, enabled=autocast_dtype == "fp16")
         snapshots_enabled = snapshot_every > 0
 
         # Check device consistency
@@ -310,8 +318,8 @@ class Tomography(TomographyOpt, TomographyBase):
                 self.zero_grad_all()
                 with torch.autocast(
                     device_type=self.device.type,
-                    dtype=torch.bfloat16,
-                    enabled=False,
+                    dtype=torch_autocast_dtype,
+                    enabled=autocast_enabled,
                 ):
                     nvtx.range_push("get_coords")
                     all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
@@ -363,13 +371,32 @@ class Tomography(TomographyOpt, TomographyBase):
                 nvtx.range_pop()
 
                 nvtx.range_push("backward")
-                batch_loss.backward()
+                if autocast_dtype == "fp16":
+                    grad_scaler.scale(batch_loss).backward()
+                else:
+                    batch_loss.backward()
                 nvtx.range_pop()
                 # Clip gradients
                 nvtx.range_push("clip_and_optim_step")
                 self._sync_pose_gradients_ddp()
+                if autocast_dtype == "fp16":
+                    if "object" in self.optimizer_params and self.obj_model.has_optimizer():
+                        grad_scaler.unscale_(self.obj_model.optimizer)
+                    if "pose" in self.optimizer_params and self.dset.has_optimizer():
+                        grad_scaler.unscale_(self.dset.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)
-                self.step_optimizers()
+                if autocast_dtype == "fp16":
+                    scaler_stepped = False
+                    if "object" in self.optimizer_params and self.obj_model.has_optimizer():
+                        grad_scaler.step(self.obj_model.optimizer)
+                        scaler_stepped = True
+                    if "pose" in self.optimizer_params and self.dset.has_optimizer():
+                        grad_scaler.step(self.dset.optimizer)
+                        scaler_stepped = True
+                    if scaler_stepped:
+                        grad_scaler.update()
+                else:
+                    self.step_optimizers()
                 nvtx.range_pop()
                 self._grad_steps = getattr(self, "_grad_steps", 0) + 1
                 nsys_capture_tick(self._grad_steps)
@@ -434,6 +461,8 @@ class Tomography(TomographyOpt, TomographyBase):
                     num_samples_per_ray=curr_num_samples_per_ray,
                     object_extent=N,
                     loss_func=loss_func,
+                    autocast_dtype=torch_autocast_dtype,
+                    autocast_enabled=autocast_enabled,
                 )
                 if getattr(self, "val_fg_dataloader", None) is not None:
                     avg_val_fg_loss = self._evaluate_validation_loss(
@@ -441,6 +470,8 @@ class Tomography(TomographyOpt, TomographyBase):
                         num_samples_per_ray=curr_num_samples_per_ray,
                         object_extent=N,
                         loss_func=loss_func,
+                        autocast_dtype=torch_autocast_dtype,
+                        autocast_enabled=autocast_enabled,
                     )
                 if getattr(self, "val_bg_dataloader", None) is not None:
                     avg_val_bg_loss = self._evaluate_validation_loss(
@@ -448,6 +479,8 @@ class Tomography(TomographyOpt, TomographyBase):
                         num_samples_per_ray=curr_num_samples_per_ray,
                         object_extent=N,
                         loss_func=loss_func,
+                        autocast_dtype=torch_autocast_dtype,
+                        autocast_enabled=autocast_enabled,
                     )
                 nvtx.range_pop()  # validation
 
@@ -522,6 +555,8 @@ class Tomography(TomographyOpt, TomographyBase):
         num_samples_per_ray: int,
         object_extent: int,
         loss_func: torch.nn.Module,
+        autocast_dtype: torch.dtype,
+        autocast_enabled: bool,
     ) -> float | None:
         val_loss = torch.tensor(0.0, device=self.device)
         val_batches = torch.tensor(0.0, device=self.device)
@@ -533,13 +568,11 @@ class Tomography(TomographyOpt, TomographyBase):
         try:
             with torch.no_grad():
                 for batch in dataloader:
-                    # Match the training pass (enabled=False): bf16 autocast breaks
-                    # the so3 pose solve and would make validation inconsistent with
-                    # the fp32 training loss it is compared to.
+                    # Keep validation autocast consistent with the training pass.
                     with torch.autocast(
                         device_type=self.device.type,
-                        dtype=torch.bfloat16,
-                        enabled=False,
+                        dtype=autocast_dtype,
+                        enabled=autocast_enabled,
                     ):
                         all_coords = self.dset.get_coords(
                             batch, object_extent, num_samples_per_ray

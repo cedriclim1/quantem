@@ -14,11 +14,16 @@ import torch
 
 from quantem.core.ml.optimizer_mixin import OptimizerParams, SchedulerParams
 from quantem.tomography.dataset_models import TomographyINRDataset, TomographyPixDataset
-from quantem.tomography.object_models import ObjConstraintParams, ObjectINR, ObjectPixelated
+from quantem.tomography.object_models import (
+    ObjConstraintParams,
+    ObjectINR,
+    ObjectPixelated,
+    ObjectTensorDecomp,
+)
 from quantem.tomography.tomography import Tomography, TomographyConventional
 from quantem.tomography.tomography_lite import TomographyLiteINR
 
-from .conftest import requires_torch
+from .conftest import requires_gpu, requires_torch
 
 
 def _stack(nang=5, n=12, seed=0):
@@ -198,8 +203,7 @@ class TestInrFactory:
         assert pose_scheduler_at_epoch_start == [False, True]
         assert object_active_at_epoch_start == [True, True]
         assert all(
-            torch.equal(before, after)
-            for before, after in zip(initial_pose, pose_at_epoch_end[0])
+            torch.equal(before, after) for before, after in zip(initial_pose, pose_at_epoch_end[0])
         )
         assert any(
             not torch.equal(before, after)
@@ -229,6 +233,69 @@ class TestInrFactory:
 
         with pytest.raises(ValueError, match="pose_warmup_epochs must be >= 0"):
             default_tomo.reconstruct(num_iter=0, pose_warmup_epochs=-1)
+
+    def test_reconstruct_default_autocast_keeps_parameters_fp32(self):
+        tomo = self._inr_tomo("cpu", n=4)
+        tomo.reconstruct(
+            num_iter=1,
+            batch_size=len(tomo.dset),
+            num_workers=0,
+            num_samples_per_ray=2,
+            autocast_dtype=None,
+        )
+        assert len(tomo.epoch_losses) == 1
+        assert all(param.dtype == torch.float32 for param in tomo.obj_model.model.parameters())
+
+    def test_reconstruct_rejects_invalid_autocast_dtype(self):
+        tomo = self._inr_tomo("cpu", n=4)
+        with pytest.raises(ValueError, match="autocast_dtype"):
+            tomo.reconstruct(autocast_dtype="float32")
+
+    def test_reconstruct_bf16_autocast_runs_on_cpu(self):
+        from quantem.core.ml.models.kplanes import KPlanes
+
+        n = 4
+        model = KPlanes(M_features=2, resolution=(n, n, n))
+        obj = ObjectTensorDecomp.from_model(model, shape=(n, n, n), device="cpu")
+        dset = TomographyINRDataset.from_data(
+            _stack(nang=5, n=n), np.linspace(-60, 60, 5).astype(np.float32)
+        )
+        tomo = Tomography.from_models(dset=dset, obj_model=obj, device="cpu", verbose=False)
+        tomo.reconstruct(
+            num_iter=2,
+            batch_size=len(dset),
+            num_workers=0,
+            num_samples_per_ray=2,
+            autocast_dtype="bf16",
+        )
+        assert len(tomo.epoch_losses) == 2
+
+    @requires_gpu
+    def test_reconstruct_fp16_autocast_runs_on_cuda(self, monkeypatch):
+        grad_scalers = []
+        grad_scaler_cls = torch.amp.GradScaler
+
+        def capture_grad_scaler(*args, **kwargs):
+            grad_scaler = grad_scaler_cls(*args, **kwargs)
+            grad_scalers.append(grad_scaler)
+            return grad_scaler
+
+        monkeypatch.setattr(torch.amp, "GradScaler", capture_grad_scaler)
+        tomo = self._inr_tomo("cuda:0", n=4)
+        tomo.reconstruct(
+            num_iter=2,
+            batch_size=len(tomo.dset),
+            num_workers=0,
+            num_samples_per_ray=2,
+            autocast_dtype="fp16",
+        )
+
+        assert len(tomo.epoch_losses) == 2
+        assert np.isfinite(tomo.epoch_losses).all()
+        assert len(grad_scalers) == 1
+        scale = grad_scalers[0].get_scale()
+        assert isinstance(scale, float)
+        assert np.isfinite(scale) and scale > 0
 
 
 @requires_torch
