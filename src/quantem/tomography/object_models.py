@@ -587,7 +587,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         ctx: ReconstructionContext,
     ) -> torch.Tensor:
         device = ctx.coords.device if ctx.coords is not None else self._device
-        soft_loss = torch.tensor(0.0, device=device)
+        soft_loss = torch.zeros((), device=device)
         if self.constraints.tv_vol > 0:
             assert ctx.coords is not None, (
                 "coords must be provided for INR object model to compute the TV loss"
@@ -1052,19 +1052,17 @@ class ObjectTensorDecomp(ObjectINR):
         num_tv_samples = min(10_000, coords.shape[0])
         tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
         tv_coords = coords[tv_indices]  # (n, 3)
-        ex = torch.zeros(3, device=tv_coords.device)
-        ex[0] = h
-        ey = torch.zeros(3, device=tv_coords.device)
-        ey[1] = h
-        ez = torch.zeros(3, device=tv_coords.device)
-        ez[2] = h
-        return torch.cat([tv_coords, tv_coords + ex, tv_coords + ey, tv_coords + ez], dim=0)
+        offsets = h * torch.eye(3, device=tv_coords.device)
+        return torch.cat(
+            [tv_coords, tv_coords + offsets[0], tv_coords + offsets[1], tv_coords + offsets[2]],
+            dim=0,
+        )
 
     # --- Constraints ---
 
     def apply_soft_constraints(self, ctx: ReconstructionContext) -> torch.Tensor:
-        soft_loss = torch.tensor(
-            0.0, device=ctx.pred.device if ctx.pred is not None else self.device
+        soft_loss = torch.zeros(
+            (), device=ctx.pred.device if ctx.pred is not None else self.device
         )
         if self.constraints.tv_vol > 0 or self.constraints.tv_plane > 0:
             assert ctx.coords is not None, "Coordinates must be provided for TV loss"
@@ -1094,7 +1092,7 @@ class ObjectTensorDecomp(ObjectINR):
         """
         assert ctx.coords is not None, "Coordinates must be provided for TV loss"
         assert ctx.pred is not None, "Prediction must be provided for TV loss"
-        tv_loss = torch.tensor(0.0, device=ctx.pred.device)
+        tv_loss = torch.zeros((), device=ctx.pred.device)
         if self.constraints.tv_plane > 0:
             tv_loss = tv_loss + self._get_plane_tv_loss()
         if self.constraints.tv_vol > 0:
@@ -1182,9 +1180,12 @@ class ObjectTensorDecomp(ObjectINR):
             # Weight per coordinate direction (coord0=x, coord1=y, coord2=z). The missing
             # wedge lives in y/z, so set those weights high and x low to suppress streak
             # smear without over-smoothing the resolved in-plane (x) structure.
-            w = torch.as_tensor(aniso, device=grad_stack.device, dtype=grad_stack.dtype).view(
-                3, 1, 1
-            )
+            w = torch.stack(
+                [
+                    torch.full((), value, device=grad_stack.device, dtype=grad_stack.dtype)
+                    for value in aniso
+                ]
+            ).view(3, 1, 1)
             grad_stack = grad_stack * w
 
         grad_norm = torch.norm(grad_stack, dim=0)  # (N, C)

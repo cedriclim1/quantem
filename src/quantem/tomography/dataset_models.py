@@ -1,3 +1,4 @@
+import math
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -532,7 +533,7 @@ class TomographyDatasetConstraints(BaseConstraints, TomographyDatasetBase):
         )
 
     def apply_soft_constraints(self) -> torch.Tensor:
-        soft_loss = torch.tensor(0.0, device=self.z1_params.device)
+        soft_loss = torch.zeros((), device=self.z1_params.device)
         if self.constraints.tv_zs > 0:
             tv_loss_zs = tv_loss_1d(self.z1_params)
             tv_loss_zs += tv_loss_1d(self.z3_params)
@@ -1117,6 +1118,16 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         )
         t_enter, t_exit, valid = self._compute_ray_box_intersections(origins, directions)
 
+        if getattr(self, "_cuda_graph_static_sampling", False):
+            return self._get_coords_box_fixed_ds_cuda_graph(
+                origins=origins,
+                directions=directions,
+                t_enter=t_enter,
+                t_exit=t_exit,
+                valid=valid,
+                num_samples_per_ray=num_samples_per_ray,
+            )
+
         if not bool(valid.any()):
             self._ray_meta = {
                 "valid": valid,
@@ -1154,6 +1165,47 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
 
         all_coords = coords_v[sample_mask_v]
         return all_coords.to(self.device, dtype=torch.float32)
+
+    def _get_coords_box_fixed_ds_cuda_graph(
+        self,
+        *,
+        origins: torch.Tensor,
+        directions: torch.Tensor,
+        t_enter: torch.Tensor,
+        t_exit: torch.Tensor,
+        valid: torch.Tensor,
+        num_samples_per_ray: int,
+    ) -> torch.Tensor:
+        """Build a fixed-capacity ray representation suitable for CUDA Graph replay.
+
+        Eager fixed-ds sampling compacts valid rays and sizes its padded dimension from a
+        GPU reduction. Both make allocation shapes depend on batch contents. During graph
+        capture, retain every ray and use the cube's maximum possible chord to choose one
+        conservative, host-known padded width. Invalid/padded coordinates are placed
+        outside the cube, so object-model masks make their densities and gradients zero.
+        """
+        ds = self._resolve_ray_ds(num_samples_per_ray)
+        max_samples = math.ceil((2.0 * math.sqrt(3.0)) / float(ds)) + 1
+        lengths = t_exit - t_enter
+        n_samples = torch.ceil(lengths.detach() / float(ds)).to(torch.long) + 1
+        n_samples = torch.clamp(n_samples, min=2, max=max_samples)
+
+        sample_idx = torch.arange(max_samples, device=origins.device).unsqueeze(0)
+        sample_mask = valid.unsqueeze(1) & (sample_idx < n_samples.unsqueeze(1))
+        denom = (n_samples - 1).to(origins.dtype).unsqueeze(1)
+        u = sample_idx.to(origins.dtype) / denom
+        t_vals = t_enter.unsqueeze(1) + lengths.unsqueeze(1) * u
+        coords = origins.unsqueeze(1) + t_vals.unsqueeze(2) * directions.unsqueeze(1)
+        coords = torch.where(sample_mask.unsqueeze(2), coords, coords.new_full((), 2.0))
+
+        step_sizes = lengths / (n_samples.to(lengths.dtype) - 1.0)
+        self._ray_meta = {
+            "valid": valid,
+            "sample_mask": sample_mask,
+            "step_sizes": step_sizes,
+            "num_valid_samples": sample_mask.sum(),
+        }
+        return coords.reshape(-1, 3).to(self.device, dtype=torch.float32)
 
     def integrate_rays(
         self, rays: torch.Tensor, num_samples_per_ray: int, target_values_len: int
@@ -1193,6 +1245,13 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
                 "integrate_rays called in 'box_fixed_ds' mode without ray metadata; "
                 "get_coords must run first."
             )
+        if "sample_mask" in meta:
+            sample_mask = meta["sample_mask"]
+            ray_densities = densities.reshape(sample_mask.shape)
+            ray_sums = (ray_densities * sample_mask.to(densities.dtype)).sum(dim=1)
+            predicted = ray_sums * meta["step_sizes"].to(densities.dtype)
+            return torch.where(meta["valid"], predicted, torch.zeros_like(predicted))
+
         predicted = torch.zeros(target_values_len, device=densities.device, dtype=densities.dtype)
         valid = meta["valid"]
         if not bool(valid.any()):
@@ -1209,6 +1268,14 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         # Consumed; clear so a stale batch can never be silently reused.
         self._ray_meta = None
         return predicted
+
+    def graph_constraint_densities(self, densities: torch.Tensor) -> torch.Tensor:
+        """Match eager sparsity normalization for graph-padded fixed-ds densities."""
+        meta = self._ray_meta
+        if meta is None or "sample_mask" not in meta:
+            return densities
+        num_valid_samples = meta["num_valid_samples"].clamp_min(1).to(densities.dtype)
+        return densities * (densities.numel() / num_valid_samples)
 
     # --- Torch Dataset Methods ---
     def __getitem__(

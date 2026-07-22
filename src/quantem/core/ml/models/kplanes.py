@@ -542,6 +542,7 @@ class KPlanesTILTED(KPlanes):
 
         # ---- Learnable rotations ----
         self.set_so3_param_type(so3_param_type, init=tau_init)
+        self.register_buffer("_rotation_matrices_override", None, persistent=False)
 
         # ---- Coarse-to-fine scale gating ----
         self.num_scales = num_scales
@@ -600,7 +601,9 @@ class KPlanesTILTED(KPlanes):
 
     def get_densities(self, coords: torch.Tensor) -> torch.Tensor:
         pts = coords.reshape(-1, 3)
-        R = self.so3.as_matrix()  # (T, 3, 3)
+        R = self._rotation_matrices_override
+        if R is None:
+            R = self.so3.as_matrix()  # (T, 3, 3)
         gates = self._scale_gates if getattr(self, "c2f_warmup_frac", 0.0) > 0 else None
         features = interpolate_ms_features_tilted(
             pts=pts,

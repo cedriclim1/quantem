@@ -1,4 +1,5 @@
 import os
+import warnings
 from pathlib import Path
 from typing import Callable, Literal, Self, Sequence
 
@@ -11,7 +12,7 @@ from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml.loss_functions import get_loss_module
-from quantem.core.ml.models.kplanes import CPTilted
+from quantem.core.ml.models.kplanes import CPTilted, KPlanesTILTED
 from quantem.core.ml.profiling import nsys_capture_tick
 from quantem.core.utils.filter import gaussian_filter_2d_stack, gaussian_kernel_1d
 from quantem.core.utils.tomography_utils import torch_phase_cross_correlation
@@ -153,6 +154,7 @@ class Tomography(TomographyOpt, TomographyBase):
         *,
         autocast_dtype: str | None = None,
         grad_scaler: bool | None = None,
+        cuda_graphs: bool = False,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -177,8 +179,24 @@ class Tomography(TomographyOpt, TomographyBase):
         grad_scaler = torch.amp.GradScaler(self.device.type, enabled=grad_scaler_enabled)
         snapshots_enabled = snapshot_every > 0
 
+        if cuda_graphs and self.world_size > 1:
+            raise NotImplementedError("CUDA Graph reconstruction does not support DDP.")
+        if cuda_graphs and torch.device(self.device).type != "cuda":
+            raise ValueError("cuda_graphs=True requires a CUDA device.")
+
+        # Reconnecting an existing optimizer during ``to`` marks all of its parameters
+        # trainable. Preserve an explicitly frozen tilted rotation bank; optimizer_params
+        # supplied below may intentionally enable it again.
+        tilted_so3_was_frozen = isinstance(
+            self.obj_model.model, KPlanesTILTED
+        ) and not any(
+            parameter.requires_grad for parameter in self.obj_model.model.so3.parameters()
+        )
+
         # Check device consistency
         self.obj_model.to(self.device)
+        if tilted_so3_was_frozen:
+            self.obj_model.model.so3.requires_grad_(False)
 
         previous_batch_size = getattr(self, "batch_size", None)
         previous_num_workers = getattr(self, "num_workers", None)
@@ -202,10 +220,19 @@ class Tomography(TomographyOpt, TomographyBase):
             raise NotImplementedError("Reset is not implemented yet.")
 
         new_scheduler = reset
+        previous_cuda_graphs_optimizer = getattr(
+            self.obj_model, "_cuda_graphs_optimizer", False
+        )
+        if cuda_graphs:
+            # Optimizers constructed below use capturable fused Adam and device LR
+            # tensors. Existing optimizers remain usable for Phase A, but Phase B is
+            # enabled only if they were already built with these properties.
+            self.obj_model._cuda_graphs_optimizer = True
         if optimizer_params is not None:
             self.optimizer_params = optimizer_params
             self.set_optimizers()
             new_scheduler = True
+        self.obj_model._cuda_graphs_optimizer = previous_cuda_graphs_optimizer
 
         if scheduler_params is not None:
             self.scheduler_params = scheduler_params
@@ -271,6 +298,33 @@ class Tomography(TomographyOpt, TomographyBase):
             self.dset.optimizer_params = pose_optimizer_params
             self.dset.scheduler_params = pose_scheduler_params
 
+        capture_enabled = cuda_graphs
+        if capture_enabled and (self.dset.has_optimizer() or pose_warmup_pending):
+            warnings.warn(
+                "cuda_graphs=True is falling back to eager reconstruction because pose "
+                "learning is enabled.",
+                stacklevel=2,
+            )
+            capture_enabled = False
+
+        tilted_model = (
+            self.obj_model.model
+            if isinstance(self.obj_model.model, KPlanesTILTED)
+            else None
+        )
+        static_rotation_matrices: torch.Tensor | None = None
+        if capture_enabled and tilted_model is not None:
+            if any(parameter.requires_grad for parameter in tilted_model.so3.parameters()):
+                warnings.warn(
+                    "cuda_graphs=True is falling back to eager reconstruction because "
+                    "KPlanesTILTED SO(3) learning is enabled.",
+                    stacklevel=2,
+                )
+                capture_enabled = False
+            else:
+                with torch.no_grad():
+                    static_rotation_matrices = tilted_model.so3.as_matrix().detach()
+
         N = max(self.obj_model.shape)
 
         if num_samples_per_ray is None:
@@ -287,6 +341,101 @@ class Tomography(TomographyOpt, TomographyBase):
                     print("num_samples_per_ray schedule provided.")
 
         loss_func = get_loss_module(name=loss_type, dtype=self.obj_model.dtype, **loss_func_kwargs)
+
+        forward_graph: torch.cuda.CUDAGraph | None = None
+        optimizer_graph: torch.cuda.CUDAGraph | None = None
+        graph_pool = None
+        static_batch: dict[str, torch.Tensor] | None = None
+        static_losses: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        graph_grads: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
+        graph_num_samples_per_ray: int | None = None
+        optimizer = self.obj_model.optimizer
+        optimizer_graph_eligible = (
+            capture_enabled
+            and not grad_scaler_enabled
+            and isinstance(optimizer, torch.optim.Adam)
+            and all(
+                group.get("capturable", False) and group.get("fused", False)
+                for group in optimizer.param_groups
+            )
+        )
+
+        def optimizer_state_is_initialized() -> bool:
+            assert optimizer is not None
+            return all(
+                parameter.grad is None or bool(optimizer.state.get(parameter))
+                for group in optimizer.param_groups
+                for parameter in group["params"]
+            )
+
+        def clear_model_grads(*, set_to_none: bool) -> None:
+            for parameter in self.obj_model.model.parameters():
+                if set_to_none:
+                    parameter.grad = None
+                elif parameter.grad is not None:
+                    parameter.grad.zero_()
+
+        def forward_loss_backward(
+            batch: dict[str, torch.Tensor],
+            samples_per_ray: int,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            with torch.autocast(
+                device_type=self.device.type,
+                dtype=torch_autocast_dtype,
+                enabled=autocast_enabled,
+            ):
+                nvtx.range_push("get_coords")
+                all_coords = self.dset.get_coords(batch, N, samples_per_ray)
+                nvtx.range_pop()
+
+                nvtx.range_push("obj_forward")
+                tap_coords = self.obj_model.sample_tv_tap_coords(all_coords)
+                if tap_coords is not None:
+                    all_densities, tv_tap_raw = self.obj_model.forward_with_tv_taps(
+                        all_coords, tap_coords
+                    )
+                else:
+                    all_densities = self.obj_model.forward(all_coords)
+                    tv_tap_raw = None
+                nvtx.range_pop()
+
+                nvtx.range_push("integrate_rays")
+                integrated_densities = self.dset.integrate_rays(
+                    all_densities,
+                    samples_per_ray,
+                    len(batch["target_value"]),
+                )
+                nvtx.range_pop()
+
+            pred = integrated_densities.float()
+            target = batch["target_value"].to(self.device, non_blocking=True).float()
+
+            nvtx.range_push("soft_constraints")
+            constraint_densities = self.dset.graph_constraint_densities(all_densities)
+            soft_constraints_loss = self.obj_model.apply_soft_constraints(
+                ctx=ReconstructionContext(
+                    coords=all_coords,
+                    pred=pred,
+                    all_densities=constraint_densities,
+                    target=target,
+                    tv_tap_densities=tv_tap_raw,
+                )
+            )
+            nvtx.range_pop()
+
+            nvtx.range_push("consistency_loss")
+            batch_consistency_loss = loss_func(pred, target)
+            soft_constraints_loss += self.dset.apply_soft_constraints()
+            batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
+            nvtx.range_pop()
+
+            nvtx.range_push("backward")
+            if grad_scaler_enabled:
+                grad_scaler.scale(batch_loss).backward()
+            else:
+                batch_loss.backward()
+            nvtx.range_pop()
+            return batch_loss, batch_consistency_loss, soft_constraints_loss
 
         pbar = tqdm(range(num_iter), disable=not self.verbose)
         for a0 in pbar:
@@ -319,67 +468,87 @@ class Tomography(TomographyOpt, TomographyBase):
 
             for batch_idx, batch in enumerate(self.dataloader):
                 nvtx.range_push("batch")
-                self.zero_grad_all()
-                with torch.autocast(
-                    device_type=self.device.type,
-                    dtype=torch_autocast_dtype,
-                    enabled=autocast_enabled,
-                ):
-                    nvtx.range_push("get_coords")
-                    all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
-                    nvtx.range_pop()
-
-                    nvtx.range_push("obj_forward")
-                    tap_coords = self.obj_model.sample_tv_tap_coords(all_coords)
-                    if tap_coords is not None:
-                        all_densities, tv_tap_raw = self.obj_model.forward_with_tv_taps(
-                            all_coords, tap_coords
-                        )
-                    else:
-                        all_densities = self.obj_model.forward(all_coords)
-                        tv_tap_raw = None
-                    nvtx.range_pop()
-
-                    nvtx.range_push("integrate_rays")
-                    integrated_densities = self.dset.integrate_rays(
-                        all_densities,
-                        curr_num_samples_per_ray,
-                        len(batch["target_value"]),
-                    )
-                    nvtx.range_pop()
-
-                pred = integrated_densities.float()
-
-                target = batch["target_value"].to(self.device, non_blocking=True).float()
-
-                nvtx.range_push("soft_constraints")
-                soft_constraints_loss = self.obj_model.apply_soft_constraints(
-                    ctx=ReconstructionContext(
-                        coords=all_coords,
-                        pred=pred,
-                        all_densities=all_densities,
-                        target=target,
-                        tv_tap_densities=tv_tap_raw,
+                full_batch = len(batch["target_value"]) == batch_size
+                graph_shape_matches = (
+                    forward_graph is not None
+                    and curr_num_samples_per_ray == graph_num_samples_per_ray
+                    and static_batch is not None
+                    and all(
+                        key in batch
+                        and batch[key].shape == value.shape
+                        and batch[key].dtype == value.dtype
+                        for key, value in static_batch.items()
                     )
                 )
-                nvtx.range_pop()
+                used_forward_graph = False
 
-                nvtx.range_push("consistency_loss")
-                batch_consistency_loss = loss_func(pred, target)
+                if capture_enabled and full_batch and forward_graph is None:
+                    static_batch = {
+                        key: value.detach().to(self.device).clone()
+                        for key, value in batch.items()
+                    }
+                    graph_num_samples_per_ray = curr_num_samples_per_ray
+                    try:
+                        self.dset._cuda_graph_static_sampling = True
+                        if tilted_model is not None:
+                            assert static_rotation_matrices is not None
+                            tilted_model._rotation_matrices_override = static_rotation_matrices
 
-                soft_constraints_loss += self.dset.apply_soft_constraints()
+                        # Materialize lazy kernels/optimizer scale state on a side stream.
+                        current_stream = torch.cuda.current_stream(self.device)
+                        warmup_stream = torch.cuda.Stream(device=self.device)
+                        warmup_stream.wait_stream(current_stream)
+                        with torch.cuda.stream(warmup_stream):
+                            for _ in range(3):
+                                clear_model_grads(set_to_none=True)
+                                forward_loss_backward(
+                                    static_batch,
+                                    curr_num_samples_per_ray,
+                                )
+                        current_stream.wait_stream(warmup_stream)
+
+                        graph_pool = torch.cuda.graph_pool_handle()
+                        forward_graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(forward_graph, pool=graph_pool):
+                            clear_model_grads(set_to_none=False)
+                            static_losses = forward_loss_backward(
+                                static_batch,
+                                curr_num_samples_per_ray,
+                            )
+                    finally:
+                        self.dset._cuda_graph_static_sampling = False
+                        if tilted_model is not None:
+                            tilted_model._rotation_matrices_override = None
+                    graph_grads = [
+                        (parameter, parameter.grad)
+                        for parameter in self.obj_model.model.parameters()
+                        if parameter.grad is not None
+                    ]
+                    # Capture records the work but does not populate static outputs for
+                    # this first batch; replay once before consuming its losses/gradients.
+                    forward_graph.replay()
+                    batch_loss, batch_consistency_loss, soft_constraints_loss = static_losses
+                    used_forward_graph = True
+                elif capture_enabled and full_batch and graph_shape_matches:
+                    assert static_batch is not None
+                    assert static_losses is not None
+                    for key, value in static_batch.items():
+                        value.copy_(batch[key], non_blocking=True)
+                    for parameter, static_grad in graph_grads:
+                        parameter.grad = static_grad
+                    forward_graph.replay()
+                    batch_loss, batch_consistency_loss, soft_constraints_loss = static_losses
+                    used_forward_graph = True
+                else:
+                    # DeviceBatchSampler drops the tail. This path protects custom
+                    # samplers/wrappers and sample-count schedules without violating a
+                    # previously captured graph's static-shape contract.
+                    self.zero_grad_all()
+                    batch_loss, batch_consistency_loss, soft_constraints_loss = (
+                        forward_loss_backward(batch, curr_num_samples_per_ray)
+                    )
 
                 epoch_soft_constraint_loss += soft_constraints_loss.detach()
-
-                batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
-                nvtx.range_pop()
-
-                nvtx.range_push("backward")
-                if grad_scaler_enabled:
-                    grad_scaler.scale(batch_loss).backward()
-                else:
-                    batch_loss.backward()
-                nvtx.range_pop()
                 # Clip gradients
                 nvtx.range_push("clip_and_optim_step")
                 self._sync_pose_gradients_ddp()
@@ -399,9 +568,30 @@ class Tomography(TomographyOpt, TomographyBase):
                         scaler_stepped = True
                     if scaler_stepped:
                         grad_scaler.update()
+                elif optimizer_graph_eligible and graph_pool is not None and used_forward_graph:
+                    assert optimizer is not None
+                    if not optimizer_state_is_initialized():
+                        # Adam lazily creates and zeroes its state on the first step. If
+                        # that initialization is captured, every replay resets ``step``
+                        # before incrementing it, freezing bias correction at step 1.
+                        # Execute the first logical update eagerly so subsequent capture
+                        # sees stable state tensors.
+                        optimizer.step()
+                    elif optimizer_graph is None:
+                        optimizer_graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(optimizer_graph, pool=graph_pool):
+                            optimizer.step()
+                        # Capture records the step but does not execute this iteration's
+                        # update. Mirror the forward graph and replay it immediately.
+                        optimizer_graph.replay()
+                    else:
+                        optimizer_graph.replay()
                 else:
                     self.step_optimizers()
                 nvtx.range_pop()
+                graph_step_callback = getattr(self, "_cuda_graph_step_callback", None)
+                if capture_enabled and graph_step_callback is not None:
+                    graph_step_callback()
                 self._grad_steps = getattr(self, "_grad_steps", 0) + 1
                 nsys_capture_tick(self._grad_steps)
                 if snapshots_enabled and _should_take_grad_step_snapshot(
@@ -559,8 +749,8 @@ class Tomography(TomographyOpt, TomographyBase):
         num_samples_per_ray: int,
         object_extent: int,
         loss_func: torch.nn.Module,
-        autocast_dtype: torch.dtype,
-        autocast_enabled: bool,
+        autocast_dtype: torch.dtype = torch.bfloat16,
+        autocast_enabled: bool = False,
     ) -> float | None:
         val_loss = torch.tensor(0.0, device=self.device)
         val_batches = torch.tensor(0.0, device=self.device)

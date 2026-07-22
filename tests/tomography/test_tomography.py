@@ -297,6 +297,140 @@ class TestInrFactory:
         assert isinstance(scale, float)
         assert np.isfinite(scale) and scale > 0
 
+    @requires_gpu
+    @pytest.mark.parametrize("model_kind", ["inr", "kplanes_tilted"])
+    def test_reconstruct_cuda_graphs_matches_eager_fp32(self, model_kind):
+        seed = 7
+
+        def build_tomography():
+            if model_kind == "inr":
+                return self._inr_tomo("cuda:0", n=4)
+
+            from quantem.core.ml.models.kplanes import KPlanesTILTED
+
+            model = KPlanesTILTED(
+                M_features=2,
+                resolution=(4, 4, 4),
+                multiscale_res_multipliers=[1],
+                T=2,
+                so3_param_type="r9svd",
+            )
+            obj = ObjectTensorDecomp.from_model(
+                model,
+                shape=(4, 4, 4),
+                device="cuda:0",
+            )
+            dset = TomographyINRDataset.from_data(
+                _stack(nang=5, n=4),
+                np.linspace(-60, 60, 5).astype(np.float32),
+            )
+            return Tomography.from_models(
+                dset=dset,
+                obj_model=obj,
+                device="cuda:0",
+                verbose=False,
+            )
+
+        torch.manual_seed(seed)
+        eager = build_tomography()
+        torch.manual_seed(seed)
+        graphed = build_tomography()
+
+        eager_initial_params = [
+            parameter.detach().clone() for parameter in eager.obj_model.model.parameters()
+        ]
+        graphed_initial_params = [
+            parameter.detach().clone() for parameter in graphed.obj_model.model.parameters()
+        ]
+
+        reconstruct_kwargs = {
+            "num_iter": 40,
+            "batch_size": len(eager.dset),
+            "num_workers": 0,
+            "num_samples_per_ray": 4,
+        }
+        if model_kind == "inr":
+            reconstruct_kwargs["optimizer_params"] = {
+                "object": OptimizerParams.Adam(lr=1e-3)
+            }
+        else:
+            optimizer_params = {
+                "grids": OptimizerParams.Adam(lr=1e-3),
+                "sigma_net": OptimizerParams.Adam(lr=1e-3),
+                "so3": OptimizerParams.Adam(lr=1e-3),
+            }
+            eager.obj_model.set_optimizer(optimizer_params)
+            graphed.obj_model._cuda_graphs_optimizer = True
+            try:
+                graphed.obj_model.set_optimizer(optimizer_params)
+            finally:
+                graphed.obj_model._cuda_graphs_optimizer = False
+            eager.obj_model.model.so3.requires_grad_(False)
+            graphed.obj_model.model.so3.requires_grad_(False)
+
+        def adam_steps(tomo):
+            return [
+                int(state["step"].item())
+                for state in tomo.obj_model.optimizer.state.values()
+                if "step" in state
+            ]
+
+        graphed_step_history = []
+
+        def record_graphed_step():
+            steps = adam_steps(graphed)
+            assert steps and len(set(steps)) == 1
+            graphed_step_history.append(steps[0])
+
+        graphed._cuda_graph_step_callback = record_graphed_step
+
+        torch.manual_seed(seed)
+        eager.reconstruct(**reconstruct_kwargs)
+        torch.manual_seed(seed)
+        graphed.reconstruct(**reconstruct_kwargs, cuda_graphs=True)
+        if model_kind == "kplanes_tilted":
+            assert graphed.obj_model.model._rotation_matrices_override is None
+
+        eager_param_delta = max(
+            (parameter - initial).abs().max().item()
+            for parameter, initial in zip(
+                eager.obj_model.model.parameters(), eager_initial_params
+            )
+        )
+        graphed_param_delta = max(
+            (parameter - initial).abs().max().item()
+            for parameter, initial in zip(
+                graphed.obj_model.model.parameters(), graphed_initial_params
+            )
+        )
+        assert eager_param_delta > 0.0
+        assert graphed_param_delta > 0.0
+        assert graphed_step_history == list(range(1, reconstruct_kwargs["num_iter"] + 1))
+
+        eager_steps = adam_steps(eager)
+        graphed_steps = adam_steps(graphed)
+        assert eager_steps
+        assert graphed_steps
+        assert set(eager_steps) == {reconstruct_kwargs["num_iter"]}
+        assert graphed_steps == eager_steps
+
+        # Padded rays change reduction order, so Adam compounds small graph/eager
+        # differences without a bound in principle. The full trajectory is only a smoke
+        # bound; the prefix check and Adam-step/parameter-delta assertions establish
+        # faithfulness.
+        np.testing.assert_allclose(
+            graphed.epoch_losses[:10],
+            eager.epoch_losses[:10],
+            rtol=1e-6,
+            atol=0.0,
+        )
+        np.testing.assert_allclose(
+            graphed.epoch_losses,
+            eager.epoch_losses,
+            rtol=2e-3,
+            atol=0.0,
+        )
+
 
 @requires_torch
 class TestLiteINRReconstructBranch:

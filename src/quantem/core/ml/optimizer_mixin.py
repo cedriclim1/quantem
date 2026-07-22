@@ -678,9 +678,26 @@ class OptimizerMixin:
         # default foreach path on large grids, same update rule); only valid when every
         # parameter lives on a CUDA device.
         fused = all(p.is_cuda for group in param_groups for p in group["params"])
+        cuda_graphs = (
+            bool(getattr(self, "_cuda_graphs_optimizer", False))
+            and fused
+            and isinstance(opt_params, OptimizerParams.Adam)
+        )
+        if cuda_graphs:
+            # Captured Adam must read its learning rate from stable device storage so
+            # scheduler updates made between replays remain visible to the graph. This
+            # relies on PyTorch 2.12 schedulers updating tensor LRs in place via ``fill_``;
+            # older PyTorch versions may replace the value and silently freeze the LR
+            # seen by an already-captured graph.
+            for group in param_groups:
+                group["lr"] = torch.tensor(group["lr"], device=group["params"][0].device)
         match opt_params:
             case OptimizerParams.Adam():
-                return torch.optim.Adam(param_groups, fused=fused)
+                return torch.optim.Adam(
+                    param_groups,
+                    fused=fused,
+                    capturable=cuda_graphs,
+                )
             case OptimizerParams.AdamW():
                 return torch.optim.AdamW(param_groups, fused=fused)
             case OptimizerParams.SGD():
@@ -769,7 +786,7 @@ class OptimizerMixin:
     def get_current_lr(self) -> float:
         """Get the current learning rate."""
         if self._optimizer is not None:
-            return self._optimizer.param_groups[0]["lr"]
+            return float(self._optimizer.param_groups[0]["lr"])
         return 0.0
 
     def remove_optimizer(self) -> None:
