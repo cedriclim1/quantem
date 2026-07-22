@@ -12,7 +12,7 @@ import torch
 from torch import nn
 
 from quantem.core import config
-from quantem.core.ml.models.kplanes import interpolate_ms_features_tilted
+from quantem.core.ml.models.kplanes import KPlanesTILTED, interpolate_ms_features_tilted
 
 requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 requires_quantem_cuda = pytest.mark.skipif(
@@ -104,3 +104,28 @@ def test_non_fp32_takes_torch_path():
     grids64 = nn.ParameterList(nn.Parameter(g.double()) for g in grids)
     out = interpolate_ms_features_tilted(pts64, grids64, rot64)
     assert out.dtype == torch.float64
+
+
+@requires_gpu
+@requires_quantem_cuda
+def test_three_scale_features_enter_sigma_net_in_autocast_dtype(monkeypatch):
+    monkeypatch.setenv("QUANTEM_KPLANES_MS_BF16_OUT", "1")
+    model = KPlanesTILTED(
+        M_features=2,
+        T=2,
+        resolution=(8, 8, 8),
+        multiscale_res_multipliers=(0.5, 0.75, 1.0),
+    ).cuda()
+    coords = torch.rand((16, 3), device="cuda", dtype=torch.float32) * 2 - 1
+    input_dtypes = []
+    handle = model.sigma_net.register_forward_pre_hook(
+        lambda _module, inputs: input_dtypes.append(inputs[0].dtype)
+    )
+    try:
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            model(coords)
+        model(coords)
+    finally:
+        handle.remove()
+
+    assert input_dtypes == [torch.bfloat16, torch.float32]
