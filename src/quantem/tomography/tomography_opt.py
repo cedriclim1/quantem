@@ -7,7 +7,27 @@ from quantem.core.ml.optimizer_mixin import (
     OptimizerParamsType,
     SchedulerParamsType,
 )
+from quantem.tomography.dataset_models import TomographyINRDataset
 from quantem.tomography.tomography_base import TomographyBase
+
+
+def _pose_optimizer_specs(
+    dset: TomographyINRDataset,
+    pose_lr: float,
+    shift_lr: float | None = None,
+    tilt_axis_lr: float | None = None,
+) -> dict[str, OptimizerParams.Adam]:
+    """Build role-keyed Adam specs, falling back to the legacy shared pose LR."""
+    specs = {}
+    if dset.learn_shift:
+        specs["pose_shift"] = OptimizerParams.Adam(
+            lr=pose_lr if shift_lr is None else shift_lr
+        )
+    if dset.learn_tilt_axis:
+        specs["pose_tilt_axis"] = OptimizerParams.Adam(
+            lr=pose_lr if tilt_axis_lr is None else tilt_axis_lr
+        )
+    return specs
 
 
 class TomographyOpt(TomographyBase):
