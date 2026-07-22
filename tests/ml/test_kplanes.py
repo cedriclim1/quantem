@@ -1,8 +1,19 @@
 """Tests for ``quantem.core.ml.models.kplanes`` construction guards."""
 
 import pytest
+import torch
 
 from quantem.core.ml.models.kplanes import KPlanes, KPlanesTILTED
+from quantem.core.ml.models.so3params import SO3ParamR9SVD
+
+
+def test_r9svd_as_matrix_stays_fp32_under_autocast():
+    so3 = SO3ParamR9SVD(T=2)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=True):
+        rotation_matrices = so3.as_matrix()
+
+    assert rotation_matrices.dtype == torch.float32
 
 
 class TestResolutionValidation:

@@ -42,9 +42,15 @@ class SO3ParamQuat(nn.Module):
         wx, wy, wz = w * x, w * y, w * z
         R = torch.stack(
             [
-                1 - 2 * (yy + zz), 2 * (xy - wz),     2 * (xz + wy),
-                2 * (xy + wz),     1 - 2 * (xx + zz), 2 * (yz - wx),
-                2 * (xz - wy),     2 * (yz + wx),     1 - 2 * (xx + yy),
+                1 - 2 * (yy + zz),
+                2 * (xy - wz),
+                2 * (xz + wy),
+                2 * (xy + wz),
+                1 - 2 * (xx + zz),
+                2 * (yz - wx),
+                2 * (xz - wy),
+                2 * (yz + wx),
+                1 - 2 * (xx + yy),
             ],
             dim=-1,
         ).reshape(*q.shape[:-1], 3, 3)
@@ -79,10 +85,18 @@ class SO3ParamQuat(nn.Module):
         S0, S1, S2, S3 = S.unbind(-1)
 
         # each candidate in [x, y, z, w] order
-        cand_w = torch.stack([(m21 - m12) / S0, (m02 - m20) / S0, (m10 - m01) / S0, 0.25 * S0], dim=-1)
-        cand_x = torch.stack([0.25 * S1, (m01 + m10) / S1, (m02 + m20) / S1, (m21 - m12) / S1], dim=-1)
-        cand_y = torch.stack([(m01 + m10) / S2, 0.25 * S2, (m12 + m21) / S2, (m02 - m20) / S2], dim=-1)
-        cand_z = torch.stack([(m02 + m20) / S3, (m12 + m21) / S3, 0.25 * S3, (m10 - m01) / S3], dim=-1)
+        cand_w = torch.stack(
+            [(m21 - m12) / S0, (m02 - m20) / S0, (m10 - m01) / S0, 0.25 * S0], dim=-1
+        )
+        cand_x = torch.stack(
+            [0.25 * S1, (m01 + m10) / S1, (m02 + m20) / S1, (m21 - m12) / S1], dim=-1
+        )
+        cand_y = torch.stack(
+            [(m01 + m10) / S2, 0.25 * S2, (m12 + m21) / S2, (m02 - m20) / S2], dim=-1
+        )
+        cand_z = torch.stack(
+            [(m02 + m20) / S3, (m12 + m21) / S3, 0.25 * S3, (m10 - m01) / S3], dim=-1
+        )
 
         cands = torch.stack([cand_w, cand_x, cand_y, cand_z], dim=-2)  # (..., 4, 4)
         idx = t.argmax(dim=-1)  # (...,)
@@ -174,11 +188,13 @@ class SO3ParamR9SVD(nn.Module):
     @staticmethod
     def r9_to_rotmat(M: torch.Tensor) -> torch.Tensor:
         """R9 (..., 3, 3) -> nearest SO(3) matrix via SVD+."""
-        U, _, Vh = torch.linalg.svd(M)
-        d = torch.det(U @ Vh)
-        diag = torch.ones(*M.shape[:-2], 3, device=M.device, dtype=M.dtype)
-        diag[..., 2] = d
-        return U @ (diag.unsqueeze(-1) * Vh)
+        # Precision-critical rotations stay fp32 under autocast, preserving fused dispatch.
+        with torch.autocast(device_type=M.device.type, enabled=False):
+            U, _, Vh = torch.linalg.svd(M)
+            d = torch.det(U @ Vh)
+            diag = torch.ones(*M.shape[:-2], 3, device=M.device, dtype=M.dtype)
+            diag[..., 2] = d
+            return U @ (diag.unsqueeze(-1) * Vh)
 
     def as_matrix(self) -> torch.Tensor:
         return self.r9_to_rotmat(self.M)
