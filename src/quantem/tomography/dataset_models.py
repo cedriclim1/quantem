@@ -654,8 +654,16 @@ class DeviceBatchSampler:
         self._epoch = 0
         self._stack = dset.tilt_stack.to(self.device)
         self._angles = dset.tilt_angles.to(self.device)
-        # __getitem__ decodes flat indices with shape[1] for both rows and
-        # columns; replicate it exactly.
+        self._angles_per_row = (
+            dset.tilt_angles_per_row.to(self.device)
+            if dset.tilt_angles_per_row is not None
+            else None
+        )
+        self._angles_per_col = (
+            dset.tilt_angles_per_col.to(self.device)
+            if dset.tilt_angles_per_col is not None
+            else None
+        )
         self._s1 = dset.tilt_stack.shape[1]
         self._s2 = dset.tilt_stack.shape[2]
         if indices is None:
@@ -691,13 +699,19 @@ class DeviceBatchSampler:
             sel = idx[k * self.batch_size : min((k + 1) * self.batch_size, len(idx))]
             proj = sel // per_proj
             rem = sel - proj * per_proj
-            pixel_i = rem // self._s1
-            pixel_j = rem - pixel_i * self._s1
+            pixel_i = rem // self._s2
+            pixel_j = rem - pixel_i * self._s2
+            if self._angles_per_row is not None:
+                phi = self._angles_per_row[proj, pixel_i]
+            elif self._angles_per_col is not None:
+                phi = self._angles_per_col[proj, pixel_j]
+            else:
+                phi = self._angles[proj]
             yield {
                 "projection_idx": proj,
                 "pixel_i": pixel_i,
                 "pixel_j": pixel_j,
-                "phi": self._angles[proj],
+                "phi": phi,
                 "target_value": self._stack[proj, pixel_i, pixel_j],
             }
 
@@ -716,14 +730,42 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         self,
         tilt_stack: Dataset3d | NDArray | torch.Tensor,
         tilt_angles: NDArray | torch.Tensor,
+        tilt_angles_per_row: NDArray | torch.Tensor | None = None,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
         ray_sampling: str = "box_fixed_ds",
         ray_ds: float | None = None,
         seed: int = 42,
+        tilt_angles_per_col: NDArray | torch.Tensor | None = None,
         _token: object | None = None,
     ):
         super().__init__(tilt_stack, tilt_angles, learn_shift, learn_tilt_axis, _token=_token)
+
+        if tilt_angles_per_row is not None and tilt_angles_per_col is not None:
+            raise ValueError("tilt_angles_per_row and tilt_angles_per_col are mutually exclusive")
+        if tilt_angles_per_row is not None:
+            if type(tilt_angles_per_row) is not torch.Tensor:
+                tilt_angles_per_row = torch.from_numpy(tilt_angles_per_row)
+            if tilt_angles_per_row.ndim != 2 or tuple(tilt_angles_per_row.shape) != tuple(
+                tilt_stack.shape[:2]
+            ):
+                raise ValueError(
+                    "tilt_angles_per_row must have shape "
+                    f"{tuple(tilt_stack.shape[:2])}, got {tuple(tilt_angles_per_row.shape)}."
+                )
+        self.tilt_angles_per_row = tilt_angles_per_row
+        if tilt_angles_per_col is not None:
+            if type(tilt_angles_per_col) is not torch.Tensor:
+                tilt_angles_per_col = torch.from_numpy(tilt_angles_per_col)
+            expected_shape = (tilt_stack.shape[0], tilt_stack.shape[2])
+            if tilt_angles_per_col.ndim != 2 or tuple(tilt_angles_per_col.shape) != tuple(
+                expected_shape
+            ):
+                raise ValueError(
+                    "tilt_angles_per_col must have shape "
+                    f"{tuple(expected_shape)}, got {tuple(tilt_angles_per_col.shape)}."
+                )
+        self.tilt_angles_per_col = tilt_angles_per_col
 
         # --- Ray-sampling scheme ---
         # "legacy"       : detector-frame z in [-1, 1] swept with a FIXED count of points,
@@ -748,10 +790,12 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         cls,
         tilt_stack: Dataset3d | NDArray | torch.Tensor,
         tilt_angles: NDArray | torch.Tensor,
+        tilt_angles_per_row: NDArray | torch.Tensor | None = None,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
         ray_sampling: str = "box_fixed_ds",
         ray_ds: float | None = None,
+        tilt_angles_per_col: NDArray | torch.Tensor | None = None,
     ):
 
         if ray_sampling == "box_fixed_ds":
@@ -760,10 +804,11 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             else:
                 ray_ds = float(ray_ds)
 
-
         return cls(
             tilt_stack=tilt_stack,
             tilt_angles=tilt_angles,
+            tilt_angles_per_row=tilt_angles_per_row,
+            tilt_angles_per_col=tilt_angles_per_col,
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
             ray_sampling=ray_sampling,
@@ -1148,9 +1193,7 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
                 "integrate_rays called in 'box_fixed_ds' mode without ray metadata; "
                 "get_coords must run first."
             )
-        predicted = torch.zeros(
-            target_values_len, device=densities.device, dtype=densities.dtype
-        )
+        predicted = torch.zeros(target_values_len, device=densities.device, dtype=densities.dtype)
         valid = meta["valid"]
         if not bool(valid.any()):
             self._ray_meta = None
@@ -1183,6 +1226,12 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
 
         pixel_i = remaining // self.tilt_stack.shape[2]
         pixel_j = remaining % self.tilt_stack.shape[2]
+        if self.tilt_angles_per_row is not None:
+            phi = self.tilt_angles_per_row[projection_idx, pixel_i]
+        elif self.tilt_angles_per_col is not None:
+            phi = self.tilt_angles_per_col[projection_idx, pixel_j]
+        else:
+            phi = self.tilt_angles[projection_idx]
 
         # Plain ints for the index fields: default_collate builds one int64 tensor per
         # batch either way, but wrapping each index in torch.tensor() here allocates
@@ -1191,7 +1240,7 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             "projection_idx": projection_idx,
             "pixel_i": pixel_i,
             "pixel_j": pixel_j,
-            "phi": self.tilt_angles[projection_idx],  # tensor
+            "phi": phi,  # tensor
             "target_value": self.tilt_stack[projection_idx, pixel_i, pixel_j],  # tensor
         }
 

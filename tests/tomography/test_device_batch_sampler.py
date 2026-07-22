@@ -20,6 +20,47 @@ def _dset(n_proj=4, n=10, seed=0):
     return TomographyINRDataset.from_data(tilt_stack=stack, tilt_angles=angles)
 
 
+def _per_row_dset(n_proj=4, height=7, width=11, seed=0):
+    rng = np.random.default_rng(seed)
+    stack = rng.random((n_proj, height, width)).astype(np.float32)
+    angles = np.linspace(-60, 60, n_proj).astype(np.float32)
+    row_angles = np.linspace(-63.7, 58.9, n_proj * height, dtype=np.float32).reshape(
+        n_proj, height
+    )
+    return TomographyINRDataset.from_data(
+        tilt_stack=stack,
+        tilt_angles=angles,
+        tilt_angles_per_row=row_angles,
+    )
+
+
+def _per_col_dset(n_proj=4, height=7, width=11, seed=0):
+    rng = np.random.default_rng(seed)
+    stack = rng.random((n_proj, height, width)).astype(np.float32)
+    angles = np.linspace(-60, 60, n_proj).astype(np.float32)
+    col_angles = np.linspace(-63.7, 58.9, n_proj * width, dtype=np.float32).reshape(n_proj, width)
+    return TomographyINRDataset.from_data(
+        tilt_stack=stack,
+        tilt_angles=angles,
+        tilt_angles_per_col=col_angles,
+    )
+
+
+def _assert_batch_matches_getitem(dset, batch):
+    width = dset.tilt_stack.shape[2]
+    per_proj = dset.tilt_stack.shape[1] * width
+    flat_indices = batch["projection_idx"] * per_proj + batch["pixel_i"] * width + batch["pixel_j"]
+    for batch_idx, flat_idx in enumerate(flat_indices.tolist()):
+        item = dset[flat_idx]
+        for key in ("projection_idx", "pixel_i", "pixel_j", "phi", "target_value"):
+            torch.testing.assert_close(
+                batch[key][batch_idx],
+                torch.as_tensor(item[key], dtype=batch[key].dtype),
+                rtol=0,
+                atol=0,
+            )
+
+
 def test_batches_match_getitem():
     dset = _dset()
     sampler = DeviceBatchSampler(dset, batch_size=37, device="cpu", shuffle=False)
@@ -37,6 +78,63 @@ def test_batches_match_getitem():
                     atol=0,
                 )
         seen += len(batch["target_value"])
+
+
+def test_non_square_per_row_batches_match_getitem_exactly():
+    dset = _per_row_dset()
+    sampler = DeviceBatchSampler(
+        dset,
+        batch_size=17,
+        device="cpu",
+        shuffle=False,
+        drop_last=False,
+    )
+
+    for batch in sampler:
+        _assert_batch_matches_getitem(dset, batch)
+
+
+def test_non_square_per_col_batches_match_getitem_exactly():
+    dset = _per_col_dset()
+    sampler = DeviceBatchSampler(
+        dset,
+        batch_size=17,
+        device="cpu",
+        shuffle=False,
+        drop_last=False,
+    )
+
+    for batch in sampler:
+        _assert_batch_matches_getitem(dset, batch)
+
+
+def test_per_row_angles_match_getitem_in_shuffled_train_and_val_split():
+    dset = _per_row_dset()
+    generator = torch.Generator().manual_seed(0)
+    perm = torch.randperm(len(dset), generator=generator)
+    n_val = len(dset) // 4
+    samplers = (
+        DeviceBatchSampler(
+            dset,
+            19,
+            "cpu",
+            indices=perm[n_val:],
+            shuffle=True,
+            drop_last=False,
+        ),
+        DeviceBatchSampler(
+            dset,
+            19,
+            "cpu",
+            indices=perm[:n_val],
+            shuffle=False,
+            drop_last=False,
+        ),
+    )
+
+    for sampler in samplers:
+        for batch in sampler:
+            _assert_batch_matches_getitem(dset, batch)
 
 
 def test_epoch_covers_indices_once_with_drop_last():
@@ -90,7 +188,7 @@ def test_reconstruct_uses_sampler_single_process():
     from quantem.tomography.tomography import Tomography
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    dset = _dset(n_proj=3, n=8)
+    dset = _per_row_dset(n_proj=3, height=8, width=8)
     model = KPlanesTILTED(M_features=2, resolution=(8, 8, 8), multiscale_res_multipliers=[1], T=1)
     obj = ObjectINR.from_model(model, shape=(8, 8, 8), device=device)
     tomo = Tomography.from_models(dset=dset, obj_model=obj, device=device, verbose=False)
@@ -111,7 +209,7 @@ def test_reconstruct_uses_sampler_single_process():
 
 
 def _flat(batch, s1, s2):
-    return batch["projection_idx"] * (s1 * s2) + batch["pixel_i"] * s1 + batch["pixel_j"]
+    return batch["projection_idx"] * (s1 * s2) + batch["pixel_i"] * s2 + batch["pixel_j"]
 
 
 def test_ddp_shards_are_disjoint_and_equal():

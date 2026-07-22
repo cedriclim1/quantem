@@ -96,3 +96,44 @@ def test_validation_sampler_keeps_partial_final_batch():
     assert len(sampler) == 1
     batch = next(iter(sampler))
     assert len(batch["target_value"]) == split.val_indices.numel()
+
+
+def test_per_row_angles_apply_to_all_holdout_samplers():
+    stack = _stack(n_proj=4, n=12)
+    angles = np.linspace(-60, 60, stack.shape[0], dtype=np.float32)
+    row_angles = np.linspace(
+        -62.4, 59.1, stack.shape[0] * stack.shape[1], dtype=np.float32
+    ).reshape(stack.shape[:2])
+    dset = TomographyINRDataset.from_data(
+        stack,
+        angles,
+        tilt_angles_per_row=row_angles,
+    )
+    split = build_pixel_holdout_split(dset.tilt_stack, holdout_fraction=0.2, holdout_seed=7)
+    sampler_configs = (
+        (split.train_indices, True),
+        (split.val_indices, False),
+        (split.val_fg_indices, False),
+        (split.val_bg_indices, False),
+    )
+
+    for indices, shuffle in sampler_configs:
+        sampler = DeviceBatchSampler(
+            dset,
+            batch_size=17,
+            device="cpu",
+            indices=indices,
+            shuffle=shuffle,
+            drop_last=False,
+        )
+        for batch in sampler:
+            flat_indices = _flat(batch, stack.shape[1])
+            for batch_idx, flat_idx in enumerate(flat_indices.tolist()):
+                item = dset[flat_idx]
+                for key in ("projection_idx", "pixel_i", "pixel_j", "phi", "target_value"):
+                    torch.testing.assert_close(
+                        batch[key][batch_idx],
+                        torch.as_tensor(item[key], dtype=batch[key].dtype),
+                        rtol=0,
+                        atol=0,
+                    )

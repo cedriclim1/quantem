@@ -98,6 +98,83 @@ class TestTomographyPixDataset:
 
 @requires_torch
 class TestTomographyINRDataset:
+    @pytest.mark.parametrize("shape", [(5,), (4, 11), (4, 12, 1)])
+    def test_tilt_angles_per_row_rejects_wrong_shape(self, shape):
+        stack = _stack(nang=4, n=12)
+        row_angles = np.zeros(shape, dtype=np.float32)
+
+        with pytest.raises(ValueError, match="tilt_angles_per_row must have shape"):
+            TomographyINRDataset.from_data(
+                stack,
+                np.linspace(-60, 60, 4, dtype="f4"),
+                tilt_angles_per_row=row_angles,
+            )
+
+    @pytest.mark.parametrize("shape", [(5,), (4, 11), (4, 12, 1)])
+    def test_tilt_angles_per_col_rejects_wrong_shape(self, shape):
+        stack = _stack(nang=4, n=12)
+        col_angles = np.zeros(shape, dtype=np.float32)
+
+        with pytest.raises(ValueError, match="tilt_angles_per_col must have shape"):
+            TomographyINRDataset.from_data(
+                stack,
+                np.linspace(-60, 60, 4, dtype="f4"),
+                tilt_angles_per_col=col_angles,
+            )
+
+    def test_per_row_and_per_col_angles_are_mutually_exclusive(self):
+        stack = _stack(nang=3, n=12)
+        pixel_angles = np.zeros(stack.shape[:2], dtype=np.float32)
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            TomographyINRDataset.from_data(
+                stack,
+                np.linspace(-60, 60, 3, dtype="f4"),
+                tilt_angles_per_row=pixel_angles,
+                tilt_angles_per_col=pixel_angles,
+            )
+
+    def test_getitem_uses_legacy_frame_angle_without_per_row_angles(self):
+        angles = np.linspace(-60, 60, 5, dtype="f4")
+        d = TomographyINRDataset.from_data(_stack(nang=5, n=12), angles)
+
+        assert d.tilt_angles_per_row is None
+        assert d.tilt_angles_per_col is None
+        assert d[0]["phi"] == angles[0]
+        assert d[11 * 12]["phi"] == angles[0]
+
+    def test_getitem_uses_arbitrary_per_row_angles(self):
+        stack = _stack(nang=3, n=12)
+        row_angles = torch.linspace(-61.3, 47.9, stack.shape[0] * stack.shape[1]).reshape(
+            stack.shape[:2]
+        )
+        d = TomographyINRDataset.from_data(
+            stack,
+            np.linspace(-60, 60, 3, dtype="f4"),
+            tilt_angles_per_row=row_angles,
+        )
+
+        assert d.tilt_angles_per_row is row_angles
+        assert d[2 * 12]["phi"] == row_angles[0, 2]
+        assert d[9 * 12 + 7]["phi"] == row_angles[0, 9]
+        assert d[2 * 12]["phi"] != d[9 * 12 + 7]["phi"]
+
+    def test_getitem_uses_arbitrary_per_col_angles(self):
+        stack = _stack(nang=3, n=12)
+        col_angles = torch.linspace(-61.3, 47.9, stack.shape[0] * stack.shape[2]).reshape(
+            stack.shape[0], stack.shape[2]
+        )
+        d = TomographyINRDataset.from_data(
+            stack,
+            np.linspace(-60, 60, 3, dtype="f4"),
+            tilt_angles_per_col=col_angles,
+        )
+
+        assert d.tilt_angles_per_col is col_angles
+        assert d[2 * 12 + 3]["phi"] == col_angles[0, 3]
+        assert d[9 * 12 + 7]["phi"] == col_angles[0, 7]
+        assert d[2 * 12 + 3]["phi"] != d[9 * 12 + 7]["phi"]
+
     def test_len_is_projections_times_pixels(self):
         d = TomographyINRDataset.from_data(
             _stack(nang=5, n=12), np.linspace(-60, 60, 5, dtype="f4")
@@ -268,6 +345,84 @@ class TestINRRayMath:
         )
         # No rotation and no shift -> rays pass through unchanged.
         assert torch.allclose(out, rays, atol=1e-5)
+
+    @pytest.mark.parametrize("ray_sampling", ["legacy", "box_fixed_ds"])
+    def test_per_row_angles_produce_rx_ray_directions(self, ray_sampling):
+        n = 5
+        stack = _stack(nang=2, n=n)
+        row_angles = np.array(
+            [[-37.2, -19.7, 3.4, 28.1, 52.6], [7.3, 8.8, 10.1, 11.9, 13.6]],
+            dtype=np.float32,
+        )
+        d = TomographyINRDataset.from_data(
+            stack,
+            np.array([0.0, 10.0], dtype=np.float32),
+            tilt_angles_per_row=row_angles,
+            ray_sampling=ray_sampling,
+        )
+        d.to("cpu")
+        items = [d[1 * n + 2], d[3 * n + 2]]
+        batch = {
+            key: torch.as_tensor([item[key] for item in items])
+            for key in ("projection_idx", "pixel_i", "pixel_j", "phi", "target_value")
+        }
+
+        coords = d.get_coords(batch, N=n, num_samples_per_ray=9)
+        if ray_sampling == "legacy":
+            sampled_rays = coords.reshape(2, 9, 3)
+        else:
+            ray_ids = d._ray_meta["local_ray_ids"]
+            sampled_rays = [coords[ray_ids == ray_idx] for ray_idx in range(2)]
+
+        actual_directions = torch.stack(
+            [
+                (ray[-1] - ray[0]) / torch.linalg.vector_norm(ray[-1] - ray[0])
+                for ray in sampled_rays
+            ]
+        )
+        rotations = d._compose_euler_rotation(torch.zeros(2), batch["phi"], torch.zeros(2))
+        expected_directions = rotations @ torch.tensor([0.0, 0.0, 1.0])
+
+        torch.testing.assert_close(actual_directions, expected_directions, atol=1e-6, rtol=1e-6)
+
+    @pytest.mark.parametrize("ray_sampling", ["legacy", "box_fixed_ds"])
+    def test_per_col_angles_produce_rx_ray_directions(self, ray_sampling):
+        n = 5
+        stack = _stack(nang=2, n=n)
+        col_angles = np.array(
+            [[-37.2, -19.7, 3.4, 28.1, 52.6], [7.3, 8.8, 10.1, 11.9, 13.6]],
+            dtype=np.float32,
+        )
+        d = TomographyINRDataset.from_data(
+            stack,
+            np.array([0.0, 10.0], dtype=np.float32),
+            tilt_angles_per_col=col_angles,
+            ray_sampling=ray_sampling,
+        )
+        d.to("cpu")
+        items = [d[2 * n + 1], d[2 * n + 3]]
+        batch = {
+            key: torch.as_tensor([item[key] for item in items])
+            for key in ("projection_idx", "pixel_i", "pixel_j", "phi", "target_value")
+        }
+
+        coords = d.get_coords(batch, N=n, num_samples_per_ray=9)
+        if ray_sampling == "legacy":
+            sampled_rays = coords.reshape(2, 9, 3)
+        else:
+            ray_ids = d._ray_meta["local_ray_ids"]
+            sampled_rays = [coords[ray_ids == ray_idx] for ray_idx in range(2)]
+
+        actual_directions = torch.stack(
+            [
+                (ray[-1] - ray[0]) / torch.linalg.vector_norm(ray[-1] - ray[0])
+                for ray in sampled_rays
+            ]
+        )
+        rotations = d._compose_euler_rotation(torch.zeros(2), batch["phi"], torch.zeros(2))
+        expected_directions = rotations @ torch.tensor([0.0, 0.0, 1.0])
+
+        torch.testing.assert_close(actual_directions, expected_directions, atol=1e-6, rtol=1e-6)
 
     def test_integrate_rays_sums_with_step_size(self):
         # integrate_rays became an instance method dispatching on ray_sampling
