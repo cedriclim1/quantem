@@ -1,3 +1,4 @@
+import os
 import weakref
 from abc import abstractmethod
 from copy import deepcopy
@@ -10,6 +11,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from tqdm.auto import tqdm
 
+from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.ddp import DDPMixin
@@ -222,6 +224,48 @@ def _unwrap(model: nn.Module | nn.parallel.DistributedDataParallel) -> PlanarDec
     if isinstance(model, nn.parallel.DistributedDataParallel):
         return cast(PlanarDecompositionModel, model.module)
     return cast(PlanarDecompositionModel, model)
+
+
+def _plane_tv_loss_eager(
+    grids: torch.nn.ParameterList | list[torch.Tensor] | tuple[torch.Tensor, ...],
+    tilted: bool,
+    rotations: int,
+) -> torch.Tensor:
+    """Reference plane-TV reduction retained for CPU and capability fallback."""
+    per_level = []
+    for plane in grids:
+        dh = (plane[:, :, 1:, :] - plane[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
+        dw = (plane[:, :, :, 1:] - plane[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
+        per_plane = dh + dw
+        if tilted:
+            per_rotation = per_plane.view(rotations, 3).sum(dim=1)
+            level_tv = per_rotation.mean()
+        else:
+            level_tv = per_plane.sum()
+        per_level.append(level_tv)
+    return torch.stack(per_level).sum()
+
+
+def _plane_tv_loss(
+    grids: torch.nn.ParameterList | list[torch.Tensor] | tuple[torch.Tensor, ...],
+    tilted: bool,
+    rotations: int,
+) -> torch.Tensor:
+    """Dispatch three fp32 CUDA levels to quantem-cuda when available."""
+    use_fused = (
+        os.environ.get("QUANTEM_PLANE_TV_FUSED", "1") != "0"
+        and len(grids) == 3
+        and all(grid.is_cuda and grid.dtype == torch.float32 for grid in grids)
+        and config.get("has_quantem_cuda")
+        and config.get("use_cuda_kernels", default=True)
+    )
+    if use_fused:
+        import quantem.cuda.core.ml as cuda_ml
+
+        fused = getattr(cuda_ml, "plane_tv_loss", None)
+        if fused is not None:
+            return fused(grids[0], grids[1], grids[2])
+    return _plane_tv_loss_eager(grids, tilted, rotations)
 
 
 class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
@@ -1106,25 +1150,8 @@ class ObjectTensorDecomp(ObjectINR):
         Gets the total-variation across the planes.
         """
         model = _unwrap(self.model)
-        is_tilted = model.tilted
-        per_level = []
-
-        for p in model.grids:
-            # p: (3*T, C, H, W) for TILTED, (3, C, H, W) for KPlanes
-            dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
-            dw = (p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
-            per_plane = dh + dw  # (3*T,) or (3,)
-
-            if is_tilted:
-                T = model.T
-                per_rotation = per_plane.view(T, 3).sum(dim=1)  # sum 3 planes per rotation
-                level_tv = per_rotation.mean()  # avg across rotations
-            else:
-                level_tv = per_plane.sum()
-
-            per_level.append(level_tv)
-
-        return self.constraints.tv_plane * torch.stack(per_level).sum()
+        rotations = model.T if model.tilted else 1
+        return self.constraints.tv_plane * _plane_tv_loss(model.grids, model.tilted, rotations)
 
     def get_volume_tv_loss(
         self,
