@@ -16,6 +16,68 @@ from quantem.core import config
 from .model_base import PPLR, TensorDecompositionModel
 from .so3params import SO3ParamQuat, SO3ParamR9SVD
 
+
+class FusedHiddenMLP(nn.Sequential):
+    """Sequential-compatible sigma head with an opt-in cuBLASLt fast path.
+
+    Keeping the numeric child-module names preserves existing state dicts and
+    optimizer parameter discovery.  Every unsupported case executes the
+    inherited Sequential path without importing quantem-cuda eagerly.
+    """
+
+    def _can_fuse(self, inputs: torch.Tensor) -> bool:
+        if os.environ.get("QUANTEM_FUSED_MLP", "0") == "0":
+            return False
+        if torch.compiler.is_compiling():
+            return False
+        if (
+            not inputs.is_cuda
+            or inputs.dtype != torch.bfloat16
+            or not inputs.is_contiguous()
+            or not torch.is_autocast_enabled("cuda")
+            or torch.get_autocast_dtype("cuda") != torch.bfloat16
+        ):
+            return False
+        if len(self) != 5:
+            return False
+        linears = (self[0], self[2], self[4])
+        if not (
+            all(isinstance(layer, nn.Linear) for layer in linears)
+            and isinstance(self[1], nn.ReLU)
+            and isinstance(self[3], nn.ReLU)
+            and all(layer.bias is not None for layer in linears)
+        ):
+            return False
+        parameters = tuple(
+            parameter for layer in linears for parameter in (layer.weight, layer.bias)
+        )
+        return all(
+            parameter.device == inputs.device
+            and parameter.dtype == torch.float32
+            and parameter.is_contiguous()
+            for parameter in parameters
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if self._can_fuse(inputs):
+            try:
+                from quantem.cuda.core.ml import fused_hidden_mlp
+
+                linear1, linear2, linear3 = self[0], self[2], self[4]
+                return fused_hidden_mlp(
+                    inputs,
+                    linear1.weight,
+                    linear1.bias,
+                    linear2.weight,
+                    linear2.bias,
+                    linear3.weight,
+                    linear3.bias,
+                )
+            except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+        return super().forward(inputs)
+
+
 """
 K-planes utility functions
 """
@@ -250,7 +312,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
             nn.init.normal_(out.weight, std=0.01)
             nn.init.zeros_(out.bias)
             layers.append(out)
-            self.sigma_net = nn.Sequential(*layers)
+            self.sigma_net = FusedHiddenMLP(*layers)
         else:
             # Linear head fallback, matching KPlanesTILTED._build_sigma_net and
             # CPTilted: forward/get_params reference sigma_net unconditionally.
@@ -598,7 +660,7 @@ class KPlanesTILTED(KPlanes):
             nn.init.normal_(out.weight, std=0.01)
             nn.init.zeros_(out.bias)
             layers.append(out)
-            self.sigma_net = nn.Sequential(*layers)
+            self.sigma_net = FusedHiddenMLP(*layers)
         else:
             # Single-linear "explicit" decoder. Small init -> density ~ 0 initially.
             self.sigma_net = nn.Linear(self.feature_dim, 1, bias=True)
