@@ -166,7 +166,7 @@ class Tomography(TomographyOpt, TomographyBase):
         snapshot_callback: Callable[[int, np.ndarray | None], None] | None = None,
         pose_warmup_epochs: int = 0,
         *,
-        autocast_dtype: str | None = None,
+        autocast_dtype: str | torch.dtype | None = None,
         grad_scaler: bool | None = None,
         cuda_graphs: bool = False,
         grad_clip_max_norm: float | None = 1.0,
@@ -185,9 +185,22 @@ class Tomography(TomographyOpt, TomographyBase):
             raise ValueError("grad_clip_max_norm must be >= 0 or None.")
         if val_fraction > 0.0 and holdout_fraction > 0.0:
             raise ValueError("Use either val_fraction or holdout_fraction, not both.")
+        torch_dtype_names = {
+            torch.bfloat16: "bf16",
+            torch.float16: "fp16",
+            torch.float32: None,
+        }
+        if isinstance(autocast_dtype, torch.dtype):
+            autocast_dtype = torch_dtype_names.get(autocast_dtype, autocast_dtype)
+
         autocast_dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16}
-        if autocast_dtype is not None and autocast_dtype not in autocast_dtypes:
-            raise ValueError("autocast_dtype must be one of None, 'bf16', or 'fp16'.")
+        if autocast_dtype is not None and (
+            not isinstance(autocast_dtype, str) or autocast_dtype not in autocast_dtypes
+        ):
+            raise ValueError(
+                "autocast_dtype must be one of None, 'bf16', 'fp16', "
+                "torch.bfloat16, torch.float16, or torch.float32."
+            )
         grad_scaler_enabled = autocast_dtype == "fp16" if grad_scaler is None else grad_scaler
         if grad_scaler_enabled and autocast_dtype is None:
             raise ValueError("grad_scaler=True requires autocast_dtype to be set.")

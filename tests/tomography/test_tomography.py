@@ -234,17 +234,28 @@ class TestInrFactory:
         with pytest.raises(ValueError, match="pose_warmup_epochs must be >= 0"):
             default_tomo.reconstruct(num_iter=0, pose_warmup_epochs=-1)
 
-    def test_reconstruct_default_autocast_keeps_parameters_fp32(self):
-        tomo = self._inr_tomo("cpu", n=4)
-        tomo.reconstruct(
-            num_iter=1,
-            batch_size=len(tomo.dset),
-            num_workers=0,
-            num_samples_per_ray=2,
-            autocast_dtype=None,
-        )
-        assert len(tomo.epoch_losses) == 1
-        assert all(param.dtype == torch.float32 for param in tomo.obj_model.model.parameters())
+    def test_reconstruct_float32_dtype_matches_disabled_autocast(self):
+        def run(autocast_dtype):
+            torch.manual_seed(17)
+            tomo = self._inr_tomo("cpu", n=4)
+            tomo.reconstruct(
+                num_iter=1,
+                batch_size=len(tomo.dset),
+                num_workers=0,
+                num_samples_per_ray=2,
+                autocast_dtype=autocast_dtype,
+            )
+            return tomo
+
+        disabled = run(None)
+        float32 = run(torch.float32)
+
+        np.testing.assert_allclose(float32.epoch_losses, disabled.epoch_losses)
+        for actual, expected in zip(
+            float32.obj_model.model.parameters(), disabled.obj_model.model.parameters()
+        ):
+            assert actual.dtype == torch.float32
+            torch.testing.assert_close(actual, expected)
 
     @pytest.mark.parametrize("disabled_value", [None, 0.0])
     def test_reconstruct_can_skip_inactive_gradient_clipping(self, monkeypatch, disabled_value):
@@ -297,27 +308,40 @@ class TestInrFactory:
 
     def test_reconstruct_rejects_invalid_autocast_dtype(self):
         tomo = self._inr_tomo("cpu", n=4)
-        with pytest.raises(ValueError, match="autocast_dtype"):
-            tomo.reconstruct(autocast_dtype="float32")
+        for invalid_dtype in ("float32", torch.float64):
+            with pytest.raises(ValueError, match="autocast_dtype"):
+                tomo.reconstruct(autocast_dtype=invalid_dtype)
 
-    def test_reconstruct_bf16_autocast_runs_on_cpu(self):
+    def test_reconstruct_bfloat16_dtype_matches_bf16_string_on_cpu(self):
         from quantem.core.ml.models.kplanes import KPlanes
 
-        n = 4
-        model = KPlanes(M_features=2, resolution=(n, n, n))
-        obj = ObjectTensorDecomp.from_model(model, shape=(n, n, n), device="cpu")
-        dset = TomographyINRDataset.from_data(
-            _stack(nang=5, n=n), np.linspace(-60, 60, 5).astype(np.float32)
-        )
-        tomo = Tomography.from_models(dset=dset, obj_model=obj, device="cpu", verbose=False)
-        tomo.reconstruct(
-            num_iter=2,
-            batch_size=len(dset),
-            num_workers=0,
-            num_samples_per_ray=2,
-            autocast_dtype="bf16",
-        )
-        assert len(tomo.epoch_losses) == 2
+        def run(autocast_dtype):
+            torch.manual_seed(17)
+            n = 4
+            model = KPlanes(M_features=2, resolution=(n, n, n))
+            obj = ObjectTensorDecomp.from_model(model, shape=(n, n, n), device="cpu")
+            dset = TomographyINRDataset.from_data(
+                _stack(nang=5, n=n), np.linspace(-60, 60, 5).astype(np.float32)
+            )
+            tomo = Tomography.from_models(dset=dset, obj_model=obj, device="cpu", verbose=False)
+            tomo.reconstruct(
+                num_iter=2,
+                batch_size=len(dset),
+                num_workers=0,
+                num_samples_per_ray=2,
+                autocast_dtype=autocast_dtype,
+            )
+            return tomo
+
+        string_dtype = run("bf16")
+        torch_dtype = run(torch.bfloat16)
+
+        np.testing.assert_allclose(torch_dtype.epoch_losses, string_dtype.epoch_losses)
+        for actual, expected in zip(
+            torch_dtype.obj_model.model.parameters(),
+            string_dtype.obj_model.model.parameters(),
+        ):
+            torch.testing.assert_close(actual, expected)
 
     @requires_gpu
     def test_reconstruct_fp16_autocast_runs_on_cuda(self, monkeypatch):
