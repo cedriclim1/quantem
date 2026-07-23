@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import torch
 
+from quantem.core.ml.activation_functions import TruncExpActivation
 from quantem.tomography.object_models import (
     ObjConstraintParams,
     ObjectBase,
@@ -268,6 +269,30 @@ class TestObjectTensorDecompTV:
         pred = torch.tensor([-2.0, 0.0, 3.0], device=torch_device)
         assert torch.all(obj.apply_hard_constraints(pred) >= 0.0)
 
+    def test_nonnegative_activation_capability_bypasses_redundant_clamp(
+        self, torch_device, monkeypatch
+    ):
+        obj = self._obj(torch_device)
+        obj.constraints.positivity = True
+        _model = obj.model.module if hasattr(obj.model, "module") else obj.model
+        _model.density_activation = TruncExpActivation(offset=1.0)
+        pred = torch.tensor([-2.0, 0.5], device=torch_device)
+
+        monkeypatch.delenv("QUANTEM_DENSITY_TAIL_FUSED", raising=False)
+        assert torch.equal(obj.apply_hard_constraints(pred), pred)
+
+        monkeypatch.setenv("QUANTEM_DENSITY_TAIL_FUSED", "0")
+        assert torch.equal(obj.apply_hard_constraints(pred), pred.clamp(min=0.0))
+
+    def test_unmarked_activation_keeps_positivity_clamp(self, torch_device, monkeypatch):
+        obj = self._obj(torch_device)
+        obj.constraints.positivity = True
+        _model = obj.model.module if hasattr(obj.model, "module") else obj.model
+        _model.density_activation = lambda values: torch.exp(values)
+        monkeypatch.delenv("QUANTEM_DENSITY_TAIL_FUSED", raising=False)
+        pred = torch.tensor([-2.0, 0.5], device=torch_device)
+        assert torch.equal(obj.apply_hard_constraints(pred), pred.clamp(min=0.0))
+
     def test_plane_tv_loss_nonneg_scalar(self, torch_device):
         obj = self._obj(torch_device)
         obj.constraints.tv_plane = 0.1
@@ -293,6 +318,28 @@ class TestObjectTensorDecompTV:
         ctx = ReconstructionContext(coords=coords, pred=torch.zeros(64, device=torch_device))
         loss = obj.apply_soft_constraints(ctx)
         assert float(loss.detach()) > 0.0
+
+    def test_combined_plane_tv_value_and_weight_are_consumed_exactly_once(
+        self, torch_device, monkeypatch
+    ):
+        obj = self._obj(torch_device)
+        obj.constraints.tv_plane = 0.125
+        obj.constraints.tv_vol = 0.0
+        raw_tv = torch.tensor(4.0, device=torch_device, requires_grad=True)
+        obj._fused_plane_tv_loss = raw_tv
+
+        def separate_path_must_not_run():
+            raise AssertionError("combined TV was double-counted through the separate path")
+
+        monkeypatch.setattr(obj, "_get_plane_tv_loss", separate_path_must_not_run)
+        coords = torch.zeros(1, 3, device=torch_device)
+        ctx = ReconstructionContext(coords=coords, pred=torch.zeros(1, device=torch_device))
+        loss = obj.get_tv_loss(ctx)
+
+        torch.testing.assert_close(loss, torch.tensor(0.5, device=torch_device))
+        loss.backward()
+        torch.testing.assert_close(raw_tv.grad, torch.tensor(0.125, device=torch_device))
+        assert obj._fused_plane_tv_loss is None
 
     def test_normalize_optimizer_params_rejects_non_dict(self, torch_device):
         from quantem.core.ml.optimizer_mixin import OptimizerParams

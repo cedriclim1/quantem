@@ -573,13 +573,23 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         obj_model.to(device)
         return obj_model
 
-    def _model_call(self, coords: torch.Tensor) -> torch.Tensor:
+    def _prepare_model_call(self) -> None:
+        """Hook for subclasses that select optional model capabilities."""
+
+    def _unpack_model_output(self, output: Any) -> torch.Tensor:
+        """Return the primary tensor from models with auxiliary outputs."""
+        if isinstance(output, tuple):
+            return output[0]
+        return output
+
+    def _model_call(self, coords: torch.Tensor) -> Any:
         """Invoke the model, through torch.compile when compile_model was set.
 
         Compiles the bound __call__ (a plain function, so nothing extra is
         registered on the module tree or picked up by AutoSerialize) and
         caches per model object.
         """
+        self._prepare_model_call()
         model = self.model
         if not getattr(self, "_compile_model", False):
             return model(coords)
@@ -783,7 +793,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         # TV's autograd.grad recompute stays on the eager model (double
         # backward through compiled graphs is not reliable); only this main
         # forward goes through the compiled path.
-        all_densities = self._model_call(coords)
+        all_densities = self._unpack_model_output(self._model_call(coords))
 
         if all_densities.dim() > 1:
             all_densities = all_densities.squeeze(-1)
@@ -815,9 +825,8 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         only; tap densities are returned raw (border-clamped), matching the
         fallback path in ``get_volume_tv_loss``.
         """
-        merged = self.model(torch.cat([coords, tap_coords], dim=0))
-        if isinstance(merged, tuple):
-            merged = merged[0]
+        self._prepare_model_call()
+        merged = self._unpack_model_output(self.model(torch.cat([coords, tap_coords], dim=0)))
         main, taps = merged[: coords.shape[0]], merged[coords.shape[0] :]
 
         if main.dim() > 1:
@@ -1080,6 +1089,33 @@ class ObjectTensorDecomp(ObjectINR):
         obj_model.to(device)
         return obj_model
 
+    def _prepare_model_call(self) -> None:
+        model = _unwrap(self.model)
+        use_combined = (
+            os.environ.get("QUANTEM_KPLANES_MS_TV_FUSED", "0") == "1"
+            and self.constraints.tv_plane > 0
+            and getattr(model, "quantem_supports_fused_plane_tv", False)
+            and config.get("has_quantem_cuda")
+            and config.get("use_cuda_kernels", default=True)
+        )
+        if use_combined:
+            try:
+                import quantem.cuda.core.ml as cuda_ml
+            except (ImportError, OSError, RuntimeError):
+                use_combined = False
+            else:
+                use_combined = getattr(cuda_ml, "kplanes_tilted_fuse_ms_tv", None) is not None
+        model._plane_tv_fusion_requested = use_combined
+        self._fused_plane_tv_loss = None
+
+    def _unpack_model_output(self, output: Any) -> torch.Tensor:
+        if isinstance(output, tuple):
+            density = output[0]
+            if len(output) == 2 and isinstance(output[1], torch.Tensor) and output[1].ndim == 0:
+                self._fused_plane_tv_loss = output[1]
+            return density
+        return output
+
     def sample_tv_tap_coords(self, coords: torch.Tensor) -> Optional[torch.Tensor]:
         """
         Sample the finite-difference tap coordinates for the volume TV loss.
@@ -1138,7 +1174,13 @@ class ObjectTensorDecomp(ObjectINR):
         assert ctx.pred is not None, "Prediction must be provided for TV loss"
         tv_loss = torch.zeros((), device=ctx.pred.device)
         if self.constraints.tv_plane > 0:
-            tv_loss = tv_loss + self._get_plane_tv_loss()
+            fused_plane_tv = getattr(self, "_fused_plane_tv_loss", None)
+            if fused_plane_tv is None:
+                tv_loss = tv_loss + self._get_plane_tv_loss()
+            else:
+                tv_loss = tv_loss + self.constraints.tv_plane * fused_plane_tv
+                self._fused_plane_tv_loss = None
+                _unwrap(self.model)._plane_tv_fusion_requested = False
         if self.constraints.tv_vol > 0:
             tv_loss = tv_loss + self.get_volume_tv_loss(
                 ctx.coords, precomputed_tap_densities=ctx.tv_tap_densities
@@ -1224,7 +1266,14 @@ class ObjectTensorDecomp(ObjectINR):
         Apply hard constraints to the predicted values of the INR model.
         """
 
-        if self.constraints.positivity:
+        activation = getattr(_unwrap(self.model), "density_activation", None)
+        activation_is_nonnegative = bool(
+            getattr(activation, "quantem_guarantees_nonnegative", False)
+        )
+        skip_redundant_positivity = (
+            os.environ.get("QUANTEM_DENSITY_TAIL_FUSED", "1") != "0" and activation_is_nonnegative
+        )
+        if self.constraints.positivity and not skip_redundant_positivity:
             pred = torch.clamp(pred, min=0.0, max=None)
         if self.constraints.shrinkage:
             pred = torch.max(pred - self.constraints.shrinkage, torch.zeros_like(pred))

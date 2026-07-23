@@ -19,7 +19,7 @@ def _inputs(num_grids=3):
 
 @pytest.fixture
 def mocked_cuda_ml(monkeypatch):
-    calls = {"single": [], "ms": []}
+    calls = {"single": [], "ms": [], "ms_tv": []}
     cuda_ml = ModuleType("quantem.cuda.core.ml")
 
     def single(pts, rotations, grid):
@@ -31,9 +31,15 @@ def mocked_cuda_ml(monkeypatch):
         width = args[1].shape[0] * sum(grid.shape[1] for grid in args[2:5])
         return torch.zeros((args[0].shape[0], width))
 
+    def multiscale_tv(*args):
+        calls["ms_tv"].append((args[2:5], args[5:8]))
+        width = args[1].shape[0] * sum(grid.shape[1] for grid in args[2:5])
+        return torch.zeros((args[0].shape[0], width)), torch.tensor(2.5)
+
     cuda_ml.kplanes_tilted_fuse = single
     cuda_ml._kplanes_tilted_fuse_builtin = single
     cuda_ml.kplanes_tilted_fuse_ms = multiscale
+    cuda_ml.kplanes_tilted_fuse_ms_tv = multiscale_tv
 
     cuda = ModuleType("quantem.cuda")
     cuda.__path__ = []
@@ -71,6 +77,32 @@ def test_none_scale_gates_dispatch_as_unit_gates(mocked_cuda_ml):
     assert len(calls["ms"]) == 1
     assert calls["ms"][0][1] == (1.0, 1.0, 1.0)
     assert calls["single"] == []
+
+
+def test_plane_tv_opt_in_dispatches_to_combined_capability(mocked_cuda_ml, monkeypatch):
+    _, calls = mocked_cuda_ml
+    monkeypatch.setenv("QUANTEM_KPLANES_MS_TV_FUSED", "1")
+    pts, rotations, grids = _inputs()
+
+    features, tv = interpolate_ms_features_tilted(
+        pts, grids, rotations, scale_gates=(0.25, 0.75, 1.0), include_plane_tv=True
+    )
+
+    assert features.shape == (pts.shape[0], rotations.shape[0] * 4 * 3)
+    assert tv.item() == 2.5
+    assert len(calls["ms_tv"]) == 1
+    assert calls["ms"] == []
+
+
+def test_plane_tv_is_default_off_even_when_capability_exists(mocked_cuda_ml, monkeypatch):
+    _, calls = mocked_cuda_ml
+    monkeypatch.delenv("QUANTEM_KPLANES_MS_TV_FUSED", raising=False)
+    pts, rotations, grids = _inputs()
+
+    interpolate_ms_features_tilted(pts, grids, rotations, include_plane_tv=True)
+
+    assert len(calls["ms"]) == 1
+    assert calls["ms_tv"] == []
 
 
 @pytest.mark.parametrize("num_grids", [2, 4])

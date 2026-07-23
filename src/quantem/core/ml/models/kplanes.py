@@ -3,6 +3,7 @@ Tensor Decomposition Methods for INR-based reconstructions
 """
 
 import itertools
+import os
 from typing import Callable, Optional, Sequence
 
 # import tinycudann as tcnn
@@ -329,7 +330,8 @@ def interpolate_ms_features_tilted(
     ms_grids: nn.ParameterList,  # each grid: (3*T, C, H, W)
     rotation_matrices: torch.Tensor,  # (T, 3, 3)
     scale_gates: Optional[Sequence[float]] = None,  # per-scale multiplier (coarse-to-fine)
-) -> torch.Tensor:
+    include_plane_tv: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Fully-vectorized multi-scale, multi-rotation K-Planes feature interpolation.
     Returns features of shape (B, C * T * num_scales).
@@ -361,6 +363,7 @@ def interpolate_ms_features_tilted(
 
         kplanes_tilted_fuse = cuda_ml.kplanes_tilted_fuse
         kplanes_tilted_fuse_ms = getattr(cuda_ml, "kplanes_tilted_fuse_ms", None)
+        kplanes_tilted_fuse_ms_tv = getattr(cuda_ml, "kplanes_tilted_fuse_ms_tv", None)
         # Respect instrumentation/overrides of the public single-level op.
         # The built-in identity is absent in older packages, which naturally
         # selects the compatible per-level path too.
@@ -369,6 +372,21 @@ def interpolate_ms_features_tilted(
         )
         if kplanes_tilted_fuse_ms is not None and len(ms_grids) == 3 and single_level_is_builtin:
             gates = scale_gates if scale_gates is not None else (1.0, 1.0, 1.0)
+            if (
+                include_plane_tv
+                and os.environ.get("QUANTEM_KPLANES_MS_TV_FUSED", "0") == "1"
+                and kplanes_tilted_fuse_ms_tv is not None
+            ):
+                return kplanes_tilted_fuse_ms_tv(
+                    pts,
+                    rotation_matrices,
+                    ms_grids[0],
+                    ms_grids[1],
+                    ms_grids[2],
+                    float(gates[0]),
+                    float(gates[1]),
+                    float(gates[2]),
+                )
             return kplanes_tilted_fuse_ms(
                 pts,
                 rotation_matrices,
@@ -464,6 +482,8 @@ class KPlanesTILTED(KPlanes):
         Irrelevant if you're calling load_tau_state() right after __init__.
     All other args are forwarded to KPlanes.
     """
+
+    quantem_supports_fused_plane_tv = True
 
     def __init__(
         self,
@@ -600,9 +620,16 @@ class KPlanesTILTED(KPlanes):
             ms_grids=self.grids,
             rotation_matrices=R,
             scale_gates=gates,
+            include_plane_tv=getattr(self, "_plane_tv_fusion_requested", False),
         )
+        plane_tv = None
+        if isinstance(features, tuple):
+            features, plane_tv = features
         density_before_activation = self.sigma_net(features)
-        return self.density_activation(density_before_activation)
+        density = self.density_activation(density_before_activation)
+        if plane_tv is not None:
+            return density, plane_tv
+        return density
 
     def forward(self, pts: torch.Tensor) -> torch.Tensor:
         return self.get_densities(pts)

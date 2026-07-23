@@ -1,8 +1,64 @@
-from typing import Callable
+import os
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class _TruncExpReference(torch.autograd.Function):
+    """Exponential with the torch-ngp clamped backward used by tomography."""
+
+    @staticmethod
+    def forward(ctx: Any, values: torch.Tensor, offset: float) -> torch.Tensor:
+        ctx.save_for_backward(values)
+        ctx.offset = offset
+        return torch.exp(values - offset)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        (values,) = ctx.saved_tensors
+        shifted = values - ctx.offset
+        return grad_output * torch.exp(shifted.clamp(max=15)), None
+
+
+def trunc_exp(values: torch.Tensor, offset: float = 0.0) -> torch.Tensor:
+    """Apply trunc-exp, using the fused CUDA density tail when available."""
+    use_fused = (
+        os.environ.get("QUANTEM_DENSITY_TAIL_FUSED", "1") != "0"
+        and values.is_cuda
+        and values.dtype in (torch.float32, torch.bfloat16)
+        and values.ndim in (1, 2)
+        and values.numel() > 0
+    )
+    if use_fused:
+        try:
+            import quantem.cuda.core.ml as cuda_ml
+        except (ImportError, OSError, RuntimeError):
+            pass
+        else:
+            fused = getattr(cuda_ml, "density_tail", None)
+            if fused is not None:
+                return fused(values, float(offset))
+    return _TruncExpReference.apply(values, float(offset))
+
+
+# Object constraints consume this explicit capability instead of guessing from
+# a callable name or implementation detail.
+trunc_exp.quantem_guarantees_nonnegative = True  # type: ignore[attr-defined]
+
+
+class TruncExpActivation(nn.Module):
+    """Configurable trunc-exp activation with a non-negativity capability."""
+
+    quantem_guarantees_nonnegative = True
+
+    def __init__(self, offset: float = 0.0) -> None:
+        super().__init__()
+        self.offset = float(offset)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return trunc_exp(values, self.offset)
 
 
 class ModReLU(nn.Module):
