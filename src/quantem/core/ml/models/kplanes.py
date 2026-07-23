@@ -436,7 +436,7 @@ def interpolate_ms_features_tilted(
             gates = scale_gates if scale_gates is not None else (1.0, 1.0, 1.0)
             if (
                 include_plane_tv
-                and os.environ.get("QUANTEM_KPLANES_MS_TV_FUSED", "0") == "1"
+                and os.environ.get("QUANTEM_KPLANES_MS_TV_FUSED", "1") != "0"
                 and kplanes_tilted_fuse_ms_tv is not None
             ):
                 return kplanes_tilted_fuse_ms_tv(

@@ -169,6 +169,7 @@ class Tomography(TomographyOpt, TomographyBase):
         autocast_dtype: str | None = None,
         grad_scaler: bool | None = None,
         cuda_graphs: bool = False,
+        grad_clip_max_norm: float | None = 1.0,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -180,6 +181,8 @@ class Tomography(TomographyOpt, TomographyBase):
             raise ValueError("pose_warmup_epochs must be >= 0.")
         if holdout_every < 1:
             raise ValueError("holdout_every must be >= 1.")
+        if grad_clip_max_norm is not None and grad_clip_max_norm < 0:
+            raise ValueError("grad_clip_max_norm must be >= 0 or None.")
         if val_fraction > 0.0 and holdout_fraction > 0.0:
             raise ValueError("Use either val_fraction or holdout_fraction, not both.")
         autocast_dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16}
@@ -201,9 +204,7 @@ class Tomography(TomographyOpt, TomographyBase):
         # Reconnecting an existing optimizer during ``to`` marks all of its parameters
         # trainable. Preserve an explicitly frozen tilted rotation bank; optimizer_params
         # supplied below may intentionally enable it again.
-        tilted_so3_was_frozen = isinstance(
-            self.obj_model.model, KPlanesTILTED
-        ) and not any(
+        tilted_so3_was_frozen = isinstance(self.obj_model.model, KPlanesTILTED) and not any(
             parameter.requires_grad for parameter in self.obj_model.model.so3.parameters()
         )
 
@@ -234,9 +235,7 @@ class Tomography(TomographyOpt, TomographyBase):
             raise NotImplementedError("Reset is not implemented yet.")
 
         new_scheduler = reset
-        previous_cuda_graphs_optimizer = getattr(
-            self.obj_model, "_cuda_graphs_optimizer", False
-        )
+        previous_cuda_graphs_optimizer = getattr(self.obj_model, "_cuda_graphs_optimizer", False)
         if cuda_graphs:
             # Optimizers constructed below use capturable fused Adam and device LR
             # tensors. Existing optimizers remain usable for Phase A, but Phase B is
@@ -322,9 +321,7 @@ class Tomography(TomographyOpt, TomographyBase):
             capture_enabled = False
 
         tilted_model = (
-            self.obj_model.model
-            if isinstance(self.obj_model.model, KPlanesTILTED)
-            else None
+            self.obj_model.model if isinstance(self.obj_model.model, KPlanesTILTED) else None
         )
         static_rotation_matrices: torch.Tensor | None = None
         if capture_enabled and tilted_model is not None:
@@ -373,6 +370,15 @@ class Tomography(TomographyOpt, TomographyBase):
                 for group in optimizer.param_groups
             )
         )
+        pred_fork_enabled = (
+            self.device.type == "cuda"
+            and not capture_enabled
+            and getattr(self.obj_model.constraints, "s3im_weight", 0.0) > 0
+            and os.environ.get("QUANTEM_RECON_PRED_FORK", "1") != "0"
+        )
+        loss_branch_stream = torch.cuda.Stream(device=self.device) if pred_fork_enabled else None
+        pred_ready_event = torch.cuda.Event() if pred_fork_enabled else None
+        consistency_ready_event = torch.cuda.Event() if pred_fork_enabled else None
 
         def optimizer_state_is_initialized() -> bool:
             assert optimizer is not None
@@ -404,13 +410,14 @@ class Tomography(TomographyOpt, TomographyBase):
 
                 nvtx.range_push("obj_forward")
                 tap_coords = self.obj_model.sample_tv_tap_coords(all_coords)
-                if tap_coords is not None:
-                    all_densities, tv_tap_raw = self.obj_model.forward_with_tv_taps(
-                        all_coords, tap_coords
-                    )
-                else:
-                    all_densities = self.obj_model.forward(all_coords)
-                    tv_tap_raw = None
+                with self.obj_model.reconstruction_forward_context():
+                    if tap_coords is not None:
+                        all_densities, tv_tap_raw = self.obj_model.forward_with_tv_taps(
+                            all_coords, tap_coords
+                        )
+                    else:
+                        all_densities = self.obj_model.forward(all_coords)
+                        tv_tap_raw = None
                 nvtx.range_pop()
 
                 nvtx.range_push("integrate_rays")
@@ -424,6 +431,20 @@ class Tomography(TomographyOpt, TomographyBase):
             pred = integrated_densities.float()
             target = batch["target_value"].to(self.device, non_blocking=True).float()
 
+            if loss_branch_stream is not None:
+                assert pred_ready_event is not None
+                assert consistency_ready_event is not None
+                main_stream = torch.cuda.current_stream(self.device)
+                pred_ready_event.record(main_stream)
+                loss_branch_stream.wait_event(pred_ready_event)
+                pred.record_stream(loss_branch_stream)
+                target.record_stream(loss_branch_stream)
+                nvtx.range_push("consistency_loss")
+                with torch.cuda.stream(loss_branch_stream):
+                    batch_consistency_loss = loss_func(pred, target)
+                    consistency_ready_event.record(loss_branch_stream)
+                nvtx.range_pop()
+
             nvtx.range_push("soft_constraints")
             constraint_densities = self.dset.graph_constraint_densities(all_densities)
             soft_constraints_loss = self.obj_model.apply_soft_constraints(
@@ -435,13 +456,17 @@ class Tomography(TomographyOpt, TomographyBase):
                     tv_tap_densities=tv_tap_raw,
                 )
             )
+            soft_constraints_loss += self.dset.apply_soft_constraints()
             nvtx.range_pop()
 
-            nvtx.range_push("consistency_loss")
-            batch_consistency_loss = loss_func(pred, target)
-            soft_constraints_loss += self.dset.apply_soft_constraints()
+            if loss_branch_stream is None:
+                nvtx.range_push("consistency_loss")
+                batch_consistency_loss = loss_func(pred, target)
+                nvtx.range_pop()
+            else:
+                main_stream.wait_event(consistency_ready_event)
+                batch_consistency_loss.record_stream(main_stream)
             batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
-            nvtx.range_pop()
 
             nvtx.range_push("backward")
             if grad_scaler_enabled:
@@ -498,8 +523,7 @@ class Tomography(TomographyOpt, TomographyBase):
 
                 if capture_enabled and full_batch and forward_graph is None:
                     static_batch = {
-                        key: value.detach().to(self.device).clone()
-                        for key, value in batch.items()
+                        key: value.detach().to(self.device).clone() for key, value in batch.items()
                     }
                     graph_num_samples_per_ray = curr_num_samples_per_ray
                     try:
@@ -571,7 +595,10 @@ class Tomography(TomographyOpt, TomographyBase):
                         grad_scaler.unscale_(self.obj_model.optimizer)
                     if "pose" in self.optimizer_params and self.dset.has_optimizer():
                         grad_scaler.unscale_(self.dset.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)
+                if grad_clip_max_norm is not None and grad_clip_max_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.obj_model.model.parameters(), max_norm=grad_clip_max_norm
+                    )
                 if grad_scaler_enabled:
                     scaler_stepped = False
                     if "object" in self.optimizer_params and self.obj_model.has_optimizer():

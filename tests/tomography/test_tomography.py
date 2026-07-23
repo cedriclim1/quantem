@@ -246,6 +246,55 @@ class TestInrFactory:
         assert len(tomo.epoch_losses) == 1
         assert all(param.dtype == torch.float32 for param in tomo.obj_model.model.parameters())
 
+    @pytest.mark.parametrize("disabled_value", [None, 0.0])
+    def test_reconstruct_can_skip_inactive_gradient_clipping(self, monkeypatch, disabled_value):
+        original_clip = torch.nn.utils.clip_grad_norm_
+        clip_calls = []
+
+        def tracking_clip(parameters, max_norm, *args, **kwargs):
+            result = original_clip(parameters, max_norm, *args, **kwargs)
+            clip_calls.append((float(result), float(max_norm)))
+            return result
+
+        monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", tracking_clip)
+
+        def run(grad_clip_max_norm):
+            torch.manual_seed(19)
+            tomo = self._inr_tomo("cpu", n=4)
+            torch.manual_seed(23)
+            tomo.reconstruct(
+                num_iter=1,
+                batch_size=len(tomo.dset),
+                num_workers=0,
+                num_samples_per_ray=2,
+                grad_clip_max_norm=grad_clip_max_norm,
+            )
+            return (
+                tomo,
+                [
+                    parameter.grad.detach().clone()
+                    for parameter in tomo.obj_model.model.parameters()
+                ],
+                [parameter.detach().clone() for parameter in tomo.obj_model.model.parameters()],
+            )
+
+        clipped, clipped_grads, clipped_params = run(1e6)
+        unclipped, unclipped_grads, unclipped_params = run(disabled_value)
+
+        assert len(clip_calls) == 1
+        total_norm, max_norm = clip_calls[0]
+        assert total_norm < max_norm
+        np.testing.assert_allclose(unclipped.epoch_losses, clipped.epoch_losses)
+        for actual, expected in zip(unclipped_grads, clipped_grads):
+            torch.testing.assert_close(actual, expected)
+        for actual, expected in zip(unclipped_params, clipped_params):
+            torch.testing.assert_close(actual, expected)
+
+    def test_reconstruct_rejects_negative_gradient_clip_norm(self):
+        tomo = self._inr_tomo("cpu", n=4)
+        with pytest.raises(ValueError, match="grad_clip_max_norm"):
+            tomo.reconstruct(num_iter=0, grad_clip_max_norm=-1.0)
+
     def test_reconstruct_rejects_invalid_autocast_dtype(self):
         tomo = self._inr_tomo("cpu", n=4)
         with pytest.raises(ValueError, match="autocast_dtype"):
@@ -350,9 +399,7 @@ class TestInrFactory:
             "num_samples_per_ray": 4,
         }
         if model_kind == "inr":
-            reconstruct_kwargs["optimizer_params"] = {
-                "object": OptimizerParams.Adam(lr=1e-3)
-            }
+            reconstruct_kwargs["optimizer_params"] = {"object": OptimizerParams.Adam(lr=1e-3)}
         else:
             optimizer_params = {
                 "grids": OptimizerParams.Adam(lr=1e-3),
@@ -393,9 +440,7 @@ class TestInrFactory:
 
         eager_param_delta = max(
             (parameter - initial).abs().max().item()
-            for parameter, initial in zip(
-                eager.obj_model.model.parameters(), eager_initial_params
-            )
+            for parameter, initial in zip(eager.obj_model.model.parameters(), eager_initial_params)
         )
         graphed_param_delta = max(
             (parameter - initial).abs().max().item()
@@ -430,6 +475,80 @@ class TestInrFactory:
             rtol=2e-3,
             atol=0.0,
         )
+
+    @requires_gpu
+    @pytest.mark.parametrize("num_steps", [1, 10, 100])
+    def test_pred_fork_matches_single_stream_state(self, monkeypatch, num_steps):
+        def build_tomography():
+            tomo = self._inr_tomo("cuda:0", n=4)
+            tomo.obj_model.constraints = ObjConstraintParams.ObjINRConstraints(
+                s3im_weight=0.05,
+                s3im_repeat_time=2,
+                s3im_kernel=2,
+                s3im_value_range=10.0,
+            )
+            return tomo
+
+        def run(tomo, enabled):
+            if enabled:
+                monkeypatch.delenv("QUANTEM_RECON_PRED_FORK", raising=False)
+            else:
+                monkeypatch.setenv("QUANTEM_RECON_PRED_FORK", "0")
+            torch.manual_seed(29)
+            tomo.reconstruct(
+                num_iter=num_steps,
+                batch_size=len(tomo.dset),
+                num_workers=0,
+                num_samples_per_ray=2,
+                optimizer_params={"object": OptimizerParams.Adam(lr=1e-3)},
+                grad_clip_max_norm=None,
+            )
+            torch.cuda.synchronize()
+
+        torch.manual_seed(17)
+        reference = build_tomography()
+        torch.manual_seed(17)
+        forked = build_tomography()
+        run(reference, enabled=False)
+        run(forked, enabled=True)
+
+        np.testing.assert_allclose(forked.epoch_losses, reference.epoch_losses, rtol=1e-5)
+        np.testing.assert_allclose(
+            forked.consistency_losses, reference.consistency_losses, rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            forked.obj_model.soft_constraint_losses,
+            reference.obj_model.soft_constraint_losses,
+            rtol=1e-5,
+        )
+        for forked_parameter, reference_parameter in zip(
+            forked.obj_model.model.parameters(), reference.obj_model.model.parameters()
+        ):
+            torch.testing.assert_close(
+                forked_parameter.grad,
+                reference_parameter.grad,
+                rtol=1e-5,
+                atol=1e-7,
+            )
+            torch.testing.assert_close(
+                forked_parameter,
+                reference_parameter,
+                rtol=1e-5,
+                atol=1e-7,
+            )
+            forked_state = forked.obj_model.optimizer.state[forked_parameter]
+            reference_state = reference.obj_model.optimizer.state[reference_parameter]
+            assert forked_state.keys() == reference_state.keys()
+            for key in forked_state:
+                if isinstance(forked_state[key], torch.Tensor):
+                    torch.testing.assert_close(
+                        forked_state[key],
+                        reference_state[key],
+                        rtol=1e-5,
+                        atol=1e-7,
+                    )
+                else:
+                    assert forked_state[key] == reference_state[key]
 
 
 @requires_torch
