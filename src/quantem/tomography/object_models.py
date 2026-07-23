@@ -1,6 +1,7 @@
 import os
 import weakref
 from abc import abstractmethod
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Generator, Optional, cast
@@ -576,6 +577,11 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     def _prepare_model_call(self) -> None:
         """Hook for subclasses that select optional model capabilities."""
 
+    @contextmanager
+    def reconstruction_forward_context(self):
+        """Scope optional auxiliaries to a reconstruction's primary model call."""
+        yield
+
     def _unpack_model_output(self, output: Any) -> torch.Tensor:
         """Return the primary tensor from models with auxiliary outputs."""
         if isinstance(output, tuple):
@@ -1092,7 +1098,8 @@ class ObjectTensorDecomp(ObjectINR):
     def _prepare_model_call(self) -> None:
         model = _unwrap(self.model)
         use_combined = (
-            os.environ.get("QUANTEM_KPLANES_MS_TV_FUSED", "0") == "1"
+            getattr(self, "_reconstruction_plane_tv_requested", False)
+            and os.environ.get("QUANTEM_KPLANES_MS_TV_FUSED", "1") != "0"
             and self.constraints.tv_plane > 0
             and getattr(model, "quantem_supports_fused_plane_tv", False)
             and config.get("has_quantem_cuda")
@@ -1107,6 +1114,16 @@ class ObjectTensorDecomp(ObjectINR):
                 use_combined = getattr(cuda_ml, "kplanes_tilted_fuse_ms_tv", None) is not None
         model._plane_tv_fusion_requested = use_combined
         self._fused_plane_tv_loss = None
+
+    @contextmanager
+    def reconstruction_forward_context(self):
+        """Request the fused plane-TV auxiliary for one reconstruction forward."""
+        self._reconstruction_plane_tv_requested = True
+        try:
+            yield
+        finally:
+            self._reconstruction_plane_tv_requested = False
+            _unwrap(self.model)._plane_tv_fusion_requested = False
 
     def _unpack_model_output(self, output: Any) -> torch.Tensor:
         if isinstance(output, tuple):

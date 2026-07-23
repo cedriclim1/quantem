@@ -79,9 +79,9 @@ def test_none_scale_gates_dispatch_as_unit_gates(mocked_cuda_ml):
     assert calls["single"] == []
 
 
-def test_plane_tv_opt_in_dispatches_to_combined_capability(mocked_cuda_ml, monkeypatch):
+def test_plane_tv_defaults_to_combined_capability(mocked_cuda_ml, monkeypatch):
     _, calls = mocked_cuda_ml
-    monkeypatch.setenv("QUANTEM_KPLANES_MS_TV_FUSED", "1")
+    monkeypatch.delenv("QUANTEM_KPLANES_MS_TV_FUSED", raising=False)
     pts, rotations, grids = _inputs()
 
     features, tv = interpolate_ms_features_tilted(
@@ -94,9 +94,9 @@ def test_plane_tv_opt_in_dispatches_to_combined_capability(mocked_cuda_ml, monke
     assert calls["ms"] == []
 
 
-def test_plane_tv_is_default_off_even_when_capability_exists(mocked_cuda_ml, monkeypatch):
+def test_plane_tv_opt_out_uses_multiscale_without_aux(mocked_cuda_ml, monkeypatch):
     _, calls = mocked_cuda_ml
-    monkeypatch.delenv("QUANTEM_KPLANES_MS_TV_FUSED", raising=False)
+    monkeypatch.setenv("QUANTEM_KPLANES_MS_TV_FUSED", "0")
     pts, rotations, grids = _inputs()
 
     interpolate_ms_features_tilted(pts, grids, rotations, include_plane_tv=True)
