@@ -1119,11 +1119,15 @@ class ObjectTensorDecomp(ObjectINR):
     def reconstruction_forward_context(self):
         """Request the fused plane-TV auxiliary for one reconstruction forward."""
         self._reconstruction_plane_tv_requested = True
+        completed = False
         try:
             yield
+            completed = True
         finally:
             self._reconstruction_plane_tv_requested = False
             _unwrap(self.model)._plane_tv_fusion_requested = False
+            if not completed:
+                self._fused_plane_tv_loss = None
 
     def _unpack_model_output(self, output: Any) -> torch.Tensor:
         if isinstance(output, tuple):

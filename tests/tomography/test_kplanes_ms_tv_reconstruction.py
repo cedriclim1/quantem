@@ -63,6 +63,13 @@ def mocked_cuda_ml(monkeypatch):
     return calls
 
 
+@pytest.mark.skipif(
+    torch.cuda.is_available(),
+    reason=(
+        "CPU-only mock integration test; real GPU path covered by "
+        "test_kplanes_ms_tv_optimizer.py and the three-level cuda_graphs arm"
+    ),
+)
 def test_reconstruction_scope_requests_and_consumes_fused_plane_tv_once(
     mocked_cuda_ml, monkeypatch
 ):
@@ -93,3 +100,28 @@ def test_reconstruction_scope_requests_and_consumes_fused_plane_tv_once(
     loss = obj.get_tv_loss(ReconstructionContext(coords=coords, pred=reconstruction_density))
     torch.testing.assert_close(loss, torch.tensor(0.5))
     assert obj._fused_plane_tv_loss is None
+
+
+@pytest.mark.skipif(
+    torch.cuda.is_available(),
+    reason=(
+        "CPU-only mock integration test; real GPU path covered by "
+        "test_kplanes_ms_tv_optimizer.py and the three-level cuda_graphs arm"
+    ),
+)
+def test_reconstruction_scope_clears_fused_plane_tv_after_exception(mocked_cuda_ml):
+    model = KPlanesTILTED(
+        T=1,
+        M_features=2,
+        resolution=(4, 4, 4),
+        multiscale_res_multipliers=(1, 2, 3),
+    )
+    obj = ObjectTensorDecomp.from_model(model, shape=(4, 4, 4), device="cpu")
+
+    with pytest.raises(RuntimeError, match="failed reconstruction"):
+        with obj.reconstruction_forward_context():
+            obj._fused_plane_tv_loss = torch.tensor(2.5, requires_grad=True)
+            raise RuntimeError("failed reconstruction")
+
+    assert obj._fused_plane_tv_loss is None
+    assert model._plane_tv_fusion_requested is False

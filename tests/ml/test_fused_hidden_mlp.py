@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from quantem.core import config
+from quantem.core.ml.models import kplanes as kplanes_module
 from quantem.core.ml.models.kplanes import FusedHiddenMLP, KPlanesTILTED
 
 
@@ -22,7 +23,28 @@ def _head():
     )
 
 
-def test_kill_switch_is_default_off(monkeypatch):
+@pytest.fixture(autouse=True)
+def reset_fused_mlp_fallback_state():
+    kplanes_module._unsupported_fused_mlp_shapes.clear()
+    kplanes_module._warned_fused_mlp_reasons.clear()
+    yield
+    kplanes_module._unsupported_fused_mlp_shapes.clear()
+    kplanes_module._warned_fused_mlp_reasons.clear()
+
+
+@pytest.mark.parametrize("value", [None, "", "1"])
+def test_fused_mlp_is_default_on_and_only_zero_disables(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("QUANTEM_FUSED_MLP", raising=False)
+    else:
+        monkeypatch.setenv("QUANTEM_FUSED_MLP", value)
+    assert kplanes_module._fused_mlp_enabled()
+
+    monkeypatch.setenv("QUANTEM_FUSED_MLP", "0")
+    assert not kplanes_module._fused_mlp_enabled()
+
+
+def test_default_on_still_falls_back_for_unsupported_inputs(monkeypatch):
     monkeypatch.delenv("QUANTEM_FUSED_MLP", raising=False)
     head = _head()
     inputs = torch.randn(7, 12)
@@ -45,7 +67,10 @@ def test_missing_extension_capability_falls_back(monkeypatch):
     expected = nn.Sequential.forward(head, inputs)
     monkeypatch.setitem(sys.modules, "quantem.cuda.core.ml", ModuleType("quantem.cuda.core.ml"))
     monkeypatch.setattr(FusedHiddenMLP, "_can_fuse", lambda self, tensor: True)
-    torch.testing.assert_close(head(inputs), expected)
+    with pytest.warns(RuntimeWarning, match="memoizing the eager fallback") as records:
+        torch.testing.assert_close(head(inputs), expected)
+        torch.testing.assert_close(head(inputs), expected)
+    assert len(records) == 1
 
 
 def test_available_extension_is_selected_without_changing_parameter_keys(monkeypatch):
@@ -119,14 +144,19 @@ def test_kplanes_tilted_forward_backward_parity(monkeypatch):
         hybrid_num_layers=2,
     ).cuda()
     fused_model = copy.deepcopy(eager_model)
+    truth_model = copy.deepcopy(eager_model)
     eager_pts = (torch.rand((37, 3), device="cuda") * 2 - 1).requires_grad_()
     fused_pts = eager_pts.detach().clone().requires_grad_()
+    truth_pts = eager_pts.detach().clone().requires_grad_()
     upstream = torch.randn((37, 1), device="cuda", dtype=torch.bfloat16)
 
     monkeypatch.setenv("QUANTEM_FUSED_MLP", "0")
     with torch.autocast("cuda", dtype=torch.bfloat16):
         eager_out = eager_model(eager_pts)
     eager_out.backward(upstream)
+
+    truth_out = truth_model(truth_pts)
+    truth_out.backward(upstream.float())
 
     real_fused = cuda_ml.fused_hidden_mlp
     calls = []
@@ -143,10 +173,18 @@ def test_kplanes_tilted_forward_backward_parity(monkeypatch):
 
     assert calls == [torch.Size((37, 24))]
     torch.testing.assert_close(fused_out, eager_out, rtol=8e-3, atol=1e-3)
-    torch.testing.assert_close(fused_pts.grad, eager_pts.grad, rtol=3e-3, atol=1e-4)
-    for (_, eager_parameter), (_, fused_parameter) in zip(
-        eager_model.named_parameters(), fused_model.named_parameters()
-    ):
-        torch.testing.assert_close(
-            fused_parameter.grad, eager_parameter.grad, rtol=3e-3, atol=1e-4
+    eager_grads = (eager_pts.grad, *(parameter.grad for parameter in eager_model.parameters()))
+    fused_grads = (fused_pts.grad, *(parameter.grad for parameter in fused_model.parameters()))
+    truth_grads = (truth_pts.grad, *(parameter.grad for parameter in truth_model.parameters()))
+    # At M=37 the measured fused/eager mean-error ratios against fp32 truth
+    # were 1.11 for dx and 1.34 for dW1; allow reduction-order variation while
+    # requiring the fused path to remain close to eager's fp32 error envelope.
+    for fused_grad, eager_grad, truth_grad in zip(fused_grads, eager_grads, truth_grads):
+        eager_error = (eager_grad.float() - truth_grad).abs()
+        fused_error = (fused_grad.float() - truth_grad).abs()
+        assert torch.mean(fused_error) <= torch.mean(eager_error) * 1.5 + 1e-7
+        truth_scale = truth_grad.abs().max()
+        bf16_eps_at_truth_scale = truth_scale * 2**-8
+        assert torch.max(fused_error) <= (
+            torch.max(eager_error) * 1.5 + 2 * bf16_eps_at_truth_scale
         )

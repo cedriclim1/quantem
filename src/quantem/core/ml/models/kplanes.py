@@ -4,6 +4,8 @@ Tensor Decomposition Methods for INR-based reconstructions
 
 import itertools
 import os
+import threading
+import warnings
 from typing import Callable, Optional, Sequence
 
 # import tinycudann as tcnn
@@ -16,17 +18,29 @@ from quantem.core import config
 from .model_base import PPLR, TensorDecompositionModel
 from .so3params import SO3ParamQuat, SO3ParamR9SVD
 
+_FusedMlpShapeKey = tuple[int | None, int, int, int, int, int]
+_unsupported_fused_mlp_shapes: dict[_FusedMlpShapeKey, str] = {}
+_warned_fused_mlp_reasons: set[str] = set()
+_fused_mlp_fallback_lock = threading.Lock()
+
+
+def _fused_mlp_enabled() -> bool:
+    return os.environ.get("QUANTEM_FUSED_MLP", "1") != "0"
+
 
 class FusedHiddenMLP(nn.Sequential):
-    """Sequential-compatible sigma head with an opt-in cuBLASLt fast path.
+    """Sequential-compatible sigma head with a default-on cuBLASLt fast path.
 
     Keeping the numeric child-module names preserves existing state dicts and
     optimizer parameter discovery.  Every unsupported case executes the
     inherited Sequential path without importing quantem-cuda eagerly.
+    ``torch.use_deterministic_algorithms`` does not govern the custom path;
+    set ``QUANTEM_FUSED_MLP=0`` when strict PyTorch deterministic-mode behavior
+    is required.
     """
 
     def _can_fuse(self, inputs: torch.Tensor) -> bool:
-        if os.environ.get("QUANTEM_FUSED_MLP", "0") == "0":
+        if not _fused_mlp_enabled():
             return False
         if torch.compiler.is_compiling():
             return False
@@ -58,8 +72,24 @@ class FusedHiddenMLP(nn.Sequential):
             for parameter in parameters
         )
 
+    def _fused_shape_key(self, inputs: torch.Tensor) -> _FusedMlpShapeKey:
+        linear1, linear2, linear3 = self[0], self[2], self[4]
+        return (
+            inputs.device.index,
+            inputs.shape[0],
+            inputs.shape[1],
+            linear1.out_features,
+            linear2.out_features,
+            linear3.out_features,
+        )
+
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         if self._can_fuse(inputs):
+            shape_key = self._fused_shape_key(inputs)
+            with _fused_mlp_fallback_lock:
+                shape_is_unsupported = shape_key in _unsupported_fused_mlp_shapes
+            if shape_is_unsupported:
+                return super().forward(inputs)
             try:
                 from quantem.cuda.core.ml import fused_hidden_mlp
 
@@ -73,8 +103,19 @@ class FusedHiddenMLP(nn.Sequential):
                     linear3.weight,
                     linear3.bias,
                 )
-            except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
-                pass
+            except (ImportError, AttributeError, RuntimeError, TypeError, ValueError) as error:
+                reason = f"{type(error).__name__}: {error}"
+                with _fused_mlp_fallback_lock:
+                    _unsupported_fused_mlp_shapes[shape_key] = reason
+                    should_warn = reason not in _warned_fused_mlp_reasons
+                    _warned_fused_mlp_reasons.add(reason)
+                if should_warn:
+                    warnings.warn(
+                        "Fused cuBLASLt MLP dispatch failed; memoizing the eager fallback for "
+                        f"this device/shape. Reason: {reason}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
         return super().forward(inputs)
 
 

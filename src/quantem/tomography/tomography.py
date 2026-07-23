@@ -374,7 +374,9 @@ class Tomography(TomographyOpt, TomographyBase):
             self.device.type == "cuda"
             and not capture_enabled
             and getattr(self.obj_model.constraints, "s3im_weight", 0.0) > 0
-            and os.environ.get("QUANTEM_RECON_PRED_FORK", "1") != "0"
+            # The side-stream schedule assumes RNG-free, stateless consistency
+            # losses. Keep it disabled for user-supplied stochastic losses.
+            and os.environ.get("QUANTEM_RECON_PRED_FORK", "0") != "0"
         )
         loss_branch_stream = torch.cuda.Stream(device=self.device) if pred_fork_enabled else None
         pred_ready_event = torch.cuda.Event() if pred_fork_enabled else None

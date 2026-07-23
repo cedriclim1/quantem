@@ -347,9 +347,23 @@ class TestInrFactory:
         assert np.isfinite(scale) and scale > 0
 
     @requires_gpu
-    @pytest.mark.parametrize("model_kind", ["inr", "kplanes_tilted"])
-    def test_reconstruct_cuda_graphs_matches_eager_fp32(self, model_kind):
+    @pytest.mark.parametrize(
+        ("model_kind", "multiscale_res_multipliers"),
+        [
+            pytest.param("inr", None, id="inr"),
+            pytest.param("kplanes_tilted", [1], id="kplanes-single-level"),
+            pytest.param(
+                "kplanes_tilted",
+                [0.25, 0.75, 1.0],
+                id="kplanes-three-level-ms-tv",
+            ),
+        ],
+    )
+    def test_reconstruct_cuda_graphs_matches_eager_fp32(
+        self, model_kind, multiscale_res_multipliers, monkeypatch
+    ):
         seed = 7
+        monkeypatch.delenv("QUANTEM_KPLANES_MS_TV_FUSED", raising=False)
 
         def build_tomography():
             if model_kind == "inr":
@@ -360,7 +374,7 @@ class TestInrFactory:
             model = KPlanesTILTED(
                 M_features=2,
                 resolution=(4, 4, 4),
-                multiscale_res_multipliers=[1],
+                multiscale_res_multipliers=multiscale_res_multipliers,
                 T=2,
                 so3_param_type="r9svd",
             )
@@ -369,6 +383,8 @@ class TestInrFactory:
                 shape=(4, 4, 4),
                 device="cuda:0",
             )
+            if len(multiscale_res_multipliers) == 3:
+                obj.constraints.tv_plane = 0.05
             dset = TomographyINRDataset.from_data(
                 _stack(nang=5, n=4),
                 np.linspace(-60, 60, 5).astype(np.float32),
@@ -491,7 +507,7 @@ class TestInrFactory:
 
         def run(tomo, enabled):
             if enabled:
-                monkeypatch.delenv("QUANTEM_RECON_PRED_FORK", raising=False)
+                monkeypatch.setenv("QUANTEM_RECON_PRED_FORK", "1")
             else:
                 monkeypatch.setenv("QUANTEM_RECON_PRED_FORK", "0")
             torch.manual_seed(29)
@@ -512,14 +528,15 @@ class TestInrFactory:
         run(reference, enabled=False)
         run(forked, enabled=True)
 
-        np.testing.assert_allclose(forked.epoch_losses, reference.epoch_losses, rtol=1e-5)
+        # Side-stream kernel interleaving can change fp32 atomic accumulation order.
+        np.testing.assert_allclose(forked.epoch_losses, reference.epoch_losses, rtol=1e-4)
         np.testing.assert_allclose(
-            forked.consistency_losses, reference.consistency_losses, rtol=1e-5
+            forked.consistency_losses, reference.consistency_losses, rtol=1e-4
         )
         np.testing.assert_allclose(
             forked.obj_model.soft_constraint_losses,
             reference.obj_model.soft_constraint_losses,
-            rtol=1e-5,
+            rtol=1e-4,
         )
         for forked_parameter, reference_parameter in zip(
             forked.obj_model.model.parameters(), reference.obj_model.model.parameters()
@@ -527,13 +544,13 @@ class TestInrFactory:
             torch.testing.assert_close(
                 forked_parameter.grad,
                 reference_parameter.grad,
-                rtol=1e-5,
+                rtol=1e-4,
                 atol=1e-7,
             )
             torch.testing.assert_close(
                 forked_parameter,
                 reference_parameter,
-                rtol=1e-5,
+                rtol=1e-4,
                 atol=1e-7,
             )
             forked_state = forked.obj_model.optimizer.state[forked_parameter]
@@ -544,7 +561,7 @@ class TestInrFactory:
                     torch.testing.assert_close(
                         forked_state[key],
                         reference_state[key],
-                        rtol=1e-5,
+                        rtol=1e-4,
                         atol=1e-7,
                     )
                 else:
