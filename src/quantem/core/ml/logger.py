@@ -61,6 +61,12 @@ class LoggerBase(AutoSerialize):
         self._timestamp = datetime.datetime.now().strftime(
             "%Y%m%d_%H%M%S"
         )  # This should never be reinstantiated.
+        # DDP: only the main rank owns the writer and the on-disk run directory.
+        # Non-main ranks build a fully inert logger -- no SummaryWriter/WandB run, no
+        # directory created, and every log_*/flush/close call is a no-op -- so a DDP
+        # run yields a single run subdirectory instead of one per rank. RANK is unset
+        # for single-process runs, so this defaults to rank 0 and preserves behavior.
+        self._is_writer_rank = int(os.environ.get("RANK", "0")) == 0
         self.run_prefix = run_prefix
         self.run_suffix = run_suffix
         self.log_dir = base_log_dir
@@ -70,10 +76,11 @@ class LoggerBase(AutoSerialize):
         self._wandb = None
         self.writer = None
 
-        if self.mode == "tensorboard":
-            self.writer = SummaryWriter(str(self.log_dir))
-        else:
-            self._init_wandb(wandb_config)
+        if self._is_writer_rank:
+            if self.mode == "tensorboard":
+                self.writer = SummaryWriter(str(self.log_dir))
+            else:
+                self._init_wandb(wandb_config)
 
     def log_scalar(
         self,
@@ -83,6 +90,8 @@ class LoggerBase(AutoSerialize):
         step_domain: str = "epoch",
         extra_steps: dict[str, int] | None = None,
     ) -> None:
+        if not self._is_writer_rank:
+            return
         if self.mode == "tensorboard":
             self.writer.add_scalar(tag=tag, scalar_value=value, global_step=step)
         else:
@@ -97,6 +106,8 @@ class LoggerBase(AutoSerialize):
         step_domain: str = "epoch",
         extra_steps: dict[str, int] | None = None,
     ) -> None:
+        if not self._is_writer_rank:
+            return
         cmap_image = self.apply_colormap(image, cmap_name=cmap)
         if self.mode == "tensorboard":
             self.writer.add_image(tag, cmap_image, step)
@@ -114,6 +125,8 @@ class LoggerBase(AutoSerialize):
         step_domain: str = "epoch",
         extra_steps: dict[str, int] | None = None,
     ) -> None:
+        if not self._is_writer_rank:
+            return
         if self.mode == "tensorboard":
             self.writer.add_figure(tag, fig, step)
         else:
@@ -138,6 +151,8 @@ class LoggerBase(AutoSerialize):
         step : int
             Step number.
         """
+        if not self._is_writer_rank:
+            return
         if isinstance(values, Tensor):
             values = values.detach().cpu().numpy()
         if self.mode == "tensorboard":
@@ -166,6 +181,8 @@ class LoggerBase(AutoSerialize):
         step : int
             Step number.
         """
+        if not self._is_writer_rank:
+            return
         if self.mode == "tensorboard":
             self.writer.add_text(tag, text, step)
         else:
@@ -176,14 +193,18 @@ class LoggerBase(AutoSerialize):
 
         This is intentionally a no-op for TensorBoard mode so callers can use it unconditionally.
         """
+        if not self._is_writer_rank:
+            return
         if self.mode == "wandb":
             self._wandb_run.config.update(dict(config), allow_val_change=True)
 
     def flush(self) -> None:
-        if self.mode == "tensorboard":
+        if self._is_writer_rank and self.mode == "tensorboard":
             self.writer.flush()
 
     def close(self) -> None:
+        if not self._is_writer_rank:
+            return
         if self.mode == "tensorboard":
             self.writer.flush()
             self.writer.close()
@@ -199,8 +220,10 @@ class LoggerBase(AutoSerialize):
         if self.run_suffix:
             name += f"_{self.run_suffix}"
         new_log_dir = self.log_dir.parent / name
-        new_log_dir.mkdir(exist_ok=True)
         self._log_dir = new_log_dir
+        if not self._is_writer_rank:
+            return
+        new_log_dir.mkdir(exist_ok=True)
         if self.mode == "tensorboard":
             self.writer = SummaryWriter(str(self.log_dir))
         else:
@@ -254,7 +277,10 @@ class LoggerBase(AutoSerialize):
             name += f"_{self.run_suffix}"
 
         full_path = dir / name
-        full_path.mkdir(parents=True, exist_ok=True)
+        # Non-main DDP ranks never materialize a run directory (see __init__). getattr
+        # guards the first setter call, which runs before _is_writer_rank is assigned.
+        if getattr(self, "_is_writer_rank", True):
+            full_path.mkdir(parents=True, exist_ok=True)
 
         self._log_dir = full_path
 
