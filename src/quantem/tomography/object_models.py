@@ -601,7 +601,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             assert ctx.pred is not None, (
                 "pred must be provided for INR object model to compute the sparsity loss"
             )
-            sparsity_loss = self.constraints.sparsity * torch.norm(ctx.pred, p=1)
+            sparsity_loss = self.constraints.sparsity * ctx.pred.abs().mean()
             soft_loss += sparsity_loss
 
         if getattr(self.constraints, "s3im_weight", 0.0) > 0:
