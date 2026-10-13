@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.constraints import BaseConstraints, Constraints
-from quantem.core.ml.optimizer_mixin import OptimizerMixin
+from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerParams, OptimizerParamsType
 from quantem.tomography.utils import tv_loss_1d
 
 # --- Constraints ---
@@ -772,6 +772,31 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         )
 
     # --- Forward Pass w/ Params Method for OptimizerMixin ---
+    def get_optimization_parameters(self) -> dict[str, list[torch.Tensor]]:
+        """Return independently tunable shift and tilt-axis parameter groups."""
+        groups = {}
+        if self.learn_shift:
+            groups["pose_shift"] = [self._shifts_params]
+        if self.learn_tilt_axis:
+            groups["pose_tilt_axis"] = [self._z1_params, self._z3_params]
+        return groups
+
+    def _normalize_optimizer_params(
+        self, params: OptimizerParamsType | dict[str, Any]
+    ) -> dict[str, OptimizerParamsType]:
+        """Expand a legacy shared pose optimizer over the active pose groups."""
+        normalized = super()._normalize_optimizer_params(params)
+        if set(normalized) == {self.DEFAULT_OPTIMIZER_KEY}:
+            spec = normalized[self.DEFAULT_OPTIMIZER_KEY]
+            if not isinstance(spec, OptimizerParams.NoneOptimizer):
+                normalized = {
+                    key: spec
+                    for key in ("pose_shift", "pose_tilt_axis")
+                    if (key == "pose_shift" and self.learn_shift)
+                    or (key == "pose_tilt_axis" and self.learn_tilt_axis)
+                }
+        return normalized
+
     def forward(self, dummy_input: Any = None):
         """
         Forward pass for INR-based tomography. In the forward pass, the only parameters that

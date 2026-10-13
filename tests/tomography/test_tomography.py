@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 import torch
 
+from quantem.core.ml.optimizer_mixin import OptimizerParams, SchedulerParams
 from quantem.tomography.dataset_models import TomographyINRDataset, TomographyPixDataset
 from quantem.tomography.object_models import ObjConstraintParams, ObjectINR, ObjectPixelated
 from quantem.tomography.tomography import Tomography, TomographyConventional
@@ -140,6 +141,94 @@ class TestInrFactory:
         tomo.save_volume(path, overwrite=True)  # must not raise
         with np.load(path) as data:
             assert "volume" in data
+
+    def test_reconstruct_pose_warmup_activation_and_reference_exclusion(self, monkeypatch):
+        tomo = self._inr_tomo("cpu", n=4)
+        pose_active_at_epoch_start = []
+        pose_scheduler_at_epoch_start = []
+        object_active_at_epoch_start = []
+        initial_pose = [
+            param.detach().clone()
+            for param in (tomo.dset._shifts_params, tomo.dset._z1_params, tomo.dset._z3_params)
+        ]
+        pose_at_epoch_end = []
+        original_train = tomo.dset.train
+
+        def record_optimizer_state(mode=True):
+            pose_active_at_epoch_start.append(tomo.dset.has_optimizer())
+            pose_scheduler_at_epoch_start.append(tomo.dset.scheduler is not None)
+            object_active_at_epoch_start.append(tomo.obj_model.has_optimizer())
+            return original_train(mode)
+
+        def record_pose(_epoch):
+            pose_at_epoch_end.append(
+                [
+                    param.detach().clone()
+                    for param in (
+                        tomo.dset._shifts_params,
+                        tomo.dset._z1_params,
+                        tomo.dset._z3_params,
+                    )
+                ]
+            )
+
+        monkeypatch.setattr(tomo.dset, "train", record_optimizer_state)
+        tomo.reconstruct(
+            num_iter=2,
+            batch_size=len(tomo.dset),
+            num_workers=0,
+            num_samples_per_ray=2,
+            optimizer_params={
+                "object": OptimizerParams.Adam(lr=1e-3),
+                "pose": {
+                    "pose_shift": OptimizerParams.Adam(lr=2e-2),
+                    "pose_tilt_axis": OptimizerParams.Adam(lr=3e-3),
+                },
+            },
+            scheduler_params={
+                "object": SchedulerParams.Exponential(gamma=0.9),
+                "pose": SchedulerParams.Exponential(gamma=0.9),
+            },
+            pose_warmup_epochs=1,
+            eval_callback=record_pose,
+            eval_every=1,
+        )
+
+        assert pose_active_at_epoch_start == [False, True]
+        assert pose_scheduler_at_epoch_start == [False, True]
+        assert object_active_at_epoch_start == [True, True]
+        assert all(
+            torch.equal(before, after)
+            for before, after in zip(initial_pose, pose_at_epoch_end[0])
+        )
+        assert any(
+            not torch.equal(before, after)
+            for before, after in zip(pose_at_epoch_end[0], pose_at_epoch_end[1])
+        )
+        assert {group["name"] for group in tomo.dset.optimizer.param_groups} == {
+            "pose_shift",
+            "pose_tilt_axis",
+        }
+        optimized = [
+            param for group in tomo.dset.optimizer.param_groups for param in group["params"]
+        ]
+        assert all(
+            ref is not param
+            for ref in (tomo.dset._shifts_ref, tomo.dset._z1_ref, tomo.dset._z3_ref)
+            for param in optimized
+        )
+
+        default_tomo = self._inr_tomo("cpu", n=4)
+        default_tomo.reconstruct(
+            num_iter=0,
+            batch_size=len(default_tomo.dset),
+            num_workers=0,
+            optimizer_params={"pose": OptimizerParams.Adam(lr=1e-2)},
+        )
+        assert default_tomo.dset.has_optimizer()
+
+        with pytest.raises(ValueError, match="pose_warmup_epochs must be >= 0"):
+            default_tomo.reconstruct(num_iter=0, pose_warmup_epochs=-1)
 
 
 @requires_torch

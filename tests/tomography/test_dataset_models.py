@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from quantem.core.ml.optimizer_mixin import OptimizerParams
 from quantem.tomography.dataset_models import (
     DatasetConstraintParams,
     DatasetValue,
@@ -15,6 +16,7 @@ from quantem.tomography.dataset_models import (
     TomographyINRPretrainDataset,
     TomographyPixDataset,
 )
+from quantem.tomography.tomography_opt import _pose_optimizer_specs
 
 from .conftest import requires_torch
 
@@ -108,6 +110,98 @@ class TestTomographyINRDataset:
         )
         item = d[0]
         assert {"phi", "pixel_i", "pixel_j", "projection_idx", "target_value"} <= set(item.keys())
+
+    @pytest.mark.parametrize(
+        "learn_shift,learn_tilt_axis,shift_lr,tilt_axis_lr,expected_lrs",
+        [
+            (True, True, 2e-2, 3e-3, {"pose_shift": 2e-2, "pose_tilt_axis": 3e-3}),
+            (True, True, None, None, {"pose_shift": 1e-2, "pose_tilt_axis": 1e-2}),
+            (True, False, 2e-2, 3e-3, {"pose_shift": 2e-2}),
+            (False, True, 2e-2, 3e-3, {"pose_tilt_axis": 3e-3}),
+        ],
+    )
+    def test_pose_optimizer_groups_and_lrs(
+        self, learn_shift, learn_tilt_axis, shift_lr, tilt_axis_lr, expected_lrs
+    ):
+        angles = np.linspace(-60, 60, 5, dtype="f4")
+        d = TomographyINRDataset.from_data(
+            _stack(nang=len(angles), n=12),
+            angles,
+            learn_shift=learn_shift,
+            learn_tilt_axis=learn_tilt_axis,
+        )
+        d.to("cpu")
+        specs = _pose_optimizer_specs(
+            d, pose_lr=1e-2, shift_lr=shift_lr, tilt_axis_lr=tilt_axis_lr
+        )
+        d.set_optimizer(specs)
+
+        groups = {group["name"]: group for group in d.optimizer.param_groups}
+        assert set(groups) == set(expected_lrs)
+        for name, lr in expected_lrs.items():
+            assert groups[name]["lr"] == pytest.approx(lr)
+
+        if learn_shift:
+            shift_params = groups["pose_shift"]["params"]
+            assert len(shift_params) == 1 and shift_params[0] is d._shifts_params
+            assert d._shifts_params.shape == (len(angles) - 1, 2)
+        if learn_tilt_axis:
+            tilt_params = groups["pose_tilt_axis"]["params"]
+            assert len(tilt_params) == 2
+            assert tilt_params[0] is d._z1_params and tilt_params[1] is d._z3_params
+            assert d._z1_params.shape == d._z3_params.shape == (len(angles) - 1,)
+
+        optimized = [param for group in groups.values() for param in group["params"]]
+        assert all(
+            ref is not param
+            for ref in (d._shifts_ref, d._z1_ref, d._z3_ref)
+            for param in optimized
+        )
+
+    def test_legacy_shared_pose_optimizer_expands_to_active_groups(self):
+        d = TomographyINRDataset.from_data(
+            _stack(nang=5, n=12), np.linspace(-60, 60, 5, dtype="f4")
+        )
+        d.to("cpu")
+        d.set_optimizer(OptimizerParams.Adam(lr=1e-2))
+        assert {group["name"]: group["lr"] for group in d.optimizer.param_groups} == {
+            "pose_shift": 1e-2,
+            "pose_tilt_axis": 1e-2,
+        }
+
+    def test_full_tomography_pose_optimizer_groups_and_lrs(self):
+        from quantem.core.ml.inr import HSiren
+        from quantem.tomography.object_models import ObjectINR
+        from quantem.tomography.tomography import Tomography
+
+        model = HSiren(in_features=3, out_features=1, hidden_layers=1, hidden_features=8)
+        obj = ObjectINR.from_model(model, shape=(12, 12, 12), device="cpu")
+        d = TomographyINRDataset.from_data(
+            _stack(nang=5, n=12),
+            np.linspace(-60, 60, 5, dtype="f4"),
+            learn_shift=True,
+            learn_tilt_axis=True,
+        )
+        tomo = Tomography.from_models(dset=d, obj_model=obj, device="cpu", verbose=False)
+        tomo.optimizer_params = {
+            "pose": {
+                "pose_shift": {"name": "adam", "lr": 2e-2},
+                "pose_tilt_axis": {"name": "adam", "lr": 3e-3},
+            }
+        }
+        tomo.set_optimizers()
+
+        groups = {group["name"]: group for group in tomo.dset.optimizer.param_groups}
+        assert {name: group["lr"] for name, group in groups.items()} == {
+            "pose_shift": 2e-2,
+            "pose_tilt_axis": 3e-3,
+        }
+        optimized = [param for group in groups.values() for param in group["params"]]
+        assert all(
+            ref is not param
+            for ref in (tomo.dset._shifts_ref, tomo.dset._z1_ref, tomo.dset._z3_ref)
+            for param in optimized
+        )
 
     @pytest.mark.parametrize(
         "learn_shift,learn_tilt_axis",

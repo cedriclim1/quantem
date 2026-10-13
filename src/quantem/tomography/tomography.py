@@ -99,6 +99,24 @@ class Tomography(TomographyOpt, TomographyBase):
             _token=cls._token,
         )
 
+    def _sync_pose_gradients_ddp(self) -> None:
+        """Average otherwise-unsynced pose gradients that live outside DDP.
+
+        Averaging rank-local shard gradients gives the full-batch direction and keeps
+        pose updates in lockstep across ranks.
+        """
+        if self.world_size <= 1 or not self.dset.has_optimizer():
+            return
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        groups = self.dset.get_optimization_parameters()
+        for key in sorted(groups.keys()):
+            for p in groups[key]:
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p)
+                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
     def reconstruct(
         self,
         num_iter: int = 10,
@@ -131,6 +149,7 @@ class Tomography(TomographyOpt, TomographyBase):
         snapshot_every: int = 0,
         snapshot_dir: str | Path | None = None,
         snapshot_callback: Callable[[int, np.ndarray | None], None] | None = None,
+        pose_warmup_epochs: int = 0,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -138,6 +157,8 @@ class Tomography(TomographyOpt, TomographyBase):
         """
         if snapshot_every < 0:
             raise ValueError("snapshot_every must be >= 0.")
+        if pose_warmup_epochs < 0:
+            raise ValueError("pose_warmup_epochs must be >= 0.")
         if holdout_every < 1:
             raise ValueError("holdout_every must be >= 1.")
         if val_fraction > 0.0 and holdout_fraction > 0.0:
@@ -228,6 +249,16 @@ class Tomography(TomographyOpt, TomographyBase):
                 "Only TomographyINRDataset is supported for this reconstruction method."
             )
 
+        pose_warmup_pending = pose_warmup_epochs > 0 and self.dset.has_optimizer()
+        if pose_warmup_pending:
+            # remove_optimizer also clears the stored specs; restore those specs without
+            # rebuilding the optimizer/scheduler until the warmup finishes.
+            pose_optimizer_params = self.optimizer_params["pose"]
+            pose_scheduler_params = self.scheduler_params["pose"]
+            self.dset.remove_optimizer()
+            self.dset.optimizer_params = pose_optimizer_params
+            self.dset.scheduler_params = pose_scheduler_params
+
         N = max(self.obj_model.shape)
 
         if num_samples_per_ray is None:
@@ -247,6 +278,10 @@ class Tomography(TomographyOpt, TomographyBase):
 
         pbar = tqdm(range(num_iter), disable=not self.verbose)
         for a0 in pbar:
+            if pose_warmup_pending and a0 == pose_warmup_epochs:
+                self.dset.set_optimizer(self.optimizer_params["pose"])
+                self.dset.set_scheduler(self.scheduler_params["pose"], num_iter=num_iter)
+                pose_warmup_pending = False
             nvtx.range_push(f"epoch_{a0}")
             consistency_loss = torch.tensor(0.0, device=self.device)
             total_loss = torch.tensor(0.0, device=self.device)
@@ -332,6 +367,7 @@ class Tomography(TomographyOpt, TomographyBase):
                 nvtx.range_pop()
                 # Clip gradients
                 nvtx.range_push("clip_and_optim_step")
+                self._sync_pose_gradients_ddp()
                 torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)
                 self.step_optimizers()
                 nvtx.range_pop()
