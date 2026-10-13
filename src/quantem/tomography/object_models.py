@@ -18,8 +18,11 @@ from quantem.core.ml.models.model_base import PlanarDecompositionModel
 from quantem.core.ml.s3im import S3IMLoss
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.rng import RNGMixin
-from quantem.tomography.dataset_models import TomographyINRPretrainDataset
-from quantem.tomography.tomography_context import ReconstructionContext
+from quantem.tomography.dataset_models import (
+    TomographyINRPretrainDataset,
+    validate_distortion_params,
+)
+from quantem.tomography.tomography_context import ReconstructionContext, record_soft_term
 from quantem.tomography.utils import tv_loss_vol_sq
 
 
@@ -91,7 +94,18 @@ class ObjConstraintParams:
         tv_vol : float
             Total variation regularization weight for the 3-D volume.
         sparsity : float
-            Sparsity regularization weight; encourages near-zero activations.
+            Weight of an L1 penalty on the integrated projections ``ctx.pred`` (mean absolute
+            predicted pixel value). For a non-negative density this equals the density L1
+            norm along the batch rays up to the ray step scale.
+        distortion : float
+            Weight of the Mip-NeRF 360 distortion loss (Eq. 15) on the per-sample ray
+            weights ``w_k = sigma_k * ds``; see ``TomographyINRDataset.ray_distortion``.
+        distortion_norm : str
+            Per-ray normalisation of the distortion loss: ``"target"`` divides by the
+            squared measured projection, ``"pred"`` by the squared detached predicted
+            projection, ``"none"`` leaves it raw.
+        distortion_eps_rel : float
+            Relative floor of the distortion normaliser, ``eps = eps_rel**2 * mean(y**2)``.
         soft_constraint_keys : list[str]
             Constraint fields penalized softly during optimization.
         hard_constraint_keys : list[str]
@@ -108,10 +122,16 @@ class ObjConstraintParams:
         s3im_repeat_time: int = 10
         s3im_kernel: int = 4
         s3im_value_range: float = 1.0
+        distortion: float = 0.0
+        distortion_norm: str = "target"
+        distortion_eps_rel: float = 0.05
         _name: str = "obj_inr"
 
-        soft_constraint_keys = ["tv_vol", "sparsity", "s3im_weight"]
+        soft_constraint_keys = ["tv_vol", "sparsity", "s3im_weight", "distortion"]
         hard_constraint_keys = ["positivity", "shrinkage"]
+
+        def __post_init__(self):
+            validate_distortion_params(self.distortion_norm, self.distortion_eps_rel)
 
     @dataclass
     class ObjTensorDecompConstraints(Constraints):
@@ -126,6 +146,22 @@ class ObjConstraintParams:
             Shrinkage regularization strength; pushes values toward zero.
         tv_vol : float
             Total variation regularization weight for the 3-D volume.
+        tv_plane : float
+            Total variation regularization weight on the factor planes.
+        sparsity : float
+            Weight of an L1 penalty on the per-sample densities ``ctx.all_densities``.
+        l21_plane : float
+            Weight of the TILTED group-sparsity penalty (``FactoredGrid.l12_cost``): the
+            mean, over every level and every plane group (first grid axis), of the RMS of
+            that group's features.
+        distortion : float
+            Weight of the Mip-NeRF 360 distortion loss (Eq. 15) on the per-sample ray
+            weights ``w_k = sigma_k * ds``; see ``TomographyINRDataset.ray_distortion``.
+        distortion_norm : str
+            Per-ray normalisation of the distortion loss: ``"target"``, ``"pred"`` or
+            ``"none"``.
+        distortion_eps_rel : float
+            Relative floor of the distortion normaliser, ``eps = eps_rel**2 * mean(y**2)``.
         soft_constraint_keys : list[str]
             Constraint fields penalized softly during optimization.
         hard_constraint_keys : list[str]
@@ -148,10 +184,24 @@ class ObjConstraintParams:
         s3im_repeat_time: int = 10
         s3im_kernel: int = 4
         s3im_value_range: float = 1.0
+        l21_plane: float = 0.0
+        distortion: float = 0.0
+        distortion_norm: str = "target"
+        distortion_eps_rel: float = 0.05
         _name: str = "obj_tensor_decomp"
 
-        soft_constraint_keys = ["tv_vol", "tv_plane", "sparsity", "s3im_weight"]
+        soft_constraint_keys = [
+            "tv_vol",
+            "tv_plane",
+            "sparsity",
+            "s3im_weight",
+            "l21_plane",
+            "distortion",
+        ]
         hard_constraint_keys = ["positivity", "shrinkage"]
+
+        def __post_init__(self):
+            validate_distortion_params(self.distortion_norm, self.distortion_eps_rel)
 
     @classmethod
     def parse_dict(
@@ -586,13 +636,20 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         self,
         ctx: ReconstructionContext,
     ) -> torch.Tensor:
+        """Return the summed weighted soft-constraint loss for one training batch.
+
+        Each enabled term is also written (detached) into ``ctx.soft_terms`` when the
+        caller supplied that dict; the returned total does not depend on it.
+        """
         device = ctx.coords.device if ctx.coords is not None else self._device
         soft_loss = torch.tensor(0.0, device=device)
         if self.constraints.tv_vol > 0:
             assert ctx.coords is not None, (
                 "coords must be provided for INR object model to compute the TV loss"
             )
-            soft_loss += self.get_tv_loss(ctx)
+            tv_vol_loss = self.get_tv_loss(ctx)
+            record_soft_term(ctx, "tv_vol", tv_vol_loss)
+            soft_loss += tv_vol_loss
 
         if (
             isinstance(self.constraints, ObjConstraintParams.ObjINRConstraints)
@@ -602,12 +659,33 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                 "pred must be provided for INR object model to compute the sparsity loss"
             )
             sparsity_loss = self.constraints.sparsity * ctx.pred.abs().mean()
+            record_soft_term(ctx, "sparsity", sparsity_loss)
             soft_loss += sparsity_loss
 
         if getattr(self.constraints, "s3im_weight", 0.0) > 0:
-            soft_loss += self.get_s3im_loss(ctx)
+            s3im_loss = self.get_s3im_loss(ctx)
+            record_soft_term(ctx, "s3im", s3im_loss)
+            soft_loss += s3im_loss
+
+        if getattr(self.constraints, "distortion", 0.0) > 0:
+            distortion_loss = self.get_distortion_loss(ctx)
+            record_soft_term(ctx, "distortion", distortion_loss)
+            soft_loss += distortion_loss
 
         return soft_loss
+
+    def get_distortion_loss(self, ctx: ReconstructionContext) -> torch.Tensor:
+        """Weight the dataset-computed ray distortion loss ``ctx.distortion``.
+
+        The unweighted value must be computed by ``TomographyINRDataset.ray_distortion``
+        before ``integrate_rays`` consumes the per-batch ray metadata.
+        """
+        if ctx.distortion is None:
+            raise ValueError(
+                "constraints.distortion > 0 but ctx.distortion is None; the training loop "
+                "must call dset.ray_distortion before integrate_rays and pass the result."
+            )
+        return self.constraints.distortion * ctx.distortion
 
     def apply_hard_constraints(self, pred: torch.Tensor) -> torch.Tensor:
         """
@@ -1059,6 +1137,13 @@ class ObjectTensorDecomp(ObjectINR):
     # --- Constraints ---
 
     def apply_soft_constraints(self, ctx: ReconstructionContext) -> torch.Tensor:
+        """Return the summed weighted soft-constraint loss for one training batch.
+
+        Terms: plane/volume TV, density L1 ``sparsity`` on ``ctx.all_densities``, S3IM,
+        TILTED group sparsity ``l21_plane`` and the ray ``distortion`` loss. Each enabled
+        term is also written (detached) into ``ctx.soft_terms`` when the caller supplied
+        that dict; the returned total does not depend on it.
+        """
         soft_loss = torch.tensor(
             0.0, device=ctx.pred.device if ctx.pred is not None else self.device
         )
@@ -1072,12 +1157,46 @@ class ObjectTensorDecomp(ObjectINR):
                 "All densities must be provided for sparsity loss"
             )
             sparsity_loss = self.constraints.sparsity * ctx.all_densities.abs().mean()
+            record_soft_term(ctx, "sparsity", sparsity_loss)
             soft_loss += sparsity_loss
 
         if self.constraints.s3im_weight > 0:
-            soft_loss += self.get_s3im_loss(ctx)
+            s3im_loss = self.get_s3im_loss(ctx)
+            record_soft_term(ctx, "s3im", s3im_loss)
+            soft_loss += s3im_loss
+
+        if getattr(self.constraints, "l21_plane", 0.0) > 0:
+            l21_loss = self.get_plane_l21_loss()
+            record_soft_term(ctx, "l21_plane", l21_loss)
+            soft_loss += l21_loss
+
+        if getattr(self.constraints, "distortion", 0.0) > 0:
+            distortion_loss = self.get_distortion_loss(ctx)
+            record_soft_term(ctx, "distortion", distortion_loss)
+            soft_loss += distortion_loss
 
         return soft_loss
+
+    def get_plane_l21_loss(self) -> torch.Tensor:
+        """Weighted TILTED group-sparsity (l2,1) penalty on the factor planes.
+
+        Port of TILTED ``FactoredGrid.l12_cost`` (Yi et al. 2023, arXiv 2308.15461, A.3):
+        every grid level is a ``(G, C, H, W)`` tensor whose first axis indexes the plane
+        groups (``G = 3`` for KPlanes, ``3T`` for KPlanesTILTED). Each group contributes
+        ``sqrt(mean(group**2) + 1e-12)`` and the penalty is the mean over all (level,
+        group) pairs, times ``constraints.l21_plane``.
+        """
+        model = _unwrap(self.model)
+        group_norms = []
+        for grid in model.grids:
+            if grid.dim() != 4:
+                raise NotImplementedError(
+                    "l21_plane needs plane grids shaped (groups, C, H, W); "
+                    f"{type(model).__name__} has a grid of shape {tuple(grid.shape)}."
+                )
+            flat = grid.reshape(grid.shape[0], -1)
+            group_norms.append(torch.sqrt(flat.pow(2).mean(dim=1) + 1e-12))
+        return self.constraints.l21_plane * torch.cat(group_norms).mean()
 
     # TV Losses
 
@@ -1092,11 +1211,15 @@ class ObjectTensorDecomp(ObjectINR):
         assert ctx.pred is not None, "Prediction must be provided for TV loss"
         tv_loss = torch.tensor(0.0, device=ctx.pred.device)
         if self.constraints.tv_plane > 0:
-            tv_loss = tv_loss + self._get_plane_tv_loss()
+            plane_tv_loss = self._get_plane_tv_loss()
+            record_soft_term(ctx, "tv_plane", plane_tv_loss)
+            tv_loss = tv_loss + plane_tv_loss
         if self.constraints.tv_vol > 0:
-            tv_loss = tv_loss + self.get_volume_tv_loss(
+            volume_tv_loss = self.get_volume_tv_loss(
                 ctx.coords, precomputed_tap_densities=ctx.tv_tap_densities
             )
+            record_soft_term(ctx, "tv_vol", volume_tv_loss)
+            tv_loss = tv_loss + volume_tv_loss
         return tv_loss
 
     def _get_plane_tv_loss(self) -> torch.Tensor:

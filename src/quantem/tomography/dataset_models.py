@@ -702,6 +702,50 @@ class DeviceBatchSampler:
             }
 
 
+DISTORTION_NORMS = ("target", "pred", "none")
+
+
+def validate_distortion_params(norm: str, eps_rel: float) -> None:
+    """Raise ``ValueError`` for an unknown distortion norm or a non-positive ``eps_rel``.
+
+    ``eps_rel`` only enters the ``"target"`` and ``"pred"`` normalisations, so it is
+    checked for those norms only.
+    """
+    if norm not in DISTORTION_NORMS:
+        raise ValueError(f"distortion norm must be one of {DISTORTION_NORMS}, got {norm!r}")
+    if norm != "none" and not float(eps_rel) > 0.0:
+        raise ValueError(f"distortion_eps_rel must be > 0 for norm {norm!r}, got {eps_rel!r}")
+
+
+def padded_ray_distortion(densities: torch.Tensor, step_sizes: torch.Tensor) -> torch.Tensor:
+    """Per-ray Mip-NeRF 360 distortion loss (Barron et al. 2022, Eq. 15) in O(n).
+
+    ``densities`` is a zero-padded ``(R, n)`` layout of per-sample densities and
+    ``step_sizes`` the ``(R,)`` per-ray sample spacing ``ds_r``. Weights are
+    ``w_k = densities[:, k] * ds_r`` at positions ``t_k = k * ds_r`` and each ray returns
+    ``L_r = sum_ij w_i w_j |t_i - t_j| + (1/3) sum_i w_i**2 ds_r``. The pairwise sum is
+    evaluated as ``2 sum_i w_i (t_i W_<i - WT_<i)`` from exclusive per-row cumulative sums
+    ``W_<i = sum_{j<i} w_j`` and ``WT_<i = sum_{j<i} w_j t_j``; zero padding contributes
+    nothing. The computation runs in float64 whatever the input dtype (the difference
+    ``t_i W_<i - WT_<i`` cancels badly in float32 on long rays) and the ``(R,)`` result is
+    cast back to ``densities.dtype``.
+    """
+    step = step_sizes.to(device=densities.device, dtype=torch.float64).unsqueeze(1)
+    weights = densities.to(torch.float64) * step
+    sample_index = torch.arange(
+        densities.shape[1], device=densities.device, dtype=torch.float64
+    ).unsqueeze(0)
+    positions = sample_index * step
+    weighted_positions = weights * positions
+    weights_before = torch.nn.functional.pad(torch.cumsum(weights, dim=1)[:, :-1], (1, 0))
+    weighted_positions_before = torch.nn.functional.pad(
+        torch.cumsum(weighted_positions, dim=1)[:, :-1], (1, 0)
+    )
+    inter = 2.0 * (weights * (positions * weights_before - weighted_positions_before)).sum(dim=1)
+    intra = weights.pow(2).sum(dim=1) * step.squeeze(1) / 3.0
+    return (inter + intra).to(densities.dtype)
+
+
 class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
     """
     Dataset class for INR-based tomography.
@@ -1105,6 +1149,7 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             "local_ray_ids": local_ray_ids,
             "step_sizes": step_sizes_v,
             "num_valid": int(origins_v.shape[0]),
+            "sample_mask": sample_mask_v,
         }
 
         all_coords = coords_v[sample_mask_v]
@@ -1116,6 +1161,82 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         if getattr(self, "ray_sampling", "legacy") == "box_fixed_ds":
             return self._integrate_rays_box_fixed_ds(rays, target_values_len)
         return self._integrate_rays_legacy(rays, num_samples_per_ray, target_values_len)
+
+    def ray_distortion(
+        self,
+        all_densities: torch.Tensor,
+        target: torch.Tensor,
+        norm: str = "target",
+        eps_rel: float = 0.05,
+    ) -> torch.Tensor:
+        """Batch-mean Mip-NeRF 360 distortion loss of the current batch's rays (unweighted).
+
+        Must be called after ``get_coords`` and BEFORE ``integrate_rays``: in
+        ``box_fixed_ds`` mode it reads (and does not clear) the per-batch ray metadata
+        that ``integrate_rays`` consumes. ``all_densities`` are the per-sample model
+        outputs exactly as ``integrate_rays`` receives them (box mask and positivity
+        already applied by the object model's forward), so the per-ray weights
+        ``w_k = sigma_k * ds_r`` sum to the predicted projection ``p_r``. Sample positions
+        are ``t_k = k * ds_r`` in physical box units with no per-ray rescaling; see
+        :func:`padded_ray_distortion` for the per-ray formula. The step ``ds_r`` is
+        detached, which only blocks the gradient path through the ray length; the loss
+        still reaches the pose through ``sigma_k(coords(pose))``, as intended. In
+        ``legacy`` mode the samples are ``(B, n)`` with step ``2 / (n - 1)``.
+
+        ``norm`` selects the per-ray normalisation: ``"target"`` divides by
+        ``y_r**2 + eps``, ``"pred"`` by ``p_r.detach()**2 + eps``, ``"none"`` returns the
+        raw loss; ``eps = eps_rel**2 * mean(y**2)`` over the batch's valid rays and
+        ``eps_rel`` must be > 0 for the normalised variants. Returns the mean over valid
+        rays as a scalar differentiable w.r.t. ``all_densities``. A batch with no valid
+        ray, or (for ``"target"``/``"pred"``) whose valid rays all have zero target, gives
+        a zero that still carries the graph.
+        """
+        validate_distortion_params(norm, eps_rel)
+        target = target.to(device=all_densities.device, dtype=all_densities.dtype)
+        if getattr(self, "ray_sampling", "legacy") == "box_fixed_ds":
+            meta = self._ray_meta
+            if meta is None:
+                raise RuntimeError(
+                    "ray_distortion called in 'box_fixed_ds' mode without ray metadata; "
+                    "call it after get_coords and before integrate_rays."
+                )
+            valid = meta["valid"]
+            if not bool(valid.any()):
+                return all_densities.sum() * 0.0
+            sample_mask = meta["sample_mask"]
+            step_sizes = meta["step_sizes"].detach().to(all_densities.dtype)
+            padded_densities = all_densities.new_zeros(sample_mask.shape).masked_scatter(
+                sample_mask, all_densities
+            )
+            ray_targets = target[valid]
+        else:
+            num_rays = int(target.shape[0])
+            if num_rays == 0:
+                return all_densities.sum() * 0.0
+            if all_densities.numel() % num_rays != 0:
+                raise ValueError(
+                    f"{all_densities.numel()} samples cannot be split evenly over {num_rays} rays"
+                )
+            num_samples = all_densities.numel() // num_rays
+            if num_samples < 2:
+                raise ValueError("legacy ray sampling needs at least 2 samples per ray")
+            padded_densities = all_densities.reshape(num_rays, num_samples)
+            step_sizes = all_densities.new_full((num_rays,), 2.0 / (num_samples - 1))
+            ray_targets = target
+
+        per_ray = padded_ray_distortion(padded_densities, step_sizes)
+        if norm == "none":
+            return per_ray.mean()
+        target_power = ray_targets.pow(2).mean()
+        if not bool(target_power > 0):
+            return all_densities.sum() * 0.0
+        eps = (float(eps_rel) ** 2) * target_power
+        if norm == "target":
+            reference = ray_targets.pow(2)
+        else:
+            reference = (padded_densities.detach().sum(dim=1) * step_sizes).pow(2)
+        denominator = (reference + eps).clamp_min(torch.finfo(per_ray.dtype).tiny)
+        return (per_ray / denominator).mean()
 
     @staticmethod
     @torch.compile(mode="reduce-overhead")

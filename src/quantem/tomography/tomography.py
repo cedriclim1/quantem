@@ -286,6 +286,14 @@ class Tomography(TomographyOpt, TomographyBase):
             consistency_loss = torch.tensor(0.0, device=self.device)
             total_loss = torch.tensor(0.0, device=self.device)
             epoch_soft_constraint_loss = torch.tensor(0.0, device=self.device)
+            epoch_soft_terms: dict[str, torch.Tensor] = {}
+            active_obj_constraints = self.obj_model.constraints
+            distortion_enabled = getattr(active_obj_constraints, "distortion", 0.0) > 0
+            active_dset_constraints = getattr(self.dset, "constraints", None)
+            pose_tv_enabled = (
+                getattr(active_dset_constraints, "tv_zs", 0.0) > 0
+                or getattr(active_dset_constraints, "tv_shifts", 0.0) > 0
+            )
             if isinstance(self.obj_model, ObjectINR) or isinstance(
                 self.obj_model, ObjectTensorDecomp
             ):
@@ -328,6 +336,19 @@ class Tomography(TomographyOpt, TomographyBase):
                         tv_tap_raw = None
                     nvtx.range_pop()
 
+                    batch_distortion = None
+                    target = None
+                    if distortion_enabled:
+                        nvtx.range_push("ray_distortion")
+                        target = batch["target_value"].to(self.device, non_blocking=True).float()
+                        batch_distortion = self.dset.ray_distortion(
+                            all_densities,
+                            target,
+                            norm=active_obj_constraints.distortion_norm,
+                            eps_rel=active_obj_constraints.distortion_eps_rel,
+                        )
+                        nvtx.range_pop()
+
                     nvtx.range_push("integrate_rays")
                     integrated_densities = self.dset.integrate_rays(
                         all_densities,
@@ -338,9 +359,11 @@ class Tomography(TomographyOpt, TomographyBase):
 
                 pred = integrated_densities.float()
 
-                target = batch["target_value"].to(self.device, non_blocking=True).float()
+                if target is None:
+                    target = batch["target_value"].to(self.device, non_blocking=True).float()
 
                 nvtx.range_push("soft_constraints")
+                batch_soft_terms: dict[str, torch.Tensor] = {}
                 soft_constraints_loss = self.obj_model.apply_soft_constraints(
                     ctx=ReconstructionContext(
                         coords=all_coords,
@@ -348,6 +371,8 @@ class Tomography(TomographyOpt, TomographyBase):
                         all_densities=all_densities,
                         target=target,
                         tv_tap_densities=tv_tap_raw,
+                        distortion=batch_distortion,
+                        soft_terms=batch_soft_terms,
                     )
                 )
                 nvtx.range_pop()
@@ -355,9 +380,17 @@ class Tomography(TomographyOpt, TomographyBase):
                 nvtx.range_push("consistency_loss")
                 batch_consistency_loss = loss_func(pred, target)
 
-                soft_constraints_loss += self.dset.apply_soft_constraints()
+                dataset_soft_loss = self.dset.apply_soft_constraints()
+                soft_constraints_loss += dataset_soft_loss
+                if pose_tv_enabled:
+                    batch_soft_terms["pose_tv"] = dataset_soft_loss.detach()
 
                 epoch_soft_constraint_loss += soft_constraints_loss.detach()
+                for term_name, term_value in batch_soft_terms.items():
+                    if term_name in epoch_soft_terms:
+                        epoch_soft_terms[term_name] += term_value.float()
+                    else:
+                        epoch_soft_terms[term_name] = term_value.float().clone()
 
                 batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
                 nvtx.range_pop()
@@ -417,6 +450,16 @@ class Tomography(TomographyOpt, TomographyBase):
                 losses / len(self.dataloader)
             ).tolist()
 
+            soft_term_names = sorted(epoch_soft_terms)
+            epoch_soft_term_values: dict[str, float] = {}
+            if soft_term_names:
+                soft_term_losses = torch.stack([epoch_soft_terms[name] for name in soft_term_names])
+                if self.world_size > 1:
+                    dist.all_reduce(soft_term_losses, dist.ReduceOp.AVG)
+                epoch_soft_term_values = dict(
+                    zip(soft_term_names, (soft_term_losses / len(self.dataloader)).tolist())
+                )
+
             self.step_schedulers(loss=total_loss)
             # TODO: Maybe reorganize the losses so that the order makes sense lol.
 
@@ -462,6 +505,9 @@ class Tomography(TomographyOpt, TomographyBase):
             self._consistency_losses.append(consistency_loss)
             self.append_learning_rates(self.get_current_lrs())
             self.obj_model._soft_constraint_losses.append(epoch_soft_constraint_loss)
+            if not hasattr(self, "_soft_term_losses"):
+                self._soft_term_losses = []
+            self._soft_term_losses.append(epoch_soft_term_values)
             if avg_val_loss is not None:
                 self._val_losses.append(avg_val_loss)
 
@@ -494,6 +540,7 @@ class Tomography(TomographyOpt, TomographyBase):
                         val_fg_loss=avg_val_fg_loss,
                         val_bg_loss=avg_val_bg_loss,
                         grad_step=self._grad_steps,
+                        soft_terms=epoch_soft_term_values,
                     )
 
                 self.logger.flush()

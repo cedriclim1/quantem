@@ -62,7 +62,14 @@ class LoggerTomography(LoggerBase):
         val_fg_loss: float | None = None,
         val_bg_loss: float | None = None,
         grad_step: int | None = None,
+        soft_terms: Mapping[str, float] | None = None,
     ):
+        """Log one epoch's scalars.
+
+        ``soft_terms`` maps each enabled weighted object soft-constraint term (e.g.
+        ``tv_plane``, ``sparsity``, ``l21_plane``, ``distortion``) to its epoch mean and is
+        logged as ``loss/soft/<name>`` next to the aggregate ``loss/soft``.
+        """
         extra_steps = {"grad_step": grad_step} if grad_step is not None else None
         self.log_scalar("loss/consistency", consistency_loss, iter, extra_steps=extra_steps)
         self.log_scalar("loss/total", total_loss, iter, extra_steps=extra_steps)
@@ -72,6 +79,10 @@ class LoggerTomography(LoggerBase):
             iter,
             extra_steps=extra_steps,
         )
+        for term_name, term_value in (soft_terms or {}).items():
+            self.log_scalar(
+                f"loss/soft/{term_name}", float(term_value), iter, extra_steps=extra_steps
+            )
         self.log_scalar("num_samples_per_ray", num_samples_per_ray, iter, extra_steps=extra_steps)
         for param_name, lr_value in learning_rates.items():
             self.log_scalar(

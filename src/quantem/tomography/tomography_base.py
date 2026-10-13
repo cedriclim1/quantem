@@ -50,6 +50,7 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         self._epoch_losses: list[float] = []
         self._consistency_losses: list[float] = []
         self._val_losses: list[float] = []
+        self._soft_term_losses: list[dict[str, float]] = []
         self._lrs: dict[str, list] = {}
         self._grad_steps: int = 0
         # DDP Initialization
@@ -132,6 +133,13 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         Returns the consistency loss for each epoch ran.
         """
         return np.array(self._consistency_losses)
+
+    @property
+    def soft_term_losses(self) -> list[dict[str, float]]:
+        """
+        Returns, per epoch ran, each weighted object soft-constraint term averaged over batches.
+        """
+        return list(getattr(self, "_soft_term_losses", []))
 
     @property
     def learning_rates(self) -> dict[str, list]:
