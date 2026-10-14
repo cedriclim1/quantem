@@ -105,7 +105,7 @@ class TestGPUPrecision:
     def test_setup_distributed_disables_tf32(self):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        ObjectTensorDecomp.from_model(_tilted(), shape=(8, 8, 8), device="cuda")
+        ObjectTensorDecomp.from_model(_tilted(), shape=(8, 8, 8), device="cuda:0")
         assert torch.backends.cuda.matmul.allow_tf32 is False
         assert torch.backends.cudnn.allow_tf32 is False
 
@@ -115,11 +115,11 @@ class TestGPUPrecision:
     def test_forward_runs_model_in_bf16_returns_fp32(self, kind, flag):
         if kind == "hsiren":
             obj = ObjectINR.from_model(
-                HSiren(hidden_layers=1, hidden_features=16), shape=(8, 8, 8), device="cuda"
+                HSiren(hidden_layers=1, hidden_features=16), shape=(8, 8, 8), device="cuda:0"
             )
         else:
             model = _tilted() if kind == "kplanes_tilted" else _cptilted()
-            obj = ObjectTensorDecomp.from_model(model, shape=(8, 8, 8), device="cuda")
+            obj = ObjectTensorDecomp.from_model(model, shape=(8, 8, 8), device="cuda:0")
         coords = _points().cuda()
         with _LinearDtypes() as rec, _tomography_autocast("cuda", flag):
             out = obj.forward(coords)
@@ -129,7 +129,7 @@ class TestGPUPrecision:
 
     @requires_bf16
     def test_blur_stays_fp32_under_autocast(self):
-        grid = torch.rand(6, 2, 16, 16, device="cuda")
+        grid = torch.rand(6, 2, 16, 16, device="cuda:0")
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = gaussian_blur_planes(grid, 1.5)
         assert out.dtype == torch.float32
@@ -202,8 +202,8 @@ def _tomo(c2f: bool = False):
         model = KPlanesTILTED(
             M_features=2, resolution=(8, 8, 8), multiscale_res_multipliers=[1, 2], T=2, **extra
         )
-    obj = ObjectTensorDecomp.from_model(model, shape=(8, 8, 8), device="cuda")
-    return Tomography.from_models(dset=_dataset(), obj_model=obj, device="cuda", verbose=False)
+    obj = ObjectTensorDecomp.from_model(model, shape=(8, 8, 8), device="cuda:0")
+    return Tomography.from_models(dset=_dataset(), obj_model=obj, device="cuda:0", verbose=False)
 
 
 def _spy_fp32_paths(monkeypatch, tomo):
