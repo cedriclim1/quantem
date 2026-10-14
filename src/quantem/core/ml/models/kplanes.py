@@ -2,6 +2,7 @@
 Tensor Decomposition Methods for INR-based reconstructions
 """
 
+import copy
 import itertools
 import math
 from typing import Callable, Optional, Sequence
@@ -448,8 +449,9 @@ def gaussian_blur_planes(grid: torch.Tensor, sigma: float) -> torch.Tensor:
 
 
 def extract_tau_state(so3: SO3ParamQuat | SO3ParamR9SVD) -> torch.Tensor:
-    """Detached CPU (T, 3, 3) rotation matrices of an SO(3) bank."""
-    return so3.as_matrix().detach().cpu().clone()
+    """Detached CPU float32 (T, 3, 3) rotations of an SO(3) bank, computed in float64."""
+    with torch.no_grad():
+        return copy.deepcopy(so3).to("cpu", torch.float64).as_matrix().float()
 
 
 class KPlanesTILTED(KPlanes):

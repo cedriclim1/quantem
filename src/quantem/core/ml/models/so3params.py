@@ -114,7 +114,7 @@ class SO3ParamQuat(nn.Module):
         """Overwrite the bank in place with the rotations R (T, 3, 3)."""
         _check_rotation_shape(R, self.quats.shape[0])
         with torch.no_grad():
-            R = SO3ParamR9SVD.r9_to_rotmat(R.to(self.quats.device, self.quats.dtype))
+            R = SO3ParamR9SVD.r9_to_rotmat(R.detach().to("cpu", torch.float64))
             self.quats.copy_(self.rotmat_to_quat(R))
 
     def extra_repr(self) -> str:
@@ -203,7 +203,7 @@ class SO3ParamR9SVD(nn.Module):
         """Overwrite the bank in place with the rotations R (T, 3, 3)."""
         _check_rotation_shape(R, self.M.shape[0])
         with torch.no_grad():
-            R = self.r9_to_rotmat(R.to(self.M.device, self.M.dtype))
+            R = self.r9_to_rotmat(R.detach().to("cpu", torch.float64))
             self.M.copy_(self.rotmat_to_r9(R))
 
     @classmethod
