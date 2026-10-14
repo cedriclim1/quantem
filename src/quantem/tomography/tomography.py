@@ -189,6 +189,12 @@ class Tomography(TomographyOpt, TomographyBase):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
         I.e, auto-detection through the obj model type, while both share the same pose optimization.
+
+        ``use_bfloat16``: on CUDA, only the object-model forward runs under bf16 autocast
+        (TILTED point rotation, the r9svd SVD, plane blur and fused kernels stay FP32
+        inside it) and its output is upcast to FP32. Coordinates, rays and pose,
+        ray integration, every loss and soft term, and holdout validation run in FP32.
+        ``False`` is pure FP32 (no autocast; TF32 is disabled in ``setup_distributed``).
         """
         if snapshot_every < 0:
             raise ValueError("snapshot_every must be >= 0.")
@@ -361,13 +367,13 @@ class Tomography(TomographyOpt, TomographyBase):
             for batch_idx, batch in enumerate(self.dataloader):
                 nvtx.range_push("batch")
                 self.zero_grad_all()
-                with _tomography_autocast(self.device, use_bfloat16):
-                    nvtx.range_push("get_coords")
-                    all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
-                    nvtx.range_pop()
+                nvtx.range_push("get_coords")
+                all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
+                nvtx.range_pop()
 
-                    nvtx.range_push("obj_forward")
-                    tap_coords = self.obj_model.sample_tv_tap_coords(all_coords)
+                nvtx.range_push("obj_forward")
+                tap_coords = self.obj_model.sample_tv_tap_coords(all_coords)
+                with _tomography_autocast(self.device, use_bfloat16):
                     if tap_coords is not None:
                         all_densities, tv_tap_raw = self.obj_model.forward_with_tv_taps(
                             all_coords, tap_coords
@@ -375,28 +381,28 @@ class Tomography(TomographyOpt, TomographyBase):
                     else:
                         all_densities = self.obj_model.forward(all_coords)
                         tv_tap_raw = None
-                    nvtx.range_pop()
+                nvtx.range_pop()
 
-                    batch_distortion = None
-                    target = None
-                    if distortion_enabled:
-                        nvtx.range_push("ray_distortion")
-                        target = batch["target_value"].to(self.device, non_blocking=True).float()
-                        batch_distortion = self.dset.ray_distortion(
-                            all_densities,
-                            target,
-                            norm=active_obj_constraints.distortion_norm,
-                            eps_rel=active_obj_constraints.distortion_eps_rel,
-                        )
-                        nvtx.range_pop()
-
-                    nvtx.range_push("integrate_rays")
-                    integrated_densities = self.dset.integrate_rays(
+                batch_distortion = None
+                target = None
+                if distortion_enabled:
+                    nvtx.range_push("ray_distortion")
+                    target = batch["target_value"].to(self.device, non_blocking=True).float()
+                    batch_distortion = self.dset.ray_distortion(
                         all_densities,
-                        curr_num_samples_per_ray,
-                        len(batch["target_value"]),
+                        target,
+                        norm=active_obj_constraints.distortion_norm,
+                        eps_rel=active_obj_constraints.distortion_eps_rel,
                     )
                     nvtx.range_pop()
+
+                nvtx.range_push("integrate_rays")
+                integrated_densities = self.dset.integrate_rays(
+                    all_densities,
+                    curr_num_samples_per_ray,
+                    len(batch["target_value"]),
+                )
+                nvtx.range_pop()
 
                 pred = integrated_densities.float()
 
@@ -799,20 +805,18 @@ class Tomography(TomographyOpt, TomographyBase):
         try:
             with torch.no_grad():
                 for batch in dataloader:
+                    all_coords = self.dset.get_coords(batch, object_extent, num_samples_per_ray)
                     with _tomography_autocast(self.device, use_bfloat16):
-                        all_coords = self.dset.get_coords(
-                            batch, object_extent, num_samples_per_ray
-                        )
                         all_densities = self.obj_model.forward(all_coords)
-                        integrated_densities = self.dset.integrate_rays(
-                            all_densities,
-                            num_samples_per_ray,
-                            len(batch["target_value"]),
-                        )
-                        target = batch["target_value"].to(self.device, non_blocking=True).float()
-                        batch_val_loss = loss_func(integrated_densities.float(), target)
-                        val_loss += batch_val_loss.detach()
-                        val_batches += 1.0
+                    integrated_densities = self.dset.integrate_rays(
+                        all_densities,
+                        num_samples_per_ray,
+                        len(batch["target_value"]),
+                    )
+                    target = batch["target_value"].to(self.device, non_blocking=True).float()
+                    batch_val_loss = loss_func(integrated_densities.float(), target)
+                    val_loss += batch_val_loss.detach()
+                    val_batches += 1.0
         finally:
             self.obj_model.model.train(model_was_training)
             self.dset.train(dset_was_training)

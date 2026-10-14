@@ -101,6 +101,7 @@ class TomographyLiteINR(Tomography):
         snapshot_every: int = 0,
         snapshot_dir: str | Path | None = None,
         snapshot_callback: Callable[[int, np.ndarray | None], None] | None = None,
+        use_bfloat16: bool = True,
     ):
         if self.num_epochs == 0:
             opt_params = {
@@ -148,6 +149,7 @@ class TomographyLiteINR(Tomography):
             snapshot_every=snapshot_every,
             snapshot_dir=snapshot_dir,
             snapshot_callback=snapshot_callback,
+            use_bfloat16=use_bfloat16,
         )
 
 

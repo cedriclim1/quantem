@@ -325,11 +325,18 @@ class KPlanes(PPLR, TensorDecompositionModel):
 # ---------------------------------------------------------------------------
 
 
+_KERNEL_CASTABLE_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
+
+
 def _rotate_tilted_points_fp32(
     pts: torch.Tensor, rotation_matrices: torch.Tensor
 ) -> torch.Tensor:
+    """Rotate points by every TILTED rotation with autocast off, in at least FP32."""
+    dtype = torch.promote_types(
+        torch.promote_types(pts.dtype, rotation_matrices.dtype), torch.float32
+    )
     with torch.autocast(device_type=pts.device.type, enabled=False):
-        return torch.einsum("tij,bj->tbi", rotation_matrices.float(), pts.float())
+        return torch.einsum("tij,bj->tbi", rotation_matrices.to(dtype), pts.to(dtype))
 
 
 def interpolate_ms_features_tilted(
@@ -351,25 +358,31 @@ def interpolate_ms_features_tilted(
     on a CUDA device, and the ``use_cuda_kernels`` config option is true
     (default), each scale dispatches to the fused CUDA kernel (rotate +
     grid_sample + Hadamard product in one launch, analytic backward) —
-    identical semantics to the torch path below, including scale_gates.
+    identical semantics to the torch path below, including scale_gates. The
+    kernel is FP32-only: bfloat16/float16 inputs are cast to FP32 (autocast
+    disabled, differentiably) and the features come back in FP32; float64
+    inputs take the torch path so their precision is kept.
     """
     T = rotation_matrices.shape[0]
     B = pts.shape[0]
 
     if (
         pts.is_cuda
-        and pts.dtype == torch.float32
-        and rotation_matrices.dtype == torch.float32
-        and all(g.dtype == torch.float32 for g in ms_grids)
+        and all(
+            t.dtype in _KERNEL_CASTABLE_DTYPES for t in (pts, rotation_matrices, *ms_grids)
+        )
         and config.get("has_quantem_cuda")
         and config.get("use_cuda_kernels", default=True)
     ):
         from quantem.cuda.core.ml import kplanes_tilted_fuse
 
-        feats = [kplanes_tilted_fuse(pts, rotation_matrices, g) for g in ms_grids]
-        if scale_gates is not None:
-            feats = [f * scale_gates[si] for si, f in enumerate(feats)]
-        return torch.cat(feats, dim=-1)
+        with torch.autocast(device_type=pts.device.type, enabled=False):
+            pts32 = pts.float()
+            rot32 = rotation_matrices.float()
+            feats = [kplanes_tilted_fuse(pts32, rot32, g.float()) for g in ms_grids]
+            if scale_gates is not None:
+                feats = [f * scale_gates[si] for si, f in enumerate(feats)]
+            return torch.cat(feats, dim=-1)
 
     # (T, B, 3)  — rotate all points by all rotations at once
     rotated = _rotate_tilted_points_fp32(pts, rotation_matrices)
@@ -438,19 +451,24 @@ def c2f_blur_sigma(progress: float, sigma0: float, blur_frac: float) -> float:
 
 
 def gaussian_blur_planes(grid: torch.Tensor, sigma: float) -> torch.Tensor:
-    """Separable, differentiable Gaussian low-pass over the last two axes (replicate padding)."""
+    """Separable, differentiable Gaussian low-pass over the last two axes (replicate padding).
+
+    Runs with autocast disabled, so the blurred planes keep the grid's dtype (FP32)
+    under a bf16 autocast forward.
+    """
     if sigma <= 0:
         return grid
     radius = max(1, math.ceil(3.0 * sigma))
-    support = torch.arange(-radius, radius + 1, device=grid.device, dtype=grid.dtype)
-    kernel = torch.exp(-0.5 * (support / sigma) ** 2)
-    kernel = kernel / kernel.sum()
-    K = kernel.numel()
-    shape = grid.shape
-    x = grid.reshape(-1, 1, shape[-2], shape[-1])
-    x = F.conv2d(F.pad(x, (radius, radius, 0, 0), mode="replicate"), kernel.view(1, 1, 1, K))
-    x = F.conv2d(F.pad(x, (0, 0, radius, radius), mode="replicate"), kernel.view(1, 1, K, 1))
-    return x.reshape(shape)
+    with torch.autocast(device_type=grid.device.type, enabled=False):
+        support = torch.arange(-radius, radius + 1, device=grid.device, dtype=grid.dtype)
+        kernel = torch.exp(-0.5 * (support / sigma) ** 2)
+        kernel = kernel / kernel.sum()
+        K = kernel.numel()
+        shape = grid.shape
+        x = grid.reshape(-1, 1, shape[-2], shape[-1])
+        x = F.conv2d(F.pad(x, (radius, radius, 0, 0), mode="replicate"), kernel.view(1, 1, 1, K))
+        x = F.conv2d(F.pad(x, (0, 0, radius, radius), mode="replicate"), kernel.view(1, 1, K, 1))
+        return x.reshape(shape)
 
 
 def extract_tau_state(so3: SO3ParamQuat | SO3ParamR9SVD) -> torch.Tensor:

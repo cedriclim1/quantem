@@ -86,7 +86,9 @@ def tv_loss_vol_sq(obj: torch.Tensor) -> torch.Tensor:
     (``pip install quantem[cuda]``), the tensor is on a CUDA device, and the
     ``use_cuda_kernels`` config option is true (default), this dispatches to
     the fused CUDA forward/backward kernel — identical math, one kernel
-    launch instead of several large intermediates.
+    launch instead of several large intermediates. The kernel is FP32-only:
+    bfloat16/float16 inputs are cast to FP32 (autocast disabled) and the loss
+    comes back in FP32; float64 inputs take the torch path.
 
     Args:
         obj: Tensor of shape ``[..., D, H, W]`` (ndim >= 3).
@@ -96,13 +98,14 @@ def tv_loss_vol_sq(obj: torch.Tensor) -> torch.Tensor:
     """
     if (
         obj.is_cuda
-        and obj.dtype == torch.float32
+        and obj.dtype in (torch.float32, torch.bfloat16, torch.float16)
         and config.get("has_quantem_cuda")
         and config.get("use_cuda_kernels", default=True)
     ):
         from quantem.cuda.core import tv_loss_sq_3d
 
-        return tv_loss_sq_3d(obj)
+        with torch.autocast(device_type=obj.device.type, enabled=False):
+            return tv_loss_sq_3d(obj.float())
 
     tv_d = torch.pow(obj[..., 1:, :, :] - obj[..., :-1, :, :], 2).sum()
     tv_h = torch.pow(obj[..., :, 1:, :] - obj[..., :, :-1, :], 2).sum()

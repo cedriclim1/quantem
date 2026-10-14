@@ -27,11 +27,17 @@ from quantem.tomography.utils import tv_loss_vol_sq
 
 
 def _tomography_autocast(device: torch.device | str, use_bfloat16: bool):
+    """BF16 autocast context for the INR model forward; a no-op unless enabled on CUDA."""
     device = torch.device(device)
     enabled = bool(
         use_bfloat16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
     )
     return torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=enabled)
+
+
+def _to_fp32(t: torch.Tensor) -> torch.Tensor:
+    """Upcast a reduced-precision (autocast) model output to FP32; FP32/FP64 pass through."""
+    return t if t.dtype in (torch.float32, torch.float64) else t.float()
 
 
 class ObjConstraintParams:
@@ -834,7 +840,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         # TV's autograd.grad recompute stays on the eager model (double
         # backward through compiled graphs is not reliable); only this main
         # forward goes through the compiled path.
-        all_densities = self._model_call(coords)
+        all_densities = _to_fp32(self._model_call(coords))
 
         if all_densities.dim() > 1:
             all_densities = all_densities.squeeze(-1)
@@ -869,6 +875,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         merged = self.model(torch.cat([coords, tap_coords], dim=0))
         if isinstance(merged, tuple):
             merged = merged[0]
+        merged = _to_fp32(merged)
         main, taps = merged[: coords.shape[0]], merged[coords.shape[0] :]
 
         if main.dim() > 1:
@@ -962,7 +969,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
                 with _tomography_autocast(self.device, use_bfloat16):
                     outputs = self.forward(coords)
-                    loss = loss_fn(outputs, target)
+                loss = loss_fn(outputs, target)
 
                 loss.backward()
                 epoch_loss += loss.item()
