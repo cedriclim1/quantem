@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal, Self, Sequence
 
@@ -12,7 +13,7 @@ from tqdm.auto import tqdm
 from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.profiling import nsys_capture_tick
-from quantem.core.ml.models.kplanes import CPTilted
+from quantem.core.ml.models.kplanes import CPTilted, KPlanesTILTED
 from quantem.core.utils.filter import gaussian_filter_2d_stack, gaussian_kernel_1d
 from quantem.core.utils.tomography_utils import torch_phase_cross_correlation
 from quantem.tomography.dataset_models import (
@@ -31,6 +32,7 @@ from quantem.tomography.object_models import (
     ObjectINR,
     ObjectPixelated,
     ObjectTensorDecomp,
+    _unwrap,
 )
 from quantem.tomography.radon.radon import iradon_torch, radon_torch
 from quantem.tomography.tomography_base import TomographyBase
@@ -71,6 +73,37 @@ def _take_grad_step_snapshot(
 
     if snapshot_callback is not None:
         snapshot_callback(grad_step, volume_or_none)
+
+
+PHASE1_UNSUPPORTED_CONSTRAINTS = ("tv_plane", "l21_plane")
+
+
+@dataclass
+class TwoPhaseParams:
+    """Phase-1 (CPTilted bottleneck) settings for ``Tomography.reconstruct_two_phase``.
+
+    ``model_kwargs`` go to ``CPTilted`` (e.g. ``C``, ``multiscale_res_multipliers``,
+    ``so3_param_type``, ``tau_init``); ``T``, ``resolution`` and ``density_activation``
+    default to the phase-2 model's and ``T`` must equal it. ``optimizer_params`` and
+    ``scheduler_params`` use the ``reconstruct`` format; the object group keys are
+    ``grids``, ``sigma_net`` and ``so3``, and pose is frozen in phase 1 unless a
+    ``"pose"`` entry is given. ``obj_constraints`` of None reuses the phase-2
+    constraints with ``tv_plane`` and ``l21_plane`` set to 0 (CPTilted has line grids,
+    on which neither is defined); an explicit value with either > 0 raises.
+    ``num_samples_per_ray`` of None reuses the phase-2 value unless that is a schedule.
+    """
+
+    num_iter: int
+    optimizer_params: dict
+    scheduler_params: dict | None = None
+    model_kwargs: dict = field(default_factory=dict)
+    obj_constraints: dict | ObjConstraintsType | None = None
+    num_samples_per_ray: int | list[tuple[int, int]] | None = None
+
+    @classmethod
+    def parse(cls, params: "TwoPhaseParams | dict") -> "TwoPhaseParams":
+        """Return params as a TwoPhaseParams, building it from a dict if needed."""
+        return params if isinstance(params, cls) else cls(**params)
 
 
 class Tomography(TomographyOpt, TomographyBase):
@@ -276,6 +309,16 @@ class Tomography(TomographyOpt, TomographyBase):
 
         loss_func = get_loss_module(name=loss_type, dtype=self.obj_model.dtype, **loss_func_kwargs)
 
+        set_progress = (
+            getattr(_unwrap(self.obj_model.model), "set_progress", None)
+            if isinstance(self.obj_model, ObjectINR)
+            else None
+        )
+        planned_steps = max(1, num_iter * len(self.dataloader))
+        call_steps = 0
+        if set_progress is not None:
+            set_progress(0.0)
+
         pbar = tqdm(range(num_iter), disable=not self.verbose)
         for a0 in pbar:
             if pose_warmup_pending and a0 == pose_warmup_epochs:
@@ -405,6 +448,9 @@ class Tomography(TomographyOpt, TomographyBase):
                 self.step_optimizers()
                 nvtx.range_pop()
                 self._grad_steps = getattr(self, "_grad_steps", 0) + 1
+                call_steps += 1
+                if set_progress is not None:
+                    set_progress(call_steps / planned_steps)
                 nsys_capture_tick(self._grad_steps)
                 if snapshots_enabled and _should_take_grad_step_snapshot(
                     self._grad_steps, snapshot_every
@@ -542,6 +588,14 @@ class Tomography(TomographyOpt, TomographyBase):
                         grad_step=self._grad_steps,
                         soft_terms=epoch_soft_term_values,
                     )
+                    phase = getattr(self, "_recon_phase", None)
+                    if phase is not None:
+                        self.logger.log_scalar(
+                            "two_phase/phase",
+                            float(phase),
+                            self.num_epochs,
+                            extra_steps={"grad_step": self._grad_steps},
+                        )
 
                 self.logger.flush()
             if not self.verbose:
@@ -559,6 +613,167 @@ class Tomography(TomographyOpt, TomographyBase):
 
         if show_metrics and self.world_size == 1:
             self.plot_losses()
+
+    def reconstruct_two_phase(
+        self,
+        phase1: TwoPhaseParams | dict,
+        num_iter: int,
+        optimizer_params: dict,
+        scheduler_params: dict | None = None,
+        obj_constraints: dict | ObjConstraintsType | None = None,
+        eval_callback: Callable[[int], None] | None = None,
+        **reconstruct_kwargs,
+    ) -> dict[str, int]:
+        """TILTED two-phase optimisation (Yi et al. 2023, arXiv 2308.15461, Sec. 4.2).
+
+        Phase 1 trains a fresh CPTilted bottleneck built from ``phase1`` on the same
+        dataset and train/holdout split; everything but its rotations is then
+        discarded. The rotations are broadcast from rank 0 and loaded into this
+        object's KPlanesTILTED, which phase 2 trains with fresh optimizers and
+        schedulers from the remaining arguments (as in ``reconstruct``).
+
+        Histories, logger epochs and ``_grad_steps`` run on across both phases;
+        snapshots in phase 1 come from the CPTilted model, epochs are logged with a
+        ``two_phase/phase`` tag, and ``eval_callback`` receives the epoch index
+        counted over both phases. Returns (and stores as ``two_phase_summary``) the
+        epoch and gradient-step counts per phase.
+        """
+        phase1 = TwoPhaseParams.parse(phase1)
+        if not isinstance(self.obj_model, ObjectTensorDecomp):
+            raise TypeError("reconstruct_two_phase needs an ObjectTensorDecomp object model.")
+        phase2_model = _unwrap(self.obj_model.model)
+        if not isinstance(phase2_model, KPlanesTILTED):
+            raise TypeError(
+                f"reconstruct_two_phase needs a KPlanesTILTED model, got {type(phase2_model).__name__}."
+            )
+        if phase1.num_iter < 1:
+            raise ValueError("phase1.num_iter must be >= 1.")
+        if optimizer_params is None or phase1.optimizer_params is None:
+            raise ValueError("Both phases need optimizer_params; each phase starts fresh optimizers.")
+        if reconstruct_kwargs.get("reset_dset") is not None:
+            raise ValueError("reset_dset is not supported: both phases must share one dataset.")
+
+        if obj_constraints is not None:
+            if isinstance(obj_constraints, dict):
+                obj_constraints = ObjConstraintParams.parse_dict(obj_constraints)
+            self.obj_model.constraints = obj_constraints
+        phase1_constraints = self._phase1_constraints(phase1.obj_constraints)
+
+        phase1_samples = phase1.num_samples_per_ray
+        if phase1_samples is None:
+            phase1_samples = reconstruct_kwargs.get("num_samples_per_ray")
+            if isinstance(phase1_samples, (list, tuple)):
+                raise ValueError(
+                    "num_samples_per_ray is a phase-2 schedule; set phase1.num_samples_per_ray."
+                )
+
+        model_kwargs = dict(phase1.model_kwargs)
+        model_kwargs.setdefault("T", phase2_model.T)
+        model_kwargs.setdefault("resolution", list(phase2_model.resolution))
+        model_kwargs.setdefault("density_activation", phase2_model.density_activation)
+        if model_kwargs["T"] != phase2_model.T:
+            raise ValueError(
+                f"Phase-1 T={model_kwargs['T']} must equal the phase-2 T={phase2_model.T}."
+            )
+
+        phase2_obj = self.obj_model
+        phase1_obj = ObjectTensorDecomp.from_model(
+            CPTilted(**model_kwargs), shape=phase2_obj.shape, device=self.device
+        )
+
+        saved_pose_optimizer = self.dset.optimizer_params
+        saved_pose_scheduler = self.dset.scheduler_params
+        if "pose" not in phase1.optimizer_params:
+            self.dset.remove_optimizer()
+
+        shared_kwargs = {
+            k: v
+            for k, v in reconstruct_kwargs.items()
+            if k not in ("num_samples_per_ray", "pose_warmup_epochs", "show_metrics")
+        }
+        start_steps, start_epochs = self._grad_steps, self.num_epochs
+        self.obj_model = phase1_obj
+        self._recon_phase = 1
+        try:
+            self.reconstruct(
+                num_iter=phase1.num_iter,
+                optimizer_params=phase1.optimizer_params,
+                scheduler_params=phase1.scheduler_params,
+                obj_constraints=phase1_constraints,
+                num_samples_per_ray=phase1_samples,
+                eval_callback=eval_callback,
+                **shared_kwargs,
+            )
+            rotations = _unwrap(phase1_obj.model).extract_tau_state().to(self.device)
+        finally:
+            self.obj_model = phase2_obj
+            self._recon_phase = None
+            self.dset.remove_optimizer()
+            self.dset.optimizer_params = saved_pose_optimizer
+            self.dset.scheduler_params = saved_pose_scheduler
+
+        if self.world_size > 1 and dist.is_available() and dist.is_initialized():
+            dist.broadcast(rotations, src=0)
+        phase2_model.load_tau_state(rotations)
+        phase2_obj._soft_constraint_losses.extend(phase1_obj._soft_constraint_losses)
+        summary = {
+            "phase1_epochs": self.num_epochs - start_epochs,
+            "phase1_grad_steps": self._grad_steps - start_steps,
+        }
+        del phase1_obj
+
+        phase1_epochs = summary["phase1_epochs"]
+        phase2_eval = (
+            None if eval_callback is None else (lambda epoch: eval_callback(epoch + phase1_epochs))
+        )
+        self._recon_phase = 2
+        try:
+            self.reconstruct(
+                num_iter=num_iter,
+                optimizer_params=optimizer_params,
+                scheduler_params=scheduler_params,
+                eval_callback=phase2_eval,
+                **reconstruct_kwargs,
+            )
+        finally:
+            self._recon_phase = None
+        summary["phase2_epochs"] = self.num_epochs - start_epochs - phase1_epochs
+        summary["phase2_grad_steps"] = self._grad_steps - start_steps - summary["phase1_grad_steps"]
+        summary["total_grad_steps"] = self._grad_steps - start_steps
+        self.two_phase_summary = summary
+        return summary
+
+    def grad_steps_per_epoch(
+        self,
+        batch_size: int,
+        val_fraction: float = 0.0,
+        holdout_fraction: float = 0.0,
+        holdout_seed: int = 0,
+    ) -> int:
+        """Gradient steps per epoch on this rank for the given batch size and split."""
+        self._setup_recon_dataloaders(
+            batch_size, getattr(self, "num_workers", 0), val_fraction, holdout_fraction, holdout_seed
+        )
+        return len(self.dataloader)
+
+    def _phase1_constraints(
+        self, constraints: dict | ObjConstraintsType | None
+    ) -> ObjConstraintsType:
+        """Phase-1 constraints: explicit (validated) or phase-2's minus plane-only terms."""
+        if constraints is None:
+            derived = self.obj_model.constraints.copy()
+            dropped = [k for k in PHASE1_UNSUPPORTED_CONSTRAINTS if getattr(derived, k, 0.0) > 0]
+            for key in dropped:
+                setattr(derived, key, 0.0)
+            if dropped and self.global_rank == 0:
+                print(f"Two-phase: phase 1 (CPTilted line grids) runs without {dropped}.")
+            return derived
+        if isinstance(constraints, dict):
+            constraints = ObjConstraintParams.parse_dict(constraints)
+        bad = [k for k in PHASE1_UNSUPPORTED_CONSTRAINTS if getattr(constraints, k, 0.0) > 0]
+        if bad:
+            raise ValueError(f"CPTilted (phase 1) does not support {bad}; set them to 0.")
+        return constraints
 
     # --- Helper Functions ---
 
