@@ -1,6 +1,7 @@
 """TILTED coarse-to-fine schedules, rotation transfer and two-phase optimisation."""
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -15,6 +16,7 @@ from quantem.core.ml.models.kplanes import (
 )
 from quantem.tomography.dataset_models import TomographyINRDataset
 from quantem.tomography.object_models import ObjConstraintParams, ObjectTensorDecomp
+from quantem.tomography.tomography_context import ReconstructionContext
 
 from .conftest import requires_gpu
 
@@ -304,25 +306,12 @@ class TestTwoPhase:
         assert len(tomo.obj_model.soft_constraint_losses) == 5
         assert isinstance(tomo.obj_model.model, KPlanesTILTED)
         assert tomo.obj_model.constraints.l21_plane == 1e-3
-        assert "l21_plane" not in tomo.soft_term_losses[0]
-        assert "l21_plane" in tomo.soft_term_losses[-1]
+        assert {"tv_plane", "l21_plane"} <= set(tomo.soft_term_losses[0])
+        assert {"tv_plane", "l21_plane"} <= set(tomo.soft_term_losses[-1])
         assert tomo.dset.has_optimizer()
 
-    def test_rejects_plane_constraints_and_T_mismatch(self, torch_device):
+    def test_rejects_T_mismatch(self, torch_device):
         tomo = _tomo(torch_device)
-        with pytest.raises(ValueError):
-            tomo.reconstruct_two_phase(
-                phase1={
-                    "num_iter": 1,
-                    "optimizer_params": _optimizer_params(),
-                    "obj_constraints": ObjConstraintParams.ObjTensorDecompConstraints(
-                        l21_plane=1e-3
-                    ),
-                },
-                num_iter=1,
-                optimizer_params=_optimizer_params(),
-                **RECON_KWARGS,
-            )
         with pytest.raises(ValueError):
             tomo.reconstruct_two_phase(
                 phase1={
@@ -334,3 +323,51 @@ class TestTwoPhase:
                 optimizer_params=_optimizer_params(),
                 **RECON_KWARGS,
             )
+
+
+class TestPhase1Constraints:
+    def _host(self, **weights):
+        constraints = ObjConstraintParams.ObjTensorDecompConstraints(**weights)
+        return SimpleNamespace(obj_model=SimpleNamespace(constraints=constraints))
+
+    def test_default_copies_every_phase2_soft_weight(self):
+        from quantem.tomography.tomography import Tomography
+
+        weights = dict(tv_plane=1e-3, l21_plane=2e-3, tv_vol=1e-4, sparsity=1e-5, s3im_weight=0.5)
+        host = self._host(**weights)
+        got = Tomography._phase1_constraints(host, None)
+        assert got is not host.obj_model.constraints
+        for key, value in weights.items():
+            assert getattr(got, key) == value
+
+    def test_explicit_plane_terms_are_accepted(self):
+        from quantem.tomography.tomography import Tomography
+
+        got = Tomography._phase1_constraints(
+            self._host(), {"name": "obj_tensor_decomp", "tv_plane": 5e-3, "l21_plane": 1e-3}
+        )
+        assert got.tv_plane == 5e-3 and got.l21_plane == 1e-3
+
+    def test_cptilted_soft_terms_recorded(self, torch_device):
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(0)
+            model = CPTilted(C=2, resolution=(8, 8, 8), T=2)
+        obj = ObjectTensorDecomp.from_model(model, shape=(8, 8, 8), device=torch_device)
+        obj.constraints = ObjConstraintParams.ObjTensorDecompConstraints(
+            tv_plane=1e-3, l21_plane=1e-3
+        )
+        coords = _points(64).to(torch_device)
+        densities = obj.forward(coords)
+        terms: dict[str, torch.Tensor] = {}
+        loss = obj.apply_soft_constraints(
+            ReconstructionContext(
+                coords=coords,
+                pred=densities[:8],
+                all_densities=densities,
+                target=torch.zeros(8, device=torch_device),
+                soft_terms=terms,
+            )
+        )
+        assert set(terms) == {"tv_plane", "l21_plane"}
+        assert float(terms["tv_plane"]) > 0 and float(terms["l21_plane"]) > 0
+        torch.testing.assert_close(loss.detach(), terms["tv_plane"] + terms["l21_plane"])

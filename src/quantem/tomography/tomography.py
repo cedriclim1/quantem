@@ -76,9 +76,6 @@ def _take_grad_step_snapshot(
         snapshot_callback(grad_step, volume_or_none)
 
 
-PHASE1_UNSUPPORTED_CONSTRAINTS = ("tv_plane", "l21_plane")
-
-
 @dataclass
 class TwoPhaseParams:
     """Phase-1 (CPTilted bottleneck) settings for ``Tomography.reconstruct_two_phase``.
@@ -89,9 +86,11 @@ class TwoPhaseParams:
     ``scheduler_params`` use the ``reconstruct`` format; the object group keys are
     ``grids``, ``sigma_net`` and ``so3``, and pose is frozen in phase 1 unless a
     ``"pose"`` entry is given. ``obj_constraints`` of None reuses the phase-2
-    constraints with ``tv_plane`` and ``l21_plane`` set to 0 (CPTilted has line grids,
-    on which neither is defined); an explicit value with either > 0 raises.
+    constraints unchanged: every soft term keeps its weight, with ``tv_plane`` and
+    ``l21_plane`` applied as their 1-D line analogues on the CPTilted grids.
     ``num_samples_per_ray`` of None reuses the phase-2 value unless that is a schedule.
+    ``num_iter`` is phase-1 epochs, run before (not inside) the ``num_iter`` epochs of
+    ``reconstruct_two_phase``; a caller with one total budget passes the remainder there.
     """
 
     num_iter: int
@@ -767,20 +766,15 @@ class Tomography(TomographyOpt, TomographyBase):
     def _phase1_constraints(
         self, constraints: dict | ObjConstraintsType | None
     ) -> ObjConstraintsType:
-        """Phase-1 constraints: explicit (validated) or phase-2's minus plane-only terms."""
+        """Phase-1 constraints: an explicit override, else a copy of phase 2's.
+
+        Every soft term carries over; ``tv_plane`` and ``l21_plane`` act on the CPTilted
+        factor lines (see ``ObjectTensorDecomp``).
+        """
         if constraints is None:
-            derived = self.obj_model.constraints.copy()
-            dropped = [k for k in PHASE1_UNSUPPORTED_CONSTRAINTS if getattr(derived, k, 0.0) > 0]
-            for key in dropped:
-                setattr(derived, key, 0.0)
-            if dropped and self.global_rank == 0:
-                print(f"Two-phase: phase 1 (CPTilted line grids) runs without {dropped}.")
-            return derived
+            return self.obj_model.constraints.copy()
         if isinstance(constraints, dict):
             constraints = ObjConstraintParams.parse_dict(constraints)
-        bad = [k for k in PHASE1_UNSUPPORTED_CONSTRAINTS if getattr(constraints, k, 0.0) > 0]
-        if bad:
-            raise ValueError(f"CPTilted (phase 1) does not support {bad}; set them to 0.")
         return constraints
 
     # --- Helper Functions ---

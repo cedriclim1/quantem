@@ -161,13 +161,14 @@ class ObjConstraintParams:
         tv_vol : float
             Total variation regularization weight for the 3-D volume.
         tv_plane : float
-            Total variation regularization weight on the factor planes.
+            Total variation regularization weight on the factor planes (on the 1-D
+            factor lines for CPTilted).
         sparsity : float
             Weight of an L1 penalty on the per-sample densities ``ctx.all_densities``.
         l21_plane : float
             Weight of the TILTED group-sparsity penalty (``FactoredGrid.l12_cost``): the
-            mean, over every level and every plane group (first grid axis), of the RMS of
-            that group's features.
+            mean, over every level and every plane or line group (first grid axis), of the
+            RMS of that group's features.
         distortion : float
             Weight of the Mip-NeRF 360 distortion loss (Eq. 15) on the per-sample ray
             weights ``w_k = sigma_k * ds``; see ``TomographyINRDataset.ray_distortion``.
@@ -1203,21 +1204,24 @@ class ObjectTensorDecomp(ObjectINR):
         return soft_loss
 
     def get_plane_l21_loss(self) -> torch.Tensor:
-        """Weighted TILTED group-sparsity (l2,1) penalty on the factor planes.
+        """Weighted TILTED group-sparsity (l2,1) penalty on the factor planes or lines.
 
         Port of TILTED ``FactoredGrid.l12_cost`` (Yi et al. 2023, arXiv 2308.15461, A.3):
-        every grid level is a ``(G, C, H, W)`` tensor whose first axis indexes the plane
-        groups (``G = 3`` for KPlanes, ``3T`` for KPlanesTILTED). Each group contributes
+        every grid level is a ``(G, C, H, W)`` plane tensor (KPlanes ``G = 3``,
+        KPlanesTILTED ``G = 3T``) or a ``(G, C, L)`` line tensor (CPTilted ``G = 3T``),
+        whose first axis indexes the groups. Each group contributes
         ``sqrt(mean(group**2) + 1e-12)`` and the penalty is the mean over all (level,
-        group) pairs, times ``constraints.l21_plane``.
+        group) pairs, times ``constraints.l21_plane``. The line form is the 1-D analogue
+        that lets a two-phase run keep ``l21_plane`` in its CPTilted phase.
         """
         model = _unwrap(self.model)
         group_norms = []
         for grid in model.grids:
-            if grid.dim() != 4:
+            if grid.dim() not in (3, 4):
                 raise NotImplementedError(
-                    "l21_plane needs plane grids shaped (groups, C, H, W); "
-                    f"{type(model).__name__} has a grid of shape {tuple(grid.shape)}."
+                    "l21_plane needs plane grids (groups, C, H, W) or line grids "
+                    f"(groups, C, L); {type(model).__name__} has a grid of shape "
+                    f"{tuple(grid.shape)}."
                 )
             flat = grid.reshape(grid.shape[0], -1)
             group_norms.append(torch.sqrt(flat.pow(2).mean(dim=1) + 1e-12))
@@ -1229,7 +1233,7 @@ class ObjectTensorDecomp(ObjectINR):
         """
         Gets the summed total variational loss for the tensor decomposition model.
 
-        _get_plane_tv_loss: Total-variation across the planes.
+        _get_plane_tv_loss: Total-variation across the planes (or CPTilted lines).
         _get_volume_tv_loss: Isotropic volume TV
         """
         assert ctx.coords is not None, "Coordinates must be provided for TV loss"
@@ -1248,25 +1252,33 @@ class ObjectTensorDecomp(ObjectINR):
         return tv_loss
 
     def _get_plane_tv_loss(self) -> torch.Tensor:
-        """
-        Gets the total-variation across the planes.
+        """Squared-difference TV of the factor grids, times ``constraints.tv_plane``.
+
+        Plane grids ``(G, C, H, W)``: each group scores ``mean(dH**2) + mean(dW**2)``.
+        Line grids ``(G, C, L)`` (CPTilted): each group scores ``mean(dL**2)``, the 1-D
+        analogue. TILTED models sum the 3 groups of each rotation and average over the
+        ``T`` rotations; KPlanes sums its 3 planes. Levels are summed.
         """
         model = _unwrap(self.model)
         is_tilted = model.tilted
         per_level = []
 
         for p in model.grids:
-            # p: (3*T, C, H, W) for TILTED, (3, C, H, W) for KPlanes
-            dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
-            dw = (p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
-            per_plane = dh + dw  # (3*T,) or (3,)
+            if p.dim() == 3:
+                per_group = (p[:, :, 1:] - p[:, :, :-1]).pow(2).mean(dim=(1, 2))
+            elif p.dim() == 4:
+                dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
+                dw = (p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
+                per_group = dh + dw
+            else:
+                raise NotImplementedError(
+                    f"tv_plane needs plane or line grids, got shape {tuple(p.shape)}."
+                )
 
             if is_tilted:
-                T = model.T
-                per_rotation = per_plane.view(T, 3).sum(dim=1)  # sum 3 planes per rotation
-                level_tv = per_rotation.mean()  # avg across rotations
+                level_tv = per_group.view(model.T, 3).sum(dim=1).mean()
             else:
-                level_tv = per_plane.sum()
+                level_tv = per_group.sum()
 
             per_level.append(level_tv)
 

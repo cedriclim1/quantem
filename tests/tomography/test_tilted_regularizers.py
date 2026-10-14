@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import default_collate
 
-from quantem.core.ml.models.kplanes import KPlanes, KPlanesTILTED
+from quantem.core.ml.models.kplanes import CPTilted, KPlanes, KPlanesTILTED
 from quantem.tomography.dataset_models import (
     DatasetConstraintParams,
     TomographyINRDataset,
@@ -363,13 +363,77 @@ class TestPlaneL21:
         got.backward()
         assert all(g.grad is not None for g in model.grids)
 
-    def test_line_grids_not_supported(self):
+    def test_line_grids_match_numpy_l12_cost(self):
+        rng = np.random.default_rng(3)
+        grids = [rng.standard_normal((6, 3, 8)), rng.standard_normal((6, 3, 16))]
         fake = SimpleNamespace(
-            model=_GridModule([torch.rand(6, 3, 8)]),
+            model=_GridModule([torch.as_tensor(g) for g in grids]),
+            constraints=SimpleNamespace(l21_plane=0.4),
+        )
+        got = float(ObjectTensorDecomp.get_plane_l21_loss(fake))
+        np.testing.assert_allclose(got, 0.4 * _l12_cost_numpy(grids), rtol=1e-12)
+
+    def test_real_cptilted_line_grids(self):
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(0)
+            model = CPTilted(C=2, resolution=(8, 8, 8), multiscale_res_multipliers=[1, 2], T=2)
+        fake = SimpleNamespace(model=model, constraints=SimpleNamespace(l21_plane=1.0))
+        got = ObjectTensorDecomp.get_plane_l21_loss(fake)
+        expected = _l12_cost_numpy([g.detach().double().numpy() for g in model.grids])
+        np.testing.assert_allclose(float(got), expected, rtol=1e-6)
+        got.backward()
+        assert all(g.grad is not None and g.grad.abs().sum() > 0 for g in model.grids)
+
+    def test_unsupported_grid_rank_raises(self):
+        fake = SimpleNamespace(
+            model=_GridModule([torch.rand(6, 3, 4, 4, 4)]),
             constraints=SimpleNamespace(l21_plane=1.0),
         )
         with pytest.raises(NotImplementedError):
             ObjectTensorDecomp.get_plane_l21_loss(fake)
+
+
+def _plane_tv_numpy(grids: list[np.ndarray], T: int | None) -> float:
+    total = 0.0
+    for g in grids:
+        if g.ndim == 3:
+            per_group = np.mean(np.diff(g, axis=2) ** 2, axis=(1, 2))
+        else:
+            per_group = np.mean(np.diff(g, axis=2) ** 2, axis=(1, 2, 3)) + np.mean(
+                np.diff(g, axis=3) ** 2, axis=(1, 2, 3)
+            )
+        total += per_group.reshape(T, 3).sum(axis=1).mean() if T else per_group.sum()
+    return float(total)
+
+
+class TestPlaneTV:
+    def _fake(self, model, weight):
+        return SimpleNamespace(model=model, constraints=SimpleNamespace(tv_plane=weight))
+
+    def test_cptilted_line_tv_matches_numpy(self):
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(1)
+            model = CPTilted(C=3, resolution=(8, 8, 8), multiscale_res_multipliers=[1, 2], T=2)
+        got = ObjectTensorDecomp._get_plane_tv_loss(self._fake(model, 0.3))
+        expected = 0.3 * _plane_tv_numpy([g.detach().double().numpy() for g in model.grids], T=2)
+        np.testing.assert_allclose(float(got), expected, rtol=1e-6)
+        got.backward()
+        assert all(g.grad is not None and g.grad.abs().sum() > 0 for g in model.grids)
+
+    def test_constant_lines_have_zero_tv(self):
+        model = CPTilted(C=2, resolution=(8, 8, 8), T=2)
+        with torch.no_grad():
+            for g in model.grids:
+                g.fill_(0.3)
+        assert float(ObjectTensorDecomp._get_plane_tv_loss(self._fake(model, 1.0))) == 0.0
+
+    @pytest.mark.parametrize("kind", ["kplanes_tilted", "kplanes"])
+    def test_plane_tv_unchanged(self, kind):
+        model = _seeded_plane_model(kind)
+        T = model.T if kind == "kplanes_tilted" else None
+        got = ObjectTensorDecomp._get_plane_tv_loss(self._fake(model, 0.5))
+        expected = 0.5 * _plane_tv_numpy([g.detach().double().numpy() for g in model.grids], T=T)
+        np.testing.assert_allclose(float(got), expected, rtol=1e-6)
 
 
 def _tensor_decomp_obj(device: str, n: int = 8) -> ObjectTensorDecomp:
