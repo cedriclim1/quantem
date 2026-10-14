@@ -7,6 +7,15 @@ import torch.nn.functional as F
 
 # --- Tilted KPlanes ---
 
+
+def _check_rotation_shape(R: torch.Tensor, T: int) -> None:
+    """Raise if R is not a (T, 3, 3) stack of matrices."""
+    if tuple(R.shape) != (T, 3, 3):
+        raise ValueError(
+            f"Expected rotation matrices of shape ({T}, 3, 3), got {tuple(R.shape)}; "
+            "T must match between the source and target rotation banks."
+        )
+
 # ---------------------------------------------------------------------------
 # SO(3) quaternion parameter module
 # ---------------------------------------------------------------------------
@@ -101,6 +110,13 @@ class SO3ParamQuat(nn.Module):
             obj.quats.copy_(cls.rotmat_to_quat(R))
         return obj
 
+    def load_matrix(self, R: torch.Tensor) -> None:
+        """Overwrite the bank in place with the rotations R (T, 3, 3)."""
+        _check_rotation_shape(R, self.quats.shape[0])
+        with torch.no_grad():
+            R = SO3ParamR9SVD.r9_to_rotmat(R.to(self.quats.device, self.quats.dtype))
+            self.quats.copy_(self.rotmat_to_quat(R))
+
     def extra_repr(self) -> str:
         return f"T={self.quats.shape[0]}"
 
@@ -182,6 +198,13 @@ class SO3ParamR9SVD(nn.Module):
 
     def as_matrix(self) -> torch.Tensor:
         return self.r9_to_rotmat(self.M)
+
+    def load_matrix(self, R: torch.Tensor) -> None:
+        """Overwrite the bank in place with the rotations R (T, 3, 3)."""
+        _check_rotation_shape(R, self.M.shape[0])
+        with torch.no_grad():
+            R = self.r9_to_rotmat(R.to(self.M.device, self.M.dtype))
+            self.M.copy_(self.rotmat_to_r9(R))
 
     @classmethod
     def from_matrix(cls, R: torch.Tensor) -> "SO3ParamR9SVD":
