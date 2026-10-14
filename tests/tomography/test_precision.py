@@ -258,7 +258,7 @@ class TestReconstructPrecision:
         with _LinearDtypes() as rec:
             summary = tomo.reconstruct_two_phase(
                 phase1={"num_iter": 1, "optimizer_params": _optimizer_params()},
-                num_iter=1,
+                num_iter=2,
                 optimizer_params=_optimizer_params(),
                 obj_constraints=ALL_TERMS.copy(),
                 use_bfloat16=True,

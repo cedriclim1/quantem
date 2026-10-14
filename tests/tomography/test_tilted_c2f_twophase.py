@@ -216,6 +216,28 @@ def _tomo(device: str, n: int = 8, **model_kwargs):
 RECON_KWARGS = dict(batch_size=64, num_samples_per_ray=9, num_workers=0)
 
 
+class _RecordingLogger:
+    """Stand-in for LoggerTomography recording the epoch and gradient-step axes."""
+
+    log_images_every = 0
+
+    def __init__(self):
+        self.iters, self.grad_steps, self.snapshot_steps, self.phases = [], [], [], []
+
+    def log_iter(self, *, iter, grad_step=None, **kwargs):
+        self.iters.append(iter)
+        self.grad_steps.append(grad_step)
+
+    def log_scalar(self, tag, value, step, **kwargs):
+        if tag == "snapshots/last_grad_step":
+            self.snapshot_steps.append(step)
+        elif tag == "two_phase/phase":
+            self.phases.append(value)
+
+    def flush(self):
+        pass
+
+
 @requires_gpu
 @pytest.mark.slow
 class TestTrainingLoopProgress:
@@ -276,13 +298,15 @@ class TestTwoPhase:
         monkeypatch.setattr(phase2_model, "load_tau_state", spy_load)
 
         snapshots, evals = [], []
+        logger = _RecordingLogger()
+        tomo._logger = logger
         summary = tomo.reconstruct_two_phase(
             phase1={
                 "num_iter": 2,
                 "optimizer_params": _optimizer_params(),
                 "model_kwargs": {"C": 2, "so3_param_type": p1_so3},
             },
-            num_iter=3,
+            num_iter=5,
             optimizer_params=_optimizer_params(pose=True),
             obj_constraints=ObjConstraintParams.ObjTensorDecompConstraints(
                 tv_plane=1e-3, l21_plane=1e-3
@@ -309,6 +333,22 @@ class TestTwoPhase:
         assert {"tv_plane", "l21_plane"} <= set(tomo.soft_term_losses[0])
         assert {"tv_plane", "l21_plane"} <= set(tomo.soft_term_losses[-1])
         assert tomo.dset.has_optimizer()
+        assert logger.iters == [1, 2, 3, 4, 5]
+        assert logger.grad_steps == [k * steps_per_epoch for k in range(1, 6)]
+        assert logger.snapshot_steps == snapshots
+        assert logger.phases == [1.0, 1.0, 2.0, 2.0, 2.0]
+
+    @pytest.mark.parametrize("phase1_iters", [0, 3, 4])
+    def test_rejects_phase1_outside_budget(self, torch_device, phase1_iters):
+        tomo = _tomo(torch_device)
+        with pytest.raises(ValueError):
+            tomo.reconstruct_two_phase(
+                phase1={"num_iter": phase1_iters, "optimizer_params": _optimizer_params()},
+                num_iter=3,
+                optimizer_params=_optimizer_params(),
+                **RECON_KWARGS,
+            )
+        assert tomo._grad_steps == 0
 
     def test_rejects_T_mismatch(self, torch_device):
         tomo = _tomo(torch_device)
@@ -319,7 +359,7 @@ class TestTwoPhase:
                     "optimizer_params": _optimizer_params(),
                     "model_kwargs": {"T": 3},
                 },
-                num_iter=1,
+                num_iter=2,
                 optimizer_params=_optimizer_params(),
                 **RECON_KWARGS,
             )

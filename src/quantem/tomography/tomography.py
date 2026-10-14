@@ -89,8 +89,8 @@ class TwoPhaseParams:
     constraints unchanged: every soft term keeps its weight, with ``tv_plane`` and
     ``l21_plane`` applied as their 1-D line analogues on the CPTilted grids.
     ``num_samples_per_ray`` of None reuses the phase-2 value unless that is a schedule.
-    ``num_iter`` is phase-1 epochs, run before (not inside) the ``num_iter`` epochs of
-    ``reconstruct_two_phase``; a caller with one total budget passes the remainder there.
+    ``num_iter`` is phase-1 epochs, counted inside the total ``num_iter`` of
+    ``reconstruct_two_phase``.
     """
 
     num_iter: int
@@ -639,8 +639,11 @@ class Tomography(TomographyOpt, TomographyBase):
         object's KPlanesTILTED, which phase 2 trains with fresh optimizers and
         schedulers from the remaining arguments (as in ``reconstruct``).
 
-        Histories, logger epochs and ``_grad_steps`` run on across both phases;
-        snapshots in phase 1 come from the CPTilted model, epochs are logged with a
+        ``num_iter`` is the TOTAL epoch budget: phase 1 runs ``phase1.num_iter`` epochs
+        and phase 2 the remaining ``num_iter - phase1.num_iter``; ``1 <= phase1.num_iter
+        < num_iter`` is required. Histories, logger epochs and ``_grad_steps`` run on
+        continuously (phase 2 starts at phase 1's last step), so snapshot and logger
+        steps form one monotone sequence over the whole budget; snapshots in phase 1 come from the CPTilted model, epochs are logged with a
         ``two_phase/phase`` tag, and ``eval_callback`` receives the epoch index
         counted over both phases. Returns (and stores as ``two_phase_summary``) the
         epoch and gradient-step counts per phase.
@@ -653,8 +656,11 @@ class Tomography(TomographyOpt, TomographyBase):
             raise TypeError(
                 f"reconstruct_two_phase needs a KPlanesTILTED model, got {type(phase2_model).__name__}."
             )
-        if phase1.num_iter < 1:
-            raise ValueError("phase1.num_iter must be >= 1.")
+        if not 1 <= phase1.num_iter < num_iter:
+            raise ValueError(
+                f"Need 1 <= phase1.num_iter < num_iter (total epochs), got "
+                f"phase1.num_iter={phase1.num_iter}, num_iter={num_iter}."
+            )
         if optimizer_params is None or phase1.optimizer_params is None:
             raise ValueError("Both phases need optimizer_params; each phase starts fresh optimizers.")
         if reconstruct_kwargs.get("reset_dset") is not None:
@@ -736,7 +742,7 @@ class Tomography(TomographyOpt, TomographyBase):
         self._recon_phase = 2
         try:
             self.reconstruct(
-                num_iter=num_iter,
+                num_iter=num_iter - phase1.num_iter,
                 optimizer_params=optimizer_params,
                 scheduler_params=scheduler_params,
                 eval_callback=phase2_eval,
