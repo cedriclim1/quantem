@@ -171,6 +171,8 @@ class SO3ParamR9SVD(nn.Module):
     Based on Rene Geist et al., 2024: https://arxiv.org/abs/2404.11735v1
     """
 
+    LOAD_SPREAD = (0.9, 1.0, 1.1)
+
     def __init__(self, T: int, init: Literal["random", "identity"] = "random"):
         super().__init__()
         if init == "random":
@@ -202,11 +204,19 @@ class SO3ParamR9SVD(nn.Module):
         return self.r9_to_rotmat(self.M)
 
     def load_matrix(self, R: torch.Tensor) -> None:
-        """Overwrite the bank in place with the rotations R (T, 3, 3)."""
+        """Overwrite the bank in place with the rotations R (T, 3, 3).
+
+        Stores ``M = R @ diag(LOAD_SPREAD)``: its SVD+ projection is exactly ``R``
+        (polar factor of R times a positive diagonal), but its singular values are
+        distinct. Storing the orthogonal ``R`` itself gives three equal singular
+        values, where ``torch.linalg.svd``'s backward (``1 / (s_i**2 - s_j**2)``)
+        returns inf/NaN gradients on the first step.
+        """
         _check_rotation_shape(R, self.M.shape[0])
         with torch.no_grad():
             R = self.r9_to_rotmat(R.detach().to("cpu", torch.float64))
-            self.M.copy_(self.rotmat_to_r9(R))
+            spread = torch.tensor(self.LOAD_SPREAD, dtype=R.dtype)
+            self.M.copy_(self.rotmat_to_r9(R) * spread)
 
     @classmethod
     def from_matrix(cls, R: torch.Tensor) -> "SO3ParamR9SVD":

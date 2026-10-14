@@ -172,6 +172,20 @@ class TestTauTransfer:
             dst.extract_tau_state(), src.extract_tau_state(), rtol=0, atol=1e-5
         )
 
+    @pytest.mark.parametrize("src_so3", SO3_TYPES)
+    @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda:0", marks=requires_gpu)])
+    def test_r9svd_load_has_finite_gradients(self, src_so3, device):
+        src = _rotation_model("cp", src_so3, seed=0)
+        dst = _rotation_model("kplanes", "r9svd", seed=1).to(device)
+        R = src.extract_tau_state()
+        dst.load_tau_state(R)
+        torch.testing.assert_close(dst.extract_tau_state(), R, rtol=0, atol=1e-5)
+        s = torch.linalg.svdvals(dst.so3.M.detach().double())
+        assert (s[:, :-1] - s[:, 1:]).abs().min() > 0.05
+        weights = torch.randn(3, 3, 3, generator=torch.Generator().manual_seed(2)).to(device)
+        (dst.so3.as_matrix() * weights).sum().backward()
+        assert torch.isfinite(dst.so3.M.grad).all()
+
     @pytest.mark.parametrize("so3", SO3_TYPES)
     def test_T_mismatch_rejected(self, so3):
         src = _rotation_model("cp", so3, seed=0, T=2)
