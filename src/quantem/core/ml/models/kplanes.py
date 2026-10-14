@@ -3,6 +3,7 @@ Tensor Decomposition Methods for INR-based reconstructions
 """
 
 import itertools
+import math
 from typing import Callable, Optional, Sequence
 
 # import tinycudann as tcnn
@@ -410,25 +411,70 @@ def interpolate_ms_features_tilted(
     return torch.cat(per_scale_features, dim=-1)
 
 
+def c2f_scale_gates(progress: float, warmup_frac: float, num_scales: int) -> list[float]:
+    """Cosine (BARF/Nerfies) per-scale gates; level 0 always on, all on at warmup end."""
+    if warmup_frac <= 0 or num_scales <= 1:
+        return [1.0] * num_scales
+    eta = (num_scales - 1) * min(1.0, max(0.0, progress / warmup_frac))
+    gates = []
+    for i in range(num_scales):
+        alpha = min(1.0, max(0.0, eta - i + 1))
+        gates.append(0.5 * (1.0 - math.cos(math.pi * alpha)))
+    return gates
+
+
+def c2f_blur_sigma(progress: float, sigma0: float, blur_frac: float) -> float:
+    """Plane blur sigma, cosine-annealed from sigma0 to 0 over the first blur_frac of training."""
+    if sigma0 <= 0 or blur_frac <= 0:
+        return 0.0
+    t = min(1.0, max(0.0, progress / blur_frac))
+    return 0.0 if t >= 1.0 else sigma0 * 0.5 * (1.0 + math.cos(math.pi * t))
+
+
+def gaussian_blur_planes(grid: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Separable, differentiable Gaussian low-pass over the last two axes (replicate padding)."""
+    if sigma <= 0:
+        return grid
+    radius = max(1, math.ceil(3.0 * sigma))
+    support = torch.arange(-radius, radius + 1, device=grid.device, dtype=grid.dtype)
+    kernel = torch.exp(-0.5 * (support / sigma) ** 2)
+    kernel = kernel / kernel.sum()
+    K = kernel.numel()
+    shape = grid.shape
+    x = grid.reshape(-1, 1, shape[-2], shape[-1])
+    x = F.conv2d(F.pad(x, (radius, radius, 0, 0), mode="replicate"), kernel.view(1, 1, 1, K))
+    x = F.conv2d(F.pad(x, (0, 0, radius, radius), mode="replicate"), kernel.view(1, 1, K, 1))
+    return x.reshape(shape)
+
+
+def extract_tau_state(so3: SO3ParamQuat | SO3ParamR9SVD) -> torch.Tensor:
+    """Detached CPU (T, 3, 3) rotation matrices of an SO(3) bank."""
+    return so3.as_matrix().detach().cpu().clone()
+
+
 class KPlanesTILTED(KPlanes):
     """
     K-Planes with T learned SO(3) rotations (TILTED). Adapted from Yi et al., https://arxiv.org/abs/2308.15461
 
     Inherits KPlanes for the sigma_net, density_activation, and get_params
-    interface.  Overrides:
-      * __init__       – replaces the axis-aligned grids with (3*T)-plane
-                         grids and adds SO3Param.
-      * get_densities  – calls the TILTED interpolation instead.
-      * get_params     – adds "so3" key so callers can set a separate lr.
-      * param_keys     – updated list.
+    interface; grids are (3*T, M_features, H, W) per scale and "so3" is an extra
+    parameter group.
 
-    Two-phase optimization
-    ----------------------
-    Phase 1: instantiate with small `M_features` (and optionally smaller
-             `resolution` / fewer scales) — the bottleneck model. Train it
-             until τ converges, then call `extract_tau_state()`.
-    Phase 2: instantiate at full capacity, call `load_tau_state(M_bneck)`
-             to seed the rotations, then train normally.
+    Two-phase optimisation: a CPTilted bottleneck is trained first and its
+    rotations are transferred with ``extract_tau_state()`` / ``load_tau_state()``
+    (proper (T, 3, 3) rotation matrices, so the quat and r9svd parameterisations
+    can be mixed); see ``Tomography.reconstruct_two_phase``.
+
+    Coarse-to-fine schedules, both driven by ``set_progress(frac)`` (the training
+    loop calls it every batch with completed / planned gradient steps):
+
+    * ``c2f_warmup_frac``: multiscale level gating. Level 0 (coarsest) is always on;
+      finer levels fade in with a cosine ramp and all are on at ``frac = c2f_warmup_frac``.
+      No-op for a single level.
+    * ``c2f_blur_sigma0`` / ``c2f_blur_frac``: every plane is Gaussian low-passed
+      before interpolation, sigma cosine-annealed from ``c2f_blur_sigma0`` (pixels of
+      the finest level; level l uses ``sigma * mult_l / max(mult)``, the same physical
+      width) to 0 at ``frac = c2f_blur_frac``. At sigma 0 no extra ops run.
 
     Parameters
     ----------
@@ -460,9 +506,9 @@ class KPlanesTILTED(KPlanes):
         hybrid_hidden_dim: int = 64,
         hybrid_num_layers: int = 2,
         so3_param_type: str = "r9svd",
-        # Coarse-to-fine band-limiting: if > 0, finer scales are gated on over the first
-        # c2f_warmup_frac of training via set_progress() (0 => disabled, all scales on).
         c2f_warmup_frac: float = 0.0,
+        c2f_blur_sigma0: float = 0.0,
+        c2f_blur_frac: float = 0.0,
     ):
         self._td_type = "tilted"
         if input_coords_dims != 3:
@@ -511,24 +557,52 @@ class KPlanesTILTED(KPlanes):
         # ---- Learnable rotations ----
         self.set_so3_param_type(so3_param_type, init=tau_init)
 
-        # ---- Coarse-to-fine scale gating ----
         self.num_scales = num_scales
         self.c2f_warmup_frac = float(c2f_warmup_frac)
-        # gate per scale (coarse..fine); all-on by default so behaviour is unchanged at frac=0
+        self.c2f_blur_sigma0 = float(c2f_blur_sigma0)
+        self.c2f_blur_frac = float(c2f_blur_frac)
+        if self.c2f_warmup_frac < 0 or self.c2f_blur_sigma0 < 0 or self.c2f_blur_frac < 0:
+            raise ValueError("c2f_warmup_frac, c2f_blur_sigma0 and c2f_blur_frac must be >= 0.")
+        if (self.c2f_blur_sigma0 > 0) != (self.c2f_blur_frac > 0):
+            raise ValueError(
+                "c2f_blur_sigma0 and c2f_blur_frac must both be > 0 to enable plane blur, "
+                f"got sigma0={self.c2f_blur_sigma0}, frac={self.c2f_blur_frac}."
+            )
         self._scale_gates = [1.0] * num_scales
-        if self.c2f_warmup_frac > 0:
-            self.set_progress(0.0)
+        self._blur_sigma = 0.0
+        self._progress = 0.0
+        self.set_progress(0.0)
 
     def set_progress(self, frac: float) -> None:
-        """Update coarse-to-fine gates given training progress frac in [0,1].
-        Coarsest scale (index 0) opens first; each successive (finer) scale ramps on
-        later, all fully open by the end of the warmup window. No-op if c2f disabled."""
-        if self.c2f_warmup_frac <= 0:
-            return
-        p = min(1.0, max(0.0, frac / self.c2f_warmup_frac))  # 0..1 over the warmup window
-        S = self.num_scales
-        # gate_i = clamp(p*S - i, 0, 1): scale 0 opens over [0,1/S], scale 1 over [1/S,2/S], ...
-        self._scale_gates = [min(1.0, max(0.0, p * S - i)) for i in range(S)]
+        """Set training progress in [0, 1] and update the coarse-to-fine schedules."""
+        self._progress = min(1.0, max(0.0, float(frac)))
+        self._scale_gates = c2f_scale_gates(self._progress, self.c2f_warmup_frac, self.num_scales)
+        self._blur_sigma = c2f_blur_sigma(self._progress, self.c2f_blur_sigma0, self.c2f_blur_frac)
+
+    @property
+    def scale_gates(self) -> list[float]:
+        return list(self._scale_gates)
+
+    @property
+    def blur_sigma(self) -> float:
+        return self._blur_sigma
+
+    def _active_scale_gates(self) -> Optional[list[float]]:
+        """Per-scale gates, or None when every gate is fully open."""
+        if all(g == 1.0 for g in self._scale_gates):
+            return None
+        return self._scale_gates
+
+    def _active_grids(self) -> Sequence[torch.Tensor]:
+        """Plane grids, low-passed when the c2f blur sigma is positive."""
+        sigma = self._blur_sigma
+        if sigma <= 0:
+            return self.grids
+        finest = max(self.multiscale_res_multipliers)
+        return [
+            gaussian_blur_planes(g, sigma * m / finest)
+            for g, m in zip(self.grids, self.multiscale_res_multipliers)
+        ]
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -569,10 +643,13 @@ class KPlanesTILTED(KPlanes):
     def get_densities(self, coords: torch.Tensor) -> torch.Tensor:
         pts = coords.reshape(-1, 3)
         R = self.so3.as_matrix()  # (T, 3, 3)
-        gates = self._scale_gates if getattr(self, "c2f_warmup_frac", 0.0) > 0 else None
+        if hasattr(self, "_blur_sigma"):
+            grids, gates = self._active_grids(), self._active_scale_gates()
+        else:
+            grids, gates = self.grids, None
         features = interpolate_ms_features_tilted(
             pts=pts,
-            ms_grids=self.grids,
+            ms_grids=grids,
             rotation_matrices=R,
             scale_gates=gates,
         )
@@ -602,35 +679,12 @@ class KPlanesTILTED(KPlanes):
     # ------------------------------------------------------------------
 
     def extract_tau_state(self) -> torch.Tensor:
-        """
-        Returns the current raw R^9 matrices (detached copy) so they can be
-        used to initialise a phase-2 model via `load_tau_state`.
+        """Detached CPU copy of the current rotations as (T, 3, 3) SO(3) matrices."""
+        return extract_tau_state(self.so3)
 
-        Returns
-        -------
-        torch.Tensor of shape (T, 3, 3)
-        """
-        return self.so3.M.detach().cpu().clone()
-
-    def load_tau_state(self, M: torch.Tensor) -> None:
-        """
-        Load pre-trained rotation matrices (e.g. from a bottleneck phase-1 model).
-
-        No orthogonalization is needed — SO3Param.as_matrix() projects to SO(3)
-        via SVD on every forward pass.
-
-        Parameters
-        ----------
-        M : torch.Tensor of shape (T, 3, 3)
-            Raw unconstrained matrices from `extract_tau_state()`.
-        """
-        if M.shape != self.so3.M.shape:
-            raise ValueError(
-                f"Shape mismatch: got {M.shape}, expected {self.so3.M.shape}. "
-                f"Make sure T matches between phase 1 and phase 2."
-            )
-        with torch.no_grad():
-            self.so3.M.copy_(M.to(self.so3.M.device))
+    def load_tau_state(self, R: torch.Tensor) -> None:
+        """Seed the rotations from (T, 3, 3) matrices, for either SO(3) parameterisation."""
+        self.so3.load_matrix(R)
 
     # ------------------------------------------------------------------
     # Pretty print
@@ -745,6 +799,7 @@ class CPTilted(PPLR, TensorDecompositionModel):
         self._td_type = "cp_tilted"
         self.T = T
         self.C = C
+        self.resolution = list(resolution)
         self.multiscale_res_multipliers = list(multiscale_res_multipliers or [1])
         self.density_activation = density_activation
 
@@ -797,7 +852,12 @@ class CPTilted(PPLR, TensorDecompositionModel):
         return self._td_type
 
     def extract_tau_state(self) -> torch.Tensor:
-        return self.so3.M.detach().clone()
+        """Detached CPU copy of the current rotations as (T, 3, 3) SO(3) matrices."""
+        return extract_tau_state(self.so3)
+
+    def load_tau_state(self, R: torch.Tensor) -> None:
+        """Seed the rotations from (T, 3, 3) matrices, for either SO(3) parameterisation."""
+        self.so3.load_matrix(R)
 
     @property
     def tilted(self) -> bool:
