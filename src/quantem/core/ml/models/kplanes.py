@@ -5,7 +5,7 @@ Tensor Decomposition Methods for INR-based reconstructions
 import copy
 import itertools
 import math
-from typing import Callable, Optional, Sequence
+from typing import Callable, Literal, Sequence
 
 # import tinycudann as tcnn
 import torch
@@ -184,7 +184,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
         input_coords_dims: int = 3,
         M_features: int = 32,
         resolution: Sequence[int] = (200, 200, 200),
-        multiscale_res_multipliers: Optional[Sequence[int]] = None,
+        multiscale_res_multipliers: Sequence[float] | None = None,
         concat_features: bool = True,
         density_activation: Callable = lambda x: F.softplus(
             x - 1
@@ -198,7 +198,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
         Assume coords are [-1, 1] in each dimension.
         """
         super().__init__()
-        self._td_type = "kplanes"
+        self.td_type = "kplanes"
         self.grid_dimensions = grid_dimensions
         self.input_coords_dims = input_coords_dims
         self.M_features = M_features
@@ -225,7 +225,22 @@ class KPlanes(PPLR, TensorDecompositionModel):
             self.grids.append(plane)
             self.feature_dim += self.M_features
 
-        # Network head
+        # Network head (single linear when not hybrid; small ReLU MLP when hybrid)
+        self._build_sigma_net(use_hybrid_mlp, hybrid_hidden_dim, hybrid_num_layers)
+
+    def _build_sigma_net(
+        self,
+        use_hybrid_mlp: bool,
+        hybrid_hidden_dim: int,
+        hybrid_num_layers: int,
+    ) -> None:
+        """Build the decoder head mapping concatenated grid features -> density.
+
+        ``use_hybrid_mlp=True`` builds a small ReLU MLP; otherwise a single linear
+        "explicit" decoder. Both init the final layer small (``weight ~ N(0, 0.01**2)``,
+        ``bias=0``) so the density starts near zero. Called after ``self.feature_dim``
+        is finalized.
+        """
         if use_hybrid_mlp:
             hybrid_hidden_dim = int(hybrid_hidden_dim)
             hybrid_num_layers = int(hybrid_num_layers)
@@ -251,8 +266,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
             layers.append(out)
             self.sigma_net = nn.Sequential(*layers)
         else:
-            # Linear head fallback, matching KPlanesTILTED._build_sigma_net and
-            # CPTilted: forward/get_params reference sigma_net unconditionally.
+            # Single-linear "explicit" decoder. Small init -> density ~ 0 initially.
             self.sigma_net = nn.Linear(self.feature_dim, 1, bias=True)
             nn.init.normal_(self.sigma_net.weight, std=0.01)
             nn.init.zeros_(self.sigma_net.bias)
@@ -282,24 +296,8 @@ class KPlanes(PPLR, TensorDecompositionModel):
         return ["grids", "sigma_net"]
 
     @property
-    def td_type(self) -> str:
-        return self._td_type
-
-    @td_type.setter
-    def td_type(self, td_type: str):
-        if not isinstance(td_type, str):
-            raise TypeError("td_type must be a string")
-        self._td_type = td_type
-
-    @property
     def tilted(self) -> bool:
         return False
-
-    @tilted.setter
-    def tilted(self, tilted: bool):
-        if not isinstance(tilted, bool):
-            raise TypeError("tilted must be a boolean")
-        self._tilted = tilted
 
     @property
     def grids(self) -> torch.nn.ParameterList:
@@ -327,11 +325,18 @@ class KPlanes(PPLR, TensorDecompositionModel):
 # ---------------------------------------------------------------------------
 
 
+def _rotate_tilted_points_fp32(
+    pts: torch.Tensor, rotation_matrices: torch.Tensor
+) -> torch.Tensor:
+    with torch.autocast(device_type=pts.device.type, enabled=False):
+        return torch.einsum("tij,bj->tbi", rotation_matrices.float(), pts.float())
+
+
 def interpolate_ms_features_tilted(
     pts: torch.Tensor,  # (B, 3)
     ms_grids: nn.ParameterList,  # each grid: (3*T, C, H, W)
     rotation_matrices: torch.Tensor,  # (T, 3, 3)
-    scale_gates: Optional[Sequence[float]] = None,  # per-scale multiplier (coarse-to-fine)
+    scale_gates: Sequence[float] | None = None,  # per-scale multiplier (coarse-to-fine)
 ) -> torch.Tensor:
     """
     Fully-vectorized multi-scale, multi-rotation K-Planes feature interpolation.
@@ -367,7 +372,7 @@ def interpolate_ms_features_tilted(
         return torch.cat(feats, dim=-1)
 
     # (T, B, 3)  — rotate all points by all rotations at once
-    rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
+    rotated = _rotate_tilted_points_fp32(pts, rotation_matrices)
 
     # Build (T, 3, B, 2) coords for planes XY, ZX, YZ in one shot.
     # Plane axis layout: XY=(0,1), ZX=(2,0), YZ=(1,2). Stacking views avoids the
@@ -498,11 +503,11 @@ class KPlanesTILTED(KPlanes):
         input_coords_dims: int = 3,
         M_features: int = 32,
         resolution: Sequence[int] = (200, 200, 200),
-        multiscale_res_multipliers: Optional[Sequence[float]] = None,
+        multiscale_res_multipliers: Sequence[float] | None = None,
         density_activation: Callable = lambda x: F.softplus(x - 1),
         # TILTED parameters
         T: int = 4,
-        tau_init: str = "random",
+        tau_init: Literal["random", "identity"] = "random",
         # Hybrid MLP parameters
         use_hybrid_mlp: bool = False,
         hybrid_hidden_dim: int = 64,
@@ -512,7 +517,7 @@ class KPlanesTILTED(KPlanes):
         c2f_blur_sigma0: float = 0.0,
         c2f_blur_frac: float = 0.0,
     ):
-        self._td_type = "tilted"
+        self.td_type = "tilted"
         if input_coords_dims != 3:
             raise NotImplementedError("KPlanesTILTED is implemented for 3D only.")
         if T < 1:
@@ -589,7 +594,7 @@ class KPlanesTILTED(KPlanes):
     def blur_sigma(self) -> float:
         return self._blur_sigma
 
-    def _active_scale_gates(self) -> Optional[list[float]]:
+    def _active_scale_gates(self) -> list[float] | None:
         """Per-scale gates, or None when every gate is fully open."""
         if all(g == 1.0 for g in self._scale_gates):
             return None
@@ -700,7 +705,9 @@ class KPlanesTILTED(KPlanes):
             f"num_scales={len(self.multiscale_res_multipliers)}"
         )
 
-    def set_so3_param_type(self, so3_param_type: str, init: str = "rand") -> None:
+    def set_so3_param_type(
+        self, so3_param_type: str, init: Literal["random", "identity"] = "random"
+    ) -> None:
         """
         Set the SO3 parameterization type.
 
@@ -737,7 +744,7 @@ def interpolate_ms_features_cp_tilted(
     B = pts.shape[0]
 
     # Rotate all points by all rotations: (T, B, 3)
-    rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
+    rotated = _rotate_tilted_points_fp32(pts, rotation_matrices)
 
     # For each transform t, we need three 1D samples: at x_t, y_t, z_t.
     # Lay them out as (3T, B) coords, matching each line grid's first dim.
@@ -791,14 +798,14 @@ class CPTilted(PPLR, TensorDecompositionModel):
         self,
         C: int = 4,  # channels per transform per scale
         resolution: Sequence[int] = (128, 128, 128),
-        multiscale_res_multipliers: Optional[Sequence[int]] = None,
+        multiscale_res_multipliers: Sequence[float] | None = None,
         T: int = 4,
-        tau_init: str = "random",
+        tau_init: Literal["random", "identity"] = "random",
         density_activation: Callable = lambda x: F.softplus(x - 1),
         so3_param_type: str = "r9svd",
     ):
         super().__init__()
-        self._td_type = "cp_tilted"
+        self.td_type = "cp_tilted"
         self.T = T
         self.C = C
         self.resolution = list(resolution)
@@ -848,10 +855,6 @@ class CPTilted(PPLR, TensorDecompositionModel):
     @property
     def param_keys(self):
         return ["grids", "sigma_net", "so3"]
-
-    @property
-    def td_type(self) -> str:
-        return self._td_type
 
     def extract_tau_state(self) -> torch.Tensor:
         """Detached CPU copy of the current rotations as (T, 3, 3) SO(3) matrices."""

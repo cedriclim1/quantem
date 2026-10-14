@@ -171,6 +171,62 @@ class OptimizerParams:
             """).strip()
 
     @dataclass
+    class LBFGS:
+        """
+        LBFGS optimizer (``torch.optim.LBFGS``).
+
+        Parameters
+        ----------
+        lr : float
+            Learning rate. Default: 1.0.
+        max_iter : int
+            Max iterations per optimizer step. Default: 20.
+        max_eval : int | None
+            Max function evaluations per step. Default: None.
+        tolerance_grad : float
+            Termination tolerance on first-order optimality. Default: 1e-7.
+        tolerance_change : float
+            Termination tolerance on parameter/function changes. Default: 1e-9.
+        history_size : int
+            Update history size. Default: 100.
+        line_search_fn : Literal["strong_wolfe"] | None
+            Optional line-search function. Default: "strong_wolfe".
+        """
+
+        lr: float = 1.0
+        max_iter: int = 20
+        max_eval: int | None = None
+        tolerance_grad: float = 1e-7
+        tolerance_change: float = 1e-9
+        history_size: int = 100
+        line_search_fn: Literal["strong_wolfe"] | None = "strong_wolfe"
+        _name: str = "lbfgs"
+
+        def params(self) -> dict:
+            return {
+                "lr": self.lr,
+                "max_iter": self.max_iter,
+                "max_eval": self.max_eval,
+                "tolerance_grad": self.tolerance_grad,
+                "tolerance_change": self.tolerance_change,
+                "history_size": self.history_size,
+                "line_search_fn": self.line_search_fn,
+            }
+
+        def __str__(self) -> str:
+            return textwrap.dedent(f"""
+                OptimizerParams.LBFGS(
+                    lr = {self.lr},
+                    max_iter = {self.max_iter},
+                    max_eval = {self.max_eval},
+                    tolerance_grad = {self.tolerance_grad},
+                    tolerance_change = {self.tolerance_change},
+                    history_size = {self.history_size},
+                    line_search_fn = {self.line_search_fn},
+                )
+            """).strip()
+
+    @dataclass
     class NoneOptimizer:
         """
         Sentinel optimizer that disables optimization.
@@ -213,6 +269,8 @@ class OptimizerParams:
             return OptimizerParams.AdamW(**d)
         elif name == "sgd":
             return OptimizerParams.SGD(**d)
+        elif name == "lbfgs":
+            return OptimizerParams.LBFGS(**d)
         elif name == "none":
             return OptimizerParams.NoneOptimizer()
         else:
@@ -223,6 +281,7 @@ OptimizerParamsType = (
     OptimizerParams.Adam
     | OptimizerParams.AdamW
     | OptimizerParams.SGD
+    | OptimizerParams.LBFGS
     | OptimizerParams.NoneOptimizer
 )
 
@@ -685,6 +744,18 @@ class OptimizerMixin:
                 return torch.optim.AdamW(param_groups, fused=fused)
             case OptimizerParams.SGD():
                 return torch.optim.SGD(param_groups)
+            case OptimizerParams.LBFGS():
+                base_hyperparams = {k: v for k, v in param_groups[0].items() if k != "params"}
+                flat_params = list(param_groups[0]["params"])
+                for group in param_groups[1:]:
+                    hyperparams = {k: v for k, v in group.items() if k != "params"}
+                    if hyperparams != base_hyperparams:
+                        raise ValueError(
+                            "LBFGS does not support per-parameter-group hyperparameters. "
+                            "All LBFGS groups must share identical settings."
+                        )
+                    flat_params.extend(group["params"])
+                return torch.optim.LBFGS(flat_params, **base_hyperparams)
             case OptimizerParams.NoneOptimizer():
                 raise ValueError(
                     "NoneOptimizer must be filtered out before _build_optimizer; "

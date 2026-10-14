@@ -49,6 +49,8 @@ defaults: list[Mapping] = [_defaults]
 no_default = "__no_default__"
 config_lock = threading.Lock()
 
+ENV_PREFIX = "QUANTEM_"
+
 PATH = Path(os.getenv("QUANTEM_CONFIG", "~/.config/quantem")).expanduser().resolve()
 
 config: dict = {}
@@ -78,7 +80,7 @@ class set:
         **kwargs,
     ):
         self.config: dict = config
-        self._record = []
+        self._record: list[tuple[str, tuple[str, ...], Any]] = []
 
         if arg is not None:
             if not isinstance(arg, (Mapping)):
@@ -95,12 +97,23 @@ class set:
     def __enter__(self):
         return self.config
 
+    def __exit__(self, type, value, traceback):
+        for op, path, value in reversed(self._record):
+            d = self.config
+            for key in path[:-1]:
+                d = d[key]
+            if op == "replace":
+                d[path[-1]] = value
+            else:
+                d.pop(path[-1], None)
+
     def _assign(
         self,
         keys: Sequence[str],
         value: Any,
         d: dict,
         path: tuple[str, ...] = (),
+        record: bool = True,
     ) -> None:
         """Assign value into a nested configuration dictionary
 
@@ -114,17 +127,27 @@ class set:
             value
         path : tuple[str], optional
             The path history up to this point.
+        record : bool, optional
+            Whether this operation needs to be recorded to allow for rollback.
         """
         key = canonical_name(keys[0], d)
 
         path = path + (key,)
 
         if len(keys) == 1:
+            if record:
+                if key in d:
+                    self._record.append(("replace", path, d[key]))
+                else:
+                    self._record.append(("insert", path, None))
             d[key] = value
         else:
             if key not in d:
+                if record:
+                    self._record.append(("insert", path, None))
                 d[key] = {}
-            self._assign(keys[1:], value, d[key], path)
+                record = False
+            self._assign(keys[1:], value, d[key], path, record=record)
 
 
 def refresh(config: dict = config, defaults: list[Mapping] = defaults, **kwargs) -> None:
@@ -197,12 +220,14 @@ def update_defaults(new: dict, config: dict = config, defaults: list[Mapping] = 
     2.  Updates the global config with the new configuration
         prioritizing older values over newer ones
     """
-    for key, value in new.items():
+    current_defaults = merge(*defaults)
+    # Registered before the keys are checked: they are what "known key" means.
+    defaults.append(new)
+
+    for key, value in list(new.items()):
         key, nval = check_key_val(key, value)
         new[key] = nval
 
-    current_defaults = merge(*defaults)
-    defaults.append(new)
     update(config, new, priority="new-defaults", defaults=current_defaults)
 
 
@@ -210,9 +235,9 @@ def _initialize() -> None:
     fn = os.path.join(os.path.dirname(__file__), "quantem.yaml")
 
     with open(fn) as f:
-        _defaults = yaml.safe_load(f)
+        shipped = yaml.safe_load(f)
 
-    update_defaults(_defaults)
+    update_defaults(shipped)
 
 
 def canonical_name(k: str, config: dict) -> str:
@@ -243,6 +268,7 @@ def update(
     new: Mapping,
     priority: Literal["old", "new", "new-defaults"] = "new",
     defaults: Mapping | None = None,
+    check: bool = True,
 ) -> dict:
     """Update a nested dictionary with values from another
 
@@ -258,6 +284,9 @@ def update(
         If 'new-defaults', a mapping should be given of the current defaults.
         Only if a value in ``old`` matches the current default, it will be
         updated with ``new``.
+    check: bool
+        Whether to run the keys through :func:`check_key_val`. False on the
+        recursive call, because the unknown-key warning is about top-level keys.
 
     Examples
     --------
@@ -279,7 +308,8 @@ def update(
 
     """
     for k, v in new.items():
-        k, v = check_key_val(k, v)
+        if check:
+            k, v = check_key_val(k, v)
         k = canonical_name(k, old)
 
         if isinstance(v, Mapping):
@@ -290,6 +320,7 @@ def update(
                 v,
                 priority=priority,
                 defaults=defaults.get(k) if defaults else None,
+                check=False,
             )
         else:
             if (
@@ -317,7 +348,8 @@ def collect(path: Path | str = PATH, env: Mapping[str, str] | None = None) -> di
         A list of paths to search for yaml config files
 
     env : Mapping[str, str]
-        The system environment variables
+        The system environment variables. Values found here take
+        precedence over those read from the yaml files.
 
     Returns
     -------
@@ -327,8 +359,7 @@ def collect(path: Path | str = PATH, env: Mapping[str, str] | None = None) -> di
     if env is None:
         env = os.environ
 
-    # configs = [*collect_yaml(paths=paths), collect_env(env=env)] # skipping env
-    configs = list([*collect_yaml(path=Path(path))])
+    configs = [*collect_yaml(path=Path(path)), collect_env(env=env)]
     return merge(*configs)
 
 
@@ -367,7 +398,7 @@ def collect_env(env: Mapping[str, str] | None = None) -> dict:
     turns these into config variables of the form ``{"foo": {"bar-baz": 123}}``
     It transforms the key and value in the following way:
 
-    -  Lower-cases the key text
+    -  Strips the ``QUANTEM_`` prefix and lower-cases the rest
     -  Treats ``__`` (double-underscore) as nested access
     -  Calls ``ast.literal_eval`` on the value
     """
@@ -378,8 +409,10 @@ def collect_env(env: Mapping[str, str] | None = None) -> dict:
     d = {}
 
     for name, value in env.items():
-        if name.startswith("QUANTEM_"):
-            varname = name[5:].lower().replace("__", ".")
+        # QUANTEM_CONFIG says where the config files are; it is not one of
+        # the keys they hold.
+        if name.startswith(ENV_PREFIX) and name != "QUANTEM_CONFIG":
+            varname = name[len(ENV_PREFIX) :].lower().replace("__", ".")
             d[varname] = interpret_value(value)
 
     result: dict = {}
@@ -412,7 +445,7 @@ def merge(*dicts: Mapping) -> dict:
     """
     result: dict = {}
     for d in dicts:
-        update(result, d)
+        update(result, d, check=False)
     return result
 
 
@@ -438,12 +471,17 @@ def _load_config_file(path: str) -> dict | None:
 
 
 def check_key_val(key: str, val: Any, deprecations: dict = deprecations) -> tuple[str, Any]:
-    """Check if the provided value has been renamed or removed
+    """Check whether a key has been renamed, removed, or is not one we ship
+
+    A key that is none of the registered defaults warns and is still set: config
+    is not a schema, and refusing an unknown key would break anything that stores
+    its own.
 
     Parameters
     ----------
     key : str
-        The configuration key to check
+        The configuration key to check. May be dotted, in which case only the
+        part before the first '.' is checked.
     deprecations : Dict[str, str]
         The mapping of aliases
 
@@ -478,6 +516,13 @@ def check_key_val(key: str, val: Any, deprecations: dict = deprecations) -> tupl
             )
         else:
             raise ValueError(f'Configuration value "{key}" has been removed')
+
+    top = key.split(".")[0]
+    # The top-level keys of the registered defaults, not merge(*defaults):
+    # merge() goes through update(), which calls back into here.
+    known = {k for d in defaults for k in d}
+    if top not in known and top not in deprecations:
+        warnings.warn(f'Unknown configuration key "{key}"')
 
     new_val = val
     if key in aliases:
@@ -603,5 +648,5 @@ def device() -> str:
     return get("device")
 
 
-refresh()
 _initialize()
+refresh()

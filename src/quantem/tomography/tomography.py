@@ -32,6 +32,7 @@ from quantem.tomography.object_models import (
     ObjectINR,
     ObjectPixelated,
     ObjectTensorDecomp,
+    _tomography_autocast,
     _unwrap,
 )
 from quantem.tomography.radon.radon import iradon_torch, radon_torch
@@ -183,6 +184,7 @@ class Tomography(TomographyOpt, TomographyBase):
         snapshot_dir: str | Path | None = None,
         snapshot_callback: Callable[[int, np.ndarray | None], None] | None = None,
         pose_warmup_epochs: int = 0,
+        use_bfloat16: bool = True,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -359,11 +361,7 @@ class Tomography(TomographyOpt, TomographyBase):
             for batch_idx, batch in enumerate(self.dataloader):
                 nvtx.range_push("batch")
                 self.zero_grad_all()
-                with torch.autocast(
-                    device_type=self.device.type,
-                    dtype=torch.bfloat16,
-                    enabled=False,
-                ):
+                with _tomography_autocast(self.device, use_bfloat16):
                     nvtx.range_push("get_coords")
                     all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
                     nvtx.range_pop()
@@ -523,6 +521,7 @@ class Tomography(TomographyOpt, TomographyBase):
                     num_samples_per_ray=curr_num_samples_per_ray,
                     object_extent=N,
                     loss_func=loss_func,
+                    use_bfloat16=use_bfloat16,
                 )
                 if getattr(self, "val_fg_dataloader", None) is not None:
                     avg_val_fg_loss = self._evaluate_validation_loss(
@@ -530,6 +529,7 @@ class Tomography(TomographyOpt, TomographyBase):
                         num_samples_per_ray=curr_num_samples_per_ray,
                         object_extent=N,
                         loss_func=loss_func,
+                        use_bfloat16=use_bfloat16,
                     )
                 if getattr(self, "val_bg_dataloader", None) is not None:
                     avg_val_bg_loss = self._evaluate_validation_loss(
@@ -537,6 +537,7 @@ class Tomography(TomographyOpt, TomographyBase):
                         num_samples_per_ray=curr_num_samples_per_ray,
                         object_extent=N,
                         loss_func=loss_func,
+                        use_bfloat16=use_bfloat16,
                     )
                 nvtx.range_pop()  # validation
 
@@ -784,7 +785,9 @@ class Tomography(TomographyOpt, TomographyBase):
         num_samples_per_ray: int,
         object_extent: int,
         loss_func: torch.nn.Module,
+        use_bfloat16: bool = True,
     ) -> float | None:
+        """Rank-averaged holdout loss, with the same precision handling as training."""
         val_loss = torch.tensor(0.0, device=self.device)
         val_batches = torch.tensor(0.0, device=self.device)
         model_was_training = self.obj_model.model.training
@@ -795,14 +798,7 @@ class Tomography(TomographyOpt, TomographyBase):
         try:
             with torch.no_grad():
                 for batch in dataloader:
-                    # Match the training pass (enabled=False): bf16 autocast breaks
-                    # the so3 pose solve and would make validation inconsistent with
-                    # the fp32 training loss it is compared to.
-                    with torch.autocast(
-                        device_type=self.device.type,
-                        dtype=torch.bfloat16,
-                        enabled=False,
-                    ):
+                    with _tomography_autocast(self.device, use_bfloat16):
                         all_coords = self.dset.get_coords(
                             batch, object_extent, num_samples_per_ray
                         )

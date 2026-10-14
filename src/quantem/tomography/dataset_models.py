@@ -321,6 +321,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
         _token: object | None = None,
     ):
         AutoSerialize.__init__(self)
@@ -329,7 +330,9 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         if _token is not self._token:
             raise RuntimeError("Use TomographyPixDataset.from_* to instantiate this class.")
 
-        if tilt_stack.shape[0] != len(tilt_angles):
+        if not (
+            tilt_stack.shape[0] == tilt_angles.shape[0]
+        ):
             raise ValueError(
                 "The number of tilt projections should be in the first dimension of the dataset."
             )
@@ -338,9 +341,10 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
             tilt_stack = torch.from_numpy(tilt_stack)
         if type(tilt_angles) is not torch.Tensor:
             tilt_angles = torch.from_numpy(tilt_angles)
-        max_val = torch.quantile(tilt_stack, 0.95)
-        # A sparse stack (>95% zeros) has a zero 95th quantile; dividing by it
-        # would turn the targets into inf/NaN and poison the first backward.
+        if norm_quantile:
+            max_val = torch.quantile(tilt_stack, 0.95)
+        else:
+            max_val = torch.max(tilt_stack)
         if max_val <= 0:
             max_val = tilt_stack.abs().max()
         if max_val <= 0:
@@ -377,12 +381,14 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
     ):
         return cls(
             tilt_stack=tilt_stack,
             tilt_angles=tilt_angles,
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
+            norm_quantile=norm_quantile,
             _token=cls._token,
         )
 
@@ -567,6 +573,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
         _token: object | None = None,
     ):
         super().__init__(
@@ -574,6 +581,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
             tilt_angles=-tilt_angles,  # TODO: Flip the tilt angles to be negative to match the convention of INR.
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
+            norm_quantile=norm_quantile,
             _token=_token,
         )
 
@@ -762,12 +770,20 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
         ray_sampling: str = "box_fixed_ds",
         ray_ds: float | None = None,
         seed: int = 42,
         _token: object | None = None,
     ):
-        super().__init__(tilt_stack, tilt_angles, learn_shift, learn_tilt_axis, _token=_token)
+        super().__init__(
+            tilt_stack,
+            tilt_angles,
+            learn_shift,
+            learn_tilt_axis,
+            norm_quantile,
+            _token=_token,
+        )
 
         # --- Ray-sampling scheme ---
         # "legacy"       : detector-frame z in [-1, 1] swept with a FIXED count of points,
@@ -794,22 +810,22 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
         ray_sampling: str = "box_fixed_ds",
         ray_ds: float | None = None,
     ):
-
         if ray_sampling == "box_fixed_ds":
             if ray_ds is None:
                 ray_ds = 2.0 / max(tilt_stack.shape)
             else:
                 ray_ds = float(ray_ds)
 
-
         return cls(
             tilt_stack=tilt_stack,
             tilt_angles=tilt_angles,
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
+            norm_quantile=norm_quantile,
             ray_sampling=ray_sampling,
             ray_ds=ray_ds,
             _token=cls._token,
@@ -871,57 +887,67 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
     def get_coords(
         self, batch: dict[str, torch.Tensor], N: int, num_samples_per_ray: int
     ) -> torch.Tensor:
-        pixel_i = batch["pixel_i"].float().to(self.device, non_blocking=True)
-        pixel_j = batch["pixel_j"].float().to(self.device, non_blocking=True)
-        # target_values = batch["target_value"].to(self.device, non_blocking=True)
-        phis = batch["phi"].to(self.device, non_blocking=True)
-        projection_indices = batch["projection_idx"].to(self.device, non_blocking=True)
-
-        shifts, z1_params, z3_params = self.forward(None)
-        batch_shifts = torch.index_select(shifts, 0, projection_indices)
-        batch_z1 = torch.index_select(z1_params, 0, projection_indices)
-        batch_z3 = torch.index_select(z3_params, 0, projection_indices)
-
-        if getattr(self, "ray_sampling", "legacy") == "box_fixed_ds":
-            return self._get_coords_box_fixed_ds(
-                pixel_i=pixel_i,
-                pixel_j=pixel_j,
-                phis=phis,
-                batch_z1=batch_z1,
-                batch_z3=batch_z3,
-                batch_shifts=batch_shifts,
-                N=N,
-                num_samples_per_ray=num_samples_per_ray,
+        with torch.autocast(device_type=self.device.type, enabled=False):
+            pixel_i = batch["pixel_i"].to(
+                self.device, dtype=torch.float32, non_blocking=True
             )
+            pixel_j = batch["pixel_j"].to(
+                self.device, dtype=torch.float32, non_blocking=True
+            )
+            phis = batch["phi"].to(self.device, dtype=torch.float32, non_blocking=True)
+            projection_indices = batch["projection_idx"].to(self.device, non_blocking=True)
 
-        with torch.no_grad():
-            batch_ray_coords = self.create_batch_rays(pixel_i, pixel_j, N, num_samples_per_ray)
+            shifts, z1_params, z3_params = self.forward(None)
+            batch_shifts = torch.index_select(shifts.float(), 0, projection_indices)
+            batch_z1 = torch.index_select(z1_params.float(), 0, projection_indices)
+            batch_z3 = torch.index_select(z3_params.float(), 0, projection_indices)
 
-        transformed_rays = self.transform_batch_rays(
-            batch_ray_coords,
-            z1=batch_z1,
-            x=phis,
-            z3=batch_z3,
-            shifts=batch_shifts,
-            N=N,
-            sampling_rate=1.0,
-        )
-        all_coords = transformed_rays.view(-1, 3)
+            if getattr(self, "ray_sampling", "legacy") == "box_fixed_ds":
+                return self._get_coords_box_fixed_ds(
+                    pixel_i=pixel_i,
+                    pixel_j=pixel_j,
+                    phis=phis,
+                    batch_z1=batch_z1,
+                    batch_z3=batch_z3,
+                    batch_shifts=batch_shifts,
+                    N=N,
+                    num_samples_per_ray=num_samples_per_ray,
+                )
 
-        all_coords = all_coords.to(self.device, dtype=torch.float32, non_blocking=True)
-        return all_coords
+            with torch.no_grad():
+                batch_ray_coords = self.create_batch_rays(
+                    pixel_i, pixel_j, N, num_samples_per_ray
+                )
+
+            transformed_rays = self.transform_batch_rays(
+                batch_ray_coords,
+                z1=batch_z1,
+                x=phis,
+                z3=batch_z3,
+                shifts=batch_shifts,
+                N=N,
+                sampling_rate=1.0,
+            )
+            return transformed_rays.reshape(-1, 3)
 
     @staticmethod
-    @torch.compile(mode="reduce-overhead")
     def create_batch_rays(
         pixel_i: torch.Tensor, pixel_j: torch.Tensor, N: int, num_samples_per_ray: int
     ) -> torch.Tensor:
         batch_size = len(pixel_i)
         x_coords = (pixel_j / (N - 1)) * 2 - 1
         y_coords = (pixel_i / (N - 1)) * 2 - 1
-        z_coords = torch.linspace(-1, 1, num_samples_per_ray, device=pixel_i.device)
+        z_coords = torch.linspace(
+            -1, 1, num_samples_per_ray, device=pixel_i.device, dtype=torch.float32
+        )
 
-        rays = torch.zeros(batch_size, num_samples_per_ray, 3, device=pixel_i.device)
+        rays = torch.zeros(
+            batch_size,
+            num_samples_per_ray,
+            3,
+            device=pixel_i.device,
+            dtype=torch.float32,
+        )
 
         rays[:, :, 0] = x_coords.unsqueeze(1)
         rays[:, :, 1] = y_coords.unsqueeze(1)
@@ -1239,7 +1265,6 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         return (per_ray / denominator).mean()
 
     @staticmethod
-    @torch.compile(mode="reduce-overhead")
     def _integrate_rays_legacy(
         rays: torch.Tensor, num_samples_per_ray: int, target_values_len: int
     ) -> torch.Tensor:
