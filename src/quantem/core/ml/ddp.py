@@ -51,6 +51,16 @@ class DDPMixin:
 
         self.device = device
 
+    def teardown_distributed(self):
+        """Barrier, then destroy the process group from ``setup_distributed``.
+
+        Frees the NCCL communicators and silences the exit-time resource-leak
+        warning. A no-op when distributed was never initialised.
+        """
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+
     def setup_dataloader(
         self,
         dataset: Dataset | DatasetModelType,

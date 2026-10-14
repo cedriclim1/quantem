@@ -276,9 +276,18 @@ ObjConstraintsType = (
 
 
 def _unwrap(model: nn.Module | nn.parallel.DistributedDataParallel) -> PlanarDecompositionModel:
-    """Unwrap a DistributedDataParallel model to get the underlying module ONLY for tensor decomposition models."""
-    if isinstance(model, nn.parallel.DistributedDataParallel):
-        return cast(PlanarDecompositionModel, model.module)
+    """Unwrap to the underlying tensor-decomposition module.
+
+    Strips the DistributedDataParallel wrapper (``.module``) and the ``torch.compile``
+    wrapper (``OptimizedModule._orig_mod``), in either order, at most four levels deep.
+    """
+    for _ in range(4):
+        if isinstance(model, nn.parallel.DistributedDataParallel):
+            model = model.module
+        elif hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        else:
+            break
     return cast(PlanarDecompositionModel, model)
 
 

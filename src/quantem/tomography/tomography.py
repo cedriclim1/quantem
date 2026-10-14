@@ -465,11 +465,12 @@ class Tomography(TomographyOpt, TomographyBase):
                 consistency_loss += batch_consistency_loss.detach()
                 nvtx.range_pop()  # batch
 
-            if isinstance(self.obj_model.model, CPTilted):
+            raw_model = _unwrap(self.obj_model.model)
+            if isinstance(raw_model, CPTilted):
                 if a0 == 0:
-                    prev_R = self.obj_model.model.so3.as_matrix().detach().clone()
+                    prev_R = raw_model.so3.as_matrix().detach().clone()
                 elif (a0 + 1) % 20 == 0:
-                    R_now = self.obj_model.model.so3.as_matrix().detach()
+                    R_now = raw_model.so3.as_matrix().detach()
                     # Cumulative angular change per rotation over the last 20 iters.
                     # trace(R_prev^T R_now) = 1 + 2*cos(theta), so theta = acos((trace - 1) / 2).
                     rel_trace = torch.einsum("tij,tij->t", prev_R, R_now)
