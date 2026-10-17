@@ -234,6 +234,129 @@ class TestTomographyINRDataset:
         assert bool(z3.any()) == learn_tilt_axis
 
 
+def _write_pose_init(path, n, z1=None, z3=None, tilt=None, shifts=None):
+    zeros = np.zeros(n, dtype=np.float32)
+    np.savez(
+        path,
+        z1_deg=zeros if z1 is None else z1,
+        z3_deg=zeros if z3 is None else z3,
+        tilt_offset_deg=zeros if tilt is None else tilt,
+        shifts_xy_px=np.zeros((n, 2), dtype=np.float32) if shifts is None else shifts,
+    )
+    return str(path)
+
+
+def _coords(d, idxs, N=12, S=4):
+    batch = torch.utils.data.default_collate([d[i] for i in idxs])
+    return d.get_coords(batch, N=N, num_samples_per_ray=S)
+
+
+@requires_torch
+class TestINRPoseZ1Z3TiltAngle:
+    """Separate z1 / z3 groups, the per-view tilt-angle offset and pose_init."""
+
+    def test_learn_tilt_axis_with_z1_raises(self):
+        with pytest.raises(ValueError):
+            TomographyINRDataset.from_data(
+                _stack(), np.linspace(-60, 60, 5, dtype="f4"), learn_tilt_axis=True, learn_z1=True
+            )
+
+    def test_separate_groups_from_shared_spec(self):
+        d = TomographyINRDataset.from_data(
+            _stack(),
+            np.linspace(-60, 60, 5, dtype="f4"),
+            learn_shift=True,
+            learn_tilt_axis=False,
+            learn_z1=True,
+            learn_z3=True,
+            learn_tilt_angle=True,
+        )
+        d.to("cpu")
+        d.set_optimizer(OptimizerParams.Adam(lr=1e-2))
+        groups = {group["name"]: group["params"] for group in d.optimizer.param_groups}
+        assert set(groups) == {"pose_shift", "pose_z1", "pose_z3", "pose_tilt_angle"}
+        assert groups["pose_z1"][0] is d._z1_params
+        assert groups["pose_z3"][0] is d._z3_params
+        assert groups["pose_tilt_angle"][0] is d._tilt_offset_params
+        assert d._tilt_offset_params.shape == (4,)
+
+    def test_forward_gates_z1_and_z3_separately(self):
+        d = TomographyINRDataset.from_data(
+            _stack(), np.linspace(-60, 60, 5, dtype="f4"), learn_tilt_axis=False, learn_z1=True
+        )
+        d.to("cpu")
+        d.z1_params.data.fill_(1.0)
+        d.z3_params.data.fill_(1.0)
+        _, z1, z3 = d.forward(None)
+        assert bool(z1.any()) and not bool(z3.any())
+
+    def test_tilt_offset_equals_shifted_nominal_angles(self, tmp_path):
+        # The INR dataset uses the input angles as phi; an offset of +delta on every view
+        # must equal reconstructing with input angles + delta and no offset.
+        angles, delta = np.linspace(-60, 60, 5, dtype="f4"), 1.7
+        n = len(angles)
+        init = _write_pose_init(tmp_path / "p.npz", n, tilt=np.full(n, delta, dtype="f4"))
+        kw = dict(learn_shift=False, learn_tilt_axis=False)
+        d = TomographyINRDataset.from_data(_stack(), angles, pose_init=init, **kw)
+        ref = TomographyINRDataset.from_data(_stack(), angles + delta, **kw)
+        plain = TomographyINRDataset.from_data(_stack(), angles, **kw)
+        for ds in (d, ref, plain):
+            ds.to("cpu")
+        idxs = [0, 150, 300, 450, 700]
+        cd, cp = _coords(d, idxs), _coords(plain, idxs)
+        assert torch.allclose(cd, _coords(ref, idxs), atol=1e-5)
+        # box sampling drops out-of-volume samples, so a changed angle may change the count
+        assert cd.shape != cp.shape or not torch.allclose(cd, cp, atol=1e-3)
+
+    def test_pose_init_loads_all_views_and_fixes_reference(self, tmp_path):
+        angles = np.linspace(-40, 60, 5, dtype="f4")  # reference view is index 2
+        n = len(angles)
+        vals = np.arange(n, dtype="f4") + 1.0
+        init = _write_pose_init(
+            tmp_path / "p.npz",
+            n,
+            z1=vals,
+            z3=-vals,
+            tilt=0.1 * vals,
+            shifts=np.stack([vals, -vals], 1),
+        )
+        d = TomographyINRDataset.from_data(
+            _stack(), angles, learn_tilt_axis=False, learn_tilt_angle=True, pose_init=init
+        )
+        d.to("cpu")
+        shifts, z1, z3 = d.forward(None)
+        np.testing.assert_allclose(z1.detach().numpy(), vals)
+        np.testing.assert_allclose(z3.detach().numpy(), -vals)
+        np.testing.assert_allclose(shifts.detach().numpy(), np.stack([vals, -vals], 1))
+        offsets = d.tilt_angle_offsets().detach().numpy()
+        np.testing.assert_allclose(offsets, 0.1 * vals, rtol=1e-6)
+        assert d._tilt_offset_ref.item() == pytest.approx(0.3)
+        d.set_optimizer(OptimizerParams.Adam(lr=1e-2))
+        optimized = [p for g in d.optimizer.param_groups for p in g["params"]]
+        assert all(p is not d._tilt_offset_ref for p in optimized)
+
+    def test_pose_init_wrong_shape_raises(self, tmp_path):
+        init = _write_pose_init(tmp_path / "p.npz", 4)
+        with pytest.raises(ValueError):
+            TomographyINRDataset.from_data(
+                _stack(), np.linspace(-60, 60, 5, dtype="f4"), pose_init=init
+            )
+
+    def test_tilt_offsets_survive_to_and_save_load(self, tmp_path):
+        angles = np.linspace(-60, 60, 5, dtype="f4")
+        d = TomographyINRDataset.from_data(_stack(), angles, learn_tilt_angle=True)
+        d.to("cpu")
+        d._tilt_offset_params.data.fill_(0.25)
+        d.to("cpu")
+        assert torch.allclose(d._tilt_offset_params.detach(), torch.full((4,), 0.25))
+        path = str(tmp_path / "params.pt")
+        d.save_parameters(path)
+        d2 = TomographyINRDataset.from_data(_stack(), angles, learn_tilt_angle=True)
+        d2.to("cpu")
+        d2.load_parameters(path)
+        assert torch.allclose(d2._tilt_offset_params.detach(), torch.full((4,), 0.25))
+
+
 class TestTomographyINRPretrainDataset:
     def test_len_and_getitem(self):
         vol = torch.rand(1, 8, 8, 8)

@@ -2,6 +2,7 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 from numpy.typing import NDArray
@@ -323,6 +324,10 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         learn_tilt_axis: bool = True,
         norm_quantile: bool = True,
         _token: object | None = None,
+        learn_z1: bool = False,
+        learn_z3: bool = False,
+        learn_tilt_angle: bool = False,
+        pose_init: str | None = None,
     ):
         AutoSerialize.__init__(self)
         OptimizerMixin.__init__(self)
@@ -357,6 +362,17 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         self.tilt_angles = tilt_angles
         self.learn_shift = learn_shift
         self.learn_tilt_axis = learn_tilt_axis
+        # learn_tilt_axis optimizes z1 and z3 together in one "pose_tilt_axis" group;
+        # learn_z1 / learn_z3 give each its own group ("pose_z1", "pose_z3") instead.
+        if learn_tilt_axis and (learn_z1 or learn_z3):
+            raise ValueError(
+                "learn_tilt_axis already learns z1 and z3; do not combine it with "
+                "learn_z1/learn_z3."
+            )
+        self.learn_z1 = learn_z1
+        self.learn_z3 = learn_z3
+        # Per-view offset (degrees) added to the nominal tilt angle, group "pose_tilt_angle".
+        self.learn_tilt_angle = learn_tilt_angle
 
         # The reference tilt angle is the one with the smallest absolute tilt angle.
         # I.e, the pose will not be optimized for the reference tilt angle.
@@ -367,11 +383,38 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         self._z1_angles = torch.zeros(self.learnable_tilts)
         self._z3_angles = torch.zeros(self.learnable_tilts)
         self._shifts = torch.zeros(self.learnable_tilts, 2)
+        self._tilt_offsets = torch.zeros(self.learnable_tilts)
 
         # Fixed zeros for reference tilt
         self._z1_ref = torch.zeros(1)
         self._z3_ref = torch.zeros(1)
         self._shifts_ref = torch.zeros(1, 2)
+        self._tilt_offset_ref = torch.zeros(1)
+
+        # Optional starting pose for every view, reference included: an .npz with z1_deg,
+        # z3_deg, tilt_offset_deg [n] and shifts_xy_px [n, 2]. The reference view keeps its
+        # given values fixed; the others start there and are learned only if enabled.
+        self.pose_init = pose_init
+        if pose_init is not None:
+            self._load_pose_init(pose_init)
+
+    def _load_pose_init(self, path: str) -> None:
+        data = np.load(path)
+        idx = self.reference_tilt_idx
+        n = self.tilt_angles.shape[0]
+
+        def split(key: str, shape: tuple[int, ...]) -> tuple[torch.Tensor, torch.Tensor]:
+            v = torch.as_tensor(np.asarray(data[key], dtype=np.float32))
+            if tuple(v.shape) != (n, *shape):
+                raise ValueError(
+                    f"pose_init {key} has shape {tuple(v.shape)}, expected {(n, *shape)}"
+                )
+            return torch.cat([v[:idx], v[idx + 1 :]]), v[idx : idx + 1].clone()
+
+        self._z1_angles, self._z1_ref = split("z1_deg", ())
+        self._z3_angles, self._z3_ref = split("z3_deg", ())
+        self._tilt_offsets, self._tilt_offset_ref = split("tilt_offset_deg", ())
+        self._shifts, self._shifts_ref = split("shifts_xy_px", (2,))
 
     # --- Class methods ---
     @classmethod
@@ -413,9 +456,15 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         z1 = self._z1_params.data if hasattr(self, "_z1_params") else self._z1_angles
         z3 = self._z3_params.data if hasattr(self, "_z3_params") else self._z3_angles
         shifts = self._shifts_params.data if hasattr(self, "_shifts_params") else self._shifts
+        tilt = (
+            self._tilt_offset_params.data
+            if hasattr(self, "_tilt_offset_params")
+            else self._tilt_offsets
+        )
         self._z1_params = nn.Parameter(z1.detach().to(device))
         self._z3_params = nn.Parameter(z3.detach().to(device))
         self._shifts_params = nn.Parameter(shifts.detach().to(device))
+        self._tilt_offset_params = nn.Parameter(tilt.detach().to(device))
 
     # --- Forward pass ---
     @abstractmethod
@@ -468,6 +517,27 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
     @learn_tilt_axis.setter
     def learn_tilt_axis(self, learn_tilt_axis: bool):
         self._learn_tilt_axis = learn_tilt_axis
+
+    @property
+    def has_pose_init(self) -> bool:
+        return getattr(self, "pose_init", None) is not None
+
+    @property
+    def learns_z1(self) -> bool:
+        return bool(self.learn_tilt_axis or getattr(self, "learn_z1", False))
+
+    @property
+    def learns_z3(self) -> bool:
+        return bool(self.learn_tilt_axis or getattr(self, "learn_z3", False))
+
+    @property
+    def learns_pose(self) -> bool:
+        return bool(
+            self.learn_shift
+            or self.learns_z1
+            or self.learns_z3
+            or getattr(self, "learn_tilt_angle", False)
+        )
 
     @property
     def reference_tilt_idx(self) -> int:
@@ -612,6 +682,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
         self._z1_ref = self._z1_ref.to(device)
         self._z3_ref = self._z3_ref.to(device)
         self._shifts_ref = self._shifts_ref.to(device)
+        self._tilt_offset_ref = self._tilt_offset_ref.to(device)
 
         self.device = device
 
@@ -775,6 +846,10 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         ray_ds: float | None = None,
         seed: int = 42,
         _token: object | None = None,
+        learn_z1: bool = False,
+        learn_z3: bool = False,
+        learn_tilt_angle: bool = False,
+        pose_init: str | None = None,
     ):
         super().__init__(
             tilt_stack,
@@ -783,6 +858,10 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             learn_tilt_axis,
             norm_quantile,
             _token=_token,
+            learn_z1=learn_z1,
+            learn_z3=learn_z3,
+            learn_tilt_angle=learn_tilt_angle,
+            pose_init=pose_init,
         )
 
         # --- Ray-sampling scheme ---
@@ -813,6 +892,10 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         norm_quantile: bool = True,
         ray_sampling: str = "box_fixed_ds",
         ray_ds: float | None = None,
+        learn_z1: bool = False,
+        learn_z3: bool = False,
+        learn_tilt_angle: bool = False,
+        pose_init: str | None = None,
     ):
         if ray_sampling == "box_fixed_ds":
             if ray_ds is None:
@@ -829,16 +912,26 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             ray_sampling=ray_sampling,
             ray_ds=ray_ds,
             _token=cls._token,
+            learn_z1=learn_z1,
+            learn_z3=learn_z3,
+            learn_tilt_angle=learn_tilt_angle,
+            pose_init=pose_init,
         )
 
     # --- Forward Pass w/ Params Method for OptimizerMixin ---
     def get_optimization_parameters(self) -> dict[str, list[torch.Tensor]]:
-        """Return independently tunable shift and tilt-axis parameter groups."""
+        """Return independently tunable shift, Euler-angle and tilt-angle parameter groups."""
         groups = {}
         if self.learn_shift:
             groups["pose_shift"] = [self._shifts_params]
         if self.learn_tilt_axis:
             groups["pose_tilt_axis"] = [self._z1_params, self._z3_params]
+        if self.learn_z1:
+            groups["pose_z1"] = [self._z1_params]
+        if self.learn_z3:
+            groups["pose_z3"] = [self._z3_params]
+        if self.learn_tilt_angle:
+            groups["pose_tilt_angle"] = [self._tilt_offset_params]
         return groups
 
     def _normalize_optimizer_params(
@@ -849,13 +942,19 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         if set(normalized) == {self.DEFAULT_OPTIMIZER_KEY}:
             spec = normalized[self.DEFAULT_OPTIMIZER_KEY]
             if not isinstance(spec, OptimizerParams.NoneOptimizer):
-                normalized = {
-                    key: spec
-                    for key in ("pose_shift", "pose_tilt_axis")
-                    if (key == "pose_shift" and self.learn_shift)
-                    or (key == "pose_tilt_axis" and self.learn_tilt_axis)
-                }
+                normalized = {key: spec for key in self.pose_group_keys()}
         return normalized
+
+    def pose_group_keys(self) -> list[str]:
+        """Names of the active pose optimizer groups, in get_optimization_parameters order."""
+        flags = (
+            ("pose_shift", self.learn_shift),
+            ("pose_tilt_axis", self.learn_tilt_axis),
+            ("pose_z1", self.learn_z1),
+            ("pose_z3", self.learn_z3),
+            ("pose_tilt_angle", self.learn_tilt_angle),
+        )
+        return [key for key, on in flags if on]
 
     def forward(self, dummy_input: Any = None):
         """
@@ -875,14 +974,20 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         second_half_z3 = self.z3_params[self.reference_tilt_idx :]
         z3 = torch.cat([first_half_z3, self._z3_ref, second_half_z3], dim=0)
 
-        if self.learn_shift and self.learn_tilt_axis:
-            return shifts, z1, z3
-        elif self.learn_shift:
-            return shifts, torch.zeros_like(z1), torch.zeros_like(z3)
-        elif self.learn_tilt_axis:
-            return torch.zeros_like(shifts), z1, z3
-        else:
-            return torch.zeros_like(shifts), torch.zeros_like(z1), torch.zeros_like(z3)
+        return (
+            shifts if self.learn_shift or self.has_pose_init else torch.zeros_like(shifts),
+            z1 if self.learns_z1 or self.has_pose_init else torch.zeros_like(z1),
+            z3 if self.learns_z3 or self.has_pose_init else torch.zeros_like(z3),
+        )
+
+    def tilt_angle_offsets(self) -> torch.Tensor:
+        """Per-view offsets (degrees) added to the nominal tilt angles; the reference is fixed."""
+        idx = self.reference_tilt_idx
+        p = self._tilt_offset_params
+        offsets = torch.cat([p[:idx], self._tilt_offset_ref, p[idx:]], dim=0)
+        if self.learn_tilt_angle or self.has_pose_init:
+            return offsets
+        return torch.zeros_like(offsets)
 
     def get_coords(
         self, batch: dict[str, torch.Tensor], N: int, num_samples_per_ray: int
@@ -901,6 +1006,9 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             batch_shifts = torch.index_select(shifts.float(), 0, projection_indices)
             batch_z1 = torch.index_select(z1_params.float(), 0, projection_indices)
             batch_z3 = torch.index_select(z3_params.float(), 0, projection_indices)
+            if self.learn_tilt_angle or self.has_pose_init:
+                offsets = self.tilt_angle_offsets().float()
+                phis = phis + torch.index_select(offsets, 0, projection_indices)
 
             if getattr(self, "ray_sampling", "legacy") == "box_fixed_ds":
                 return self._get_coords_box_fixed_ds(
@@ -1355,6 +1463,7 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         self._z1_ref = self._z1_ref.to(device)
         self._z3_ref = self._z3_ref.to(device)
         self._shifts_ref = self._shifts_ref.to(device)
+        self._tilt_offset_ref = self._tilt_offset_ref.to(device)
 
         self.device = device
         self.reconnect_optimizer_to_parameters()
@@ -1370,6 +1479,7 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
                 "z1": self._z1_params.detach().cpu(),
                 "z3": self._z3_params.detach().cpu(),
                 "shifts": self._shifts_params.detach().cpu(),
+                "tilt_offsets": self._tilt_offset_params.detach().cpu(),
             },
             path,
         )
@@ -1382,6 +1492,8 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         self._z1_params = nn.Parameter(data["z1"]).to(self.device)
         self._z3_params = nn.Parameter(data["z3"]).to(self.device)
         self._shifts_params = nn.Parameter(data["shifts"]).to(self.device)
+        if "tilt_offsets" in data:
+            self._tilt_offset_params = nn.Parameter(data["tilt_offsets"]).to(self.device)
         if self.optimizer is not None:
             self.reconnect_optimizer_to_parameters()
 
