@@ -1,4 +1,6 @@
 import os
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal, Self, Sequence
@@ -149,6 +151,30 @@ class Tomography(TomographyOpt, TomographyBase):
                 if p.grad is None:
                     p.grad = torch.zeros_like(p)
                 dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
+    @contextmanager
+    def _overhead_window(self):
+        """Add the enclosed non-training work to ``overhead_s``.
+
+        CUDA is synchronised at both ends so queued training kernels are not counted as
+        overhead and overhead kernels are not left to the next step. Nested windows count once.
+        """
+        if getattr(self, "_overhead_t0", None) is not None:
+            yield
+            return
+        cuda = str(self.device).startswith("cuda")
+        if cuda:
+            torch.cuda.synchronize(self.device)
+        self._overhead_t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            if cuda:
+                torch.cuda.synchronize(self.device)
+            self._overhead_s = getattr(self, "_overhead_s", 0.0) + (
+                time.perf_counter() - self._overhead_t0
+            )
+            self._overhead_t0 = None
 
     def reconstruct(
         self,
@@ -458,14 +484,15 @@ class Tomography(TomographyOpt, TomographyBase):
                 if snapshots_enabled and _should_take_grad_step_snapshot(
                     self._grad_steps, snapshot_every
                 ):
-                    _take_grad_step_snapshot(
-                        obj_model=self.obj_model,
-                        grad_step=self._grad_steps,
-                        global_rank=self.global_rank,
-                        logger=self.logger,
-                        snapshot_dir=snapshot_dir,
-                        snapshot_callback=snapshot_callback,
-                    )
+                    with self._overhead_window():
+                        _take_grad_step_snapshot(
+                            obj_model=self.obj_model,
+                            grad_step=self._grad_steps,
+                            global_rank=self.global_rank,
+                            logger=self.logger,
+                            snapshot_dir=snapshot_dir,
+                            snapshot_callback=snapshot_callback,
+                        )
                 total_loss += batch_loss.detach()
                 consistency_loss += batch_consistency_loss.detach()
                 nvtx.range_pop()  # batch
@@ -520,32 +547,33 @@ class Tomography(TomographyOpt, TomographyBase):
                 holdout_fraction <= 0.0 or (a0 + 1) % holdout_every == 0
             )
             if validate_this_epoch:
-                print("Validating...")
-                nvtx.range_push("validation")
-                avg_val_loss = self._evaluate_validation_loss(
-                    dataloader=self.val_dataloader,
-                    num_samples_per_ray=curr_num_samples_per_ray,
-                    object_extent=N,
-                    loss_func=loss_func,
-                    use_bfloat16=use_bfloat16,
-                )
-                if getattr(self, "val_fg_dataloader", None) is not None:
-                    avg_val_fg_loss = self._evaluate_validation_loss(
-                        dataloader=self.val_fg_dataloader,
+                with self._overhead_window():
+                    print("Validating...")
+                    nvtx.range_push("validation")
+                    avg_val_loss = self._evaluate_validation_loss(
+                        dataloader=self.val_dataloader,
                         num_samples_per_ray=curr_num_samples_per_ray,
                         object_extent=N,
                         loss_func=loss_func,
                         use_bfloat16=use_bfloat16,
                     )
-                if getattr(self, "val_bg_dataloader", None) is not None:
-                    avg_val_bg_loss = self._evaluate_validation_loss(
-                        dataloader=self.val_bg_dataloader,
-                        num_samples_per_ray=curr_num_samples_per_ray,
-                        object_extent=N,
-                        loss_func=loss_func,
-                        use_bfloat16=use_bfloat16,
-                    )
-                nvtx.range_pop()  # validation
+                    if getattr(self, "val_fg_dataloader", None) is not None:
+                        avg_val_fg_loss = self._evaluate_validation_loss(
+                            dataloader=self.val_fg_dataloader,
+                            num_samples_per_ray=curr_num_samples_per_ray,
+                            object_extent=N,
+                            loss_func=loss_func,
+                            use_bfloat16=use_bfloat16,
+                        )
+                    if getattr(self, "val_bg_dataloader", None) is not None:
+                        avg_val_bg_loss = self._evaluate_validation_loss(
+                            dataloader=self.val_bg_dataloader,
+                            num_samples_per_ray=curr_num_samples_per_ray,
+                            object_extent=N,
+                            loss_func=loss_func,
+                            use_bfloat16=use_bfloat16,
+                        )
+                    nvtx.range_pop()  # validation
 
             # The three losses were already rank-averaged (and batch-normalized) right
             # after the batch loop; re-reducing identical values here was a redundant
@@ -565,46 +593,47 @@ class Tomography(TomographyOpt, TomographyBase):
                 self._val_losses.append(avg_val_loss)
 
             if self.logger is not None:
-                if (
-                    self.logger.log_images_every > 0
-                    and self.num_epochs % self.logger.log_images_every == 0
-                ):
-                    pred_full = self.obj_model.obj_view
+                with self._overhead_window():
+                    if (
+                        self.logger.log_images_every > 0
+                        and self.num_epochs % self.logger.log_images_every == 0
+                    ):
+                        pred_full = self.obj_model.obj_view
+
+                        if self.global_rank == 0:
+                            self.logger.log_iter_images(
+                                pred_volume=pred_full,
+                                dataset_model=self.dset,
+                                iter=self.num_epochs,
+                            )
+                        pbar.set_description(
+                            f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e} | Images Logged"
+                        )
 
                     if self.global_rank == 0:
-                        self.logger.log_iter_images(
-                            pred_volume=pred_full,
-                            dataset_model=self.dset,
+                        self.logger.log_iter(
+                            object_model=self.obj_model,
                             iter=self.num_epochs,
+                            consistency_loss=consistency_loss,
+                            total_loss=total_loss,
+                            learning_rates=self.get_current_lrs(),
+                            num_samples_per_ray=curr_num_samples_per_ray,
+                            val_loss=avg_val_loss if validate_this_epoch else None,
+                            val_fg_loss=avg_val_fg_loss,
+                            val_bg_loss=avg_val_bg_loss,
+                            grad_step=self._grad_steps,
+                            soft_terms=epoch_soft_term_values,
                         )
-                    pbar.set_description(
-                        f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e} | Images Logged"
-                    )
+                        phase = getattr(self, "_recon_phase", None)
+                        if phase is not None:
+                            self.logger.log_scalar(
+                                "two_phase/phase",
+                                float(phase),
+                                self.num_epochs,
+                                extra_steps={"grad_step": self._grad_steps},
+                            )
 
-                if self.global_rank == 0:
-                    self.logger.log_iter(
-                        object_model=self.obj_model,
-                        iter=self.num_epochs,
-                        consistency_loss=consistency_loss,
-                        total_loss=total_loss,
-                        learning_rates=self.get_current_lrs(),
-                        num_samples_per_ray=curr_num_samples_per_ray,
-                        val_loss=avg_val_loss if validate_this_epoch else None,
-                        val_fg_loss=avg_val_fg_loss,
-                        val_bg_loss=avg_val_bg_loss,
-                        grad_step=self._grad_steps,
-                        soft_terms=epoch_soft_term_values,
-                    )
-                    phase = getattr(self, "_recon_phase", None)
-                    if phase is not None:
-                        self.logger.log_scalar(
-                            "two_phase/phase",
-                            float(phase),
-                            self.num_epochs,
-                            extra_steps={"grad_step": self._grad_steps},
-                        )
-
-                self.logger.flush()
+                    self.logger.flush()
             if not self.verbose:
                 if self.global_rank == 0:
                     print(
@@ -615,7 +644,8 @@ class Tomography(TomographyOpt, TomographyBase):
             # curves). Note `obj_view` is collective, so the callback must be invoked on
             # every rank; it is the caller's responsibility to guard rank-0-only work.
             if eval_callback is not None and eval_every > 0 and (a0 + 1) % eval_every == 0:
-                eval_callback(a0 + 1)
+                with self._overhead_window():
+                    eval_callback(a0 + 1)
             nvtx.range_pop()  # epoch
 
         if show_metrics and self.world_size == 1:

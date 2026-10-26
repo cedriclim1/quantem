@@ -8,6 +8,8 @@ through ``setup_distributed`` and so follow the ``torch_device`` fixture under
 ``requires_torch`` (build on CUDA when present; see conftest).
 """
 
+import time
+
 import numpy as np
 import pytest
 import torch
@@ -229,6 +231,45 @@ class TestInrFactory:
 
         with pytest.raises(ValueError, match="pose_warmup_epochs must be >= 0"):
             default_tomo.reconstruct(num_iter=0, pose_warmup_epochs=-1)
+
+    def test_overhead_window_nested_counts_once(self):
+        tomo = self._inr_tomo("cpu", n=4)
+        assert tomo.overhead_s == 0.0
+        with tomo._overhead_window():
+            with tomo._overhead_window():
+                time.sleep(0.02)
+            assert tomo.overhead_s >= 0.02
+        assert 0.02 <= tomo.overhead_s < 1.0
+        assert tomo._overhead_t0 is None
+
+    def test_reconstruct_counts_snapshot_and_callback_time_as_overhead(self):
+        tomo = self._inr_tomo("cpu", n=4)
+        seen = []
+
+        def slow_snapshot(_step, _volume):
+            time.sleep(0.05)
+
+        def record(_epoch):
+            seen.append(tomo.overhead_s)
+            time.sleep(0.05)
+
+        tomo.reconstruct(
+            num_iter=2,
+            batch_size=len(tomo.dset),
+            num_workers=0,
+            num_samples_per_ray=2,
+            optimizer_params={"object": OptimizerParams.Adam(lr=1e-3)},
+            eval_callback=record,
+            eval_every=1,
+            snapshot_every=1,
+            snapshot_callback=slow_snapshot,
+        )
+
+        assert tomo._grad_steps == 2
+        assert seen[0] >= 0.05
+        assert seen[1] >= seen[0] + 0.1
+        assert tomo.overhead_s >= 0.2
+        assert tomo._overhead_t0 is None
 
 
 @requires_torch
