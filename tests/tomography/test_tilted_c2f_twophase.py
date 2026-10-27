@@ -352,6 +352,43 @@ class TestTwoPhase:
         assert logger.snapshot_steps == snapshots
         assert logger.phases == [1.0, 1.0, 2.0, 2.0, 2.0]
 
+    def test_max_grad_steps_spans_both_phases(self, torch_device):
+        tomo = _tomo(torch_device)
+        spe = tomo.grad_steps_per_epoch(RECON_KWARGS["batch_size"])
+        snapshots, evals = [], []
+        summary = tomo.reconstruct_two_phase(
+            phase1={"num_iter": 2, "optimizer_params": _optimizer_params()},
+            num_iter=4,
+            optimizer_params=_optimizer_params(),
+            scheduler_params={"object": {"name": "cosine_annealing", "eta_min": 0.0}},
+            scheduler_step="grad_step",
+            max_grad_steps=3 * spe - 1,
+            snapshot_steps={3 * spe - 1},
+            snapshot_callback=lambda step, vol: snapshots.append(step),
+            eval_callback=evals.append,
+            eval_every=1,
+            **RECON_KWARGS,
+        )
+        assert summary["phase1_grad_steps"] == 2 * spe
+        assert summary["phase2_grad_steps"] == spe - 1
+        assert summary["total_grad_steps"] == tomo._grad_steps == 3 * spe - 1
+        assert summary["phase2_epochs"] == 1
+        assert snapshots == [3 * spe - 1]
+        assert evals == [1, 2, 3]
+        assert tomo.obj_model.get_current_lr() == pytest.approx(0.0, abs=1e-12)
+
+    def test_max_grad_steps_must_leave_phase2_steps(self, torch_device):
+        tomo = _tomo(torch_device)
+        spe = tomo.grad_steps_per_epoch(RECON_KWARGS["batch_size"])
+        with pytest.raises(ValueError, match="no phase-2 steps"):
+            tomo.reconstruct_two_phase(
+                phase1={"num_iter": 1, "optimizer_params": _optimizer_params()},
+                num_iter=3,
+                optimizer_params=_optimizer_params(),
+                max_grad_steps=spe,
+                **RECON_KWARGS,
+            )
+
     @pytest.mark.parametrize("phase1_iters", [0, 3, 4])
     def test_rejects_phase1_outside_budget(self, torch_device, phase1_iters):
         tomo = _tomo(torch_device)
