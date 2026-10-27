@@ -3,7 +3,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Literal, Self, Sequence
+from typing import Callable, Collection, Literal, Self, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml.loss_functions import get_loss_module
+from quantem.core.ml.optimizer_mixin import SchedulerParams
 from quantem.core.ml.profiling import nsys_capture_tick
 from quantem.core.ml.models.kplanes import CPTilted, KPlanesTILTED
 from quantem.core.utils.filter import gaussian_filter_2d_stack, gaussian_kernel_1d
@@ -210,6 +211,9 @@ class Tomography(TomographyOpt, TomographyBase):
         snapshot_callback: Callable[[int, np.ndarray | None], None] | None = None,
         pose_warmup_epochs: int = 0,
         use_bfloat16: bool = True,
+        max_grad_steps: int | None = None,
+        scheduler_step: Literal["epoch", "grad_step"] = "epoch",
+        snapshot_steps: Collection[int] | None = None,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -220,6 +224,15 @@ class Tomography(TomographyOpt, TomographyBase):
         inside it) and its output is upcast to FP32. Coordinates, rays and pose,
         ray integration, every loss and soft term, and holdout validation run in FP32.
         ``False`` is pure FP32 (no autocast; TF32 is disabled in ``setup_distributed``).
+
+        ``max_grad_steps`` ends training once this call has taken that many gradient steps,
+        mid-epoch if needed (``num_iter`` stays the epoch cap). The last epoch's losses are
+        averaged over the batches it ran, and that epoch is always validated and passed to
+        ``eval_callback``. ``scheduler_step="grad_step"`` builds new schedulers over this
+        call's planned steps (``num_iter`` epochs capped by ``max_grad_steps``) and steps them
+        after every optimizer step instead of at epoch ends; plateau schedulers need
+        ``"epoch"``. ``snapshot_steps`` adds explicit gradient steps (counted like
+        ``snapshot_every``, over the object's lifetime) to the snapshot cadence.
         """
         if snapshot_every < 0:
             raise ValueError("snapshot_every must be >= 0.")
@@ -229,7 +242,12 @@ class Tomography(TomographyOpt, TomographyBase):
             raise ValueError("holdout_every must be >= 1.")
         if val_fraction > 0.0 and holdout_fraction > 0.0:
             raise ValueError("Use either val_fraction or holdout_fraction, not both.")
-        snapshots_enabled = snapshot_every > 0
+        if max_grad_steps is not None and max_grad_steps < 1:
+            raise ValueError("max_grad_steps must be None or >= 1.")
+        if scheduler_step not in ("epoch", "grad_step"):
+            raise ValueError(f"scheduler_step must be 'epoch' or 'grad_step', got {scheduler_step!r}.")
+        step_schedulers_per_grad_step = scheduler_step == "grad_step"
+        extra_snapshot_steps = frozenset(int(s) for s in (snapshot_steps or ()))
 
         # Check device consistency
         self.obj_model.to(self.device)
@@ -265,7 +283,12 @@ class Tomography(TomographyOpt, TomographyBase):
             self.scheduler_params = scheduler_params
             new_scheduler = True
 
-        if new_scheduler:
+        if step_schedulers_per_grad_step and any(
+            isinstance(params, SchedulerParams.Plateau) for params in self.scheduler_params.values()
+        ):
+            raise ValueError("scheduler_step='grad_step' cannot drive a plateau scheduler.")
+
+        if new_scheduler and not step_schedulers_per_grad_step:
             self.set_schedulers(self.scheduler_params, num_iter=num_iter)
 
         if obj_constraints is not None:
@@ -315,6 +338,13 @@ class Tomography(TomographyOpt, TomographyBase):
                 "Only TomographyINRDataset is supported for this reconstruction method."
             )
 
+        planned_steps = num_iter * len(self.dataloader)
+        if max_grad_steps is not None:
+            planned_steps = min(planned_steps, max_grad_steps)
+        planned_steps = max(1, planned_steps)
+        if new_scheduler and step_schedulers_per_grad_step:
+            self.set_schedulers(self.scheduler_params, num_iter=planned_steps)
+
         pose_warmup_pending = pose_warmup_epochs > 0 and self.dset.has_optimizer()
         if pose_warmup_pending:
             # remove_optimizer also clears the stored specs; restore those specs without
@@ -347,7 +377,6 @@ class Tomography(TomographyOpt, TomographyBase):
             if isinstance(self.obj_model, ObjectINR)
             else None
         )
-        planned_steps = max(1, num_iter * len(self.dataloader))
         call_steps = 0
         if set_progress is not None:
             set_progress(0.0)
@@ -356,13 +385,17 @@ class Tomography(TomographyOpt, TomographyBase):
         for a0 in pbar:
             if pose_warmup_pending and a0 == pose_warmup_epochs:
                 self.dset.set_optimizer(self.optimizer_params["pose"])
-                self.dset.set_scheduler(self.scheduler_params["pose"], num_iter=num_iter)
+                self.dset.set_scheduler(
+                    self.scheduler_params["pose"],
+                    num_iter=planned_steps - call_steps if step_schedulers_per_grad_step else num_iter,
+                )
                 pose_warmup_pending = False
             nvtx.range_push(f"epoch_{a0}")
             consistency_loss = torch.tensor(0.0, device=self.device)
             total_loss = torch.tensor(0.0, device=self.device)
             epoch_soft_constraint_loss = torch.tensor(0.0, device=self.device)
             epoch_soft_terms: dict[str, torch.Tensor] = {}
+            epoch_batches = 0
             active_obj_constraints = self.obj_model.constraints
             distortion_enabled = getattr(active_obj_constraints, "distortion", 0.0) > 0
             active_dset_constraints = getattr(self.dset, "constraints", None)
@@ -475,14 +508,17 @@ class Tomography(TomographyOpt, TomographyBase):
                 self._sync_pose_gradients_ddp()
                 torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)
                 self.step_optimizers()
+                if step_schedulers_per_grad_step:
+                    self.step_schedulers()
                 nvtx.range_pop()
                 self._grad_steps = getattr(self, "_grad_steps", 0) + 1
                 call_steps += 1
                 if set_progress is not None:
                     set_progress(call_steps / planned_steps)
                 nsys_capture_tick(self._grad_steps)
-                if snapshots_enabled and _should_take_grad_step_snapshot(
-                    self._grad_steps, snapshot_every
+                if (
+                    _should_take_grad_step_snapshot(self._grad_steps, snapshot_every)
+                    or self._grad_steps in extra_snapshot_steps
                 ):
                     with self._overhead_window():
                         _take_grad_step_snapshot(
@@ -495,7 +531,11 @@ class Tomography(TomographyOpt, TomographyBase):
                         )
                 total_loss += batch_loss.detach()
                 consistency_loss += batch_consistency_loss.detach()
+                epoch_batches += 1
                 nvtx.range_pop()  # batch
+                if max_grad_steps is not None and call_steps >= max_grad_steps:
+                    break
+            stopping = max_grad_steps is not None and call_steps >= max_grad_steps
 
             raw_model = _unwrap(self.obj_model.model)
             if isinstance(raw_model, CPTilted):
@@ -524,7 +564,7 @@ class Tomography(TomographyOpt, TomographyBase):
                 dist.all_reduce(losses, dist.ReduceOp.AVG)
                 nvtx.range_pop()
             total_loss, consistency_loss, epoch_soft_constraint_loss = (
-                losses / len(self.dataloader)
+                losses / epoch_batches
             ).tolist()
 
             soft_term_names = sorted(epoch_soft_terms)
@@ -534,17 +574,18 @@ class Tomography(TomographyOpt, TomographyBase):
                 if self.world_size > 1:
                     dist.all_reduce(soft_term_losses, dist.ReduceOp.AVG)
                 epoch_soft_term_values = dict(
-                    zip(soft_term_names, (soft_term_losses / len(self.dataloader)).tolist())
+                    zip(soft_term_names, (soft_term_losses / epoch_batches).tolist())
                 )
 
-            self.step_schedulers(loss=total_loss)
+            if not step_schedulers_per_grad_step:
+                self.step_schedulers(loss=total_loss)
             # TODO: Maybe reorganize the losses so that the order makes sense lol.
 
             avg_val_loss = None
             avg_val_fg_loss = None
             avg_val_bg_loss = None
             validate_this_epoch = self.val_dataloader is not None and (
-                holdout_fraction <= 0.0 or (a0 + 1) % holdout_every == 0
+                holdout_fraction <= 0.0 or (a0 + 1) % holdout_every == 0 or stopping
             )
             if validate_this_epoch:
                 with self._overhead_window():
@@ -643,10 +684,12 @@ class Tomography(TomographyOpt, TomographyBase):
             # Opt-in per-epoch evaluation hook (e.g. SSIM-vs-ground-truth convergence
             # curves). Note `obj_view` is collective, so the callback must be invoked on
             # every rank; it is the caller's responsibility to guard rank-0-only work.
-            if eval_callback is not None and eval_every > 0 and (a0 + 1) % eval_every == 0:
+            if eval_callback is not None and eval_every > 0 and ((a0 + 1) % eval_every == 0 or stopping):
                 with self._overhead_window():
                     eval_callback(a0 + 1)
             nvtx.range_pop()  # epoch
+            if stopping:
+                break
 
         if show_metrics and self.world_size == 1:
             self.plot_losses()
@@ -676,7 +719,8 @@ class Tomography(TomographyOpt, TomographyBase):
         steps form one monotone sequence over the whole budget; snapshots in phase 1 come from the CPTilted model, epochs are logged with a
         ``two_phase/phase`` tag, and ``eval_callback`` receives the epoch index
         counted over both phases. Returns (and stores as ``two_phase_summary``) the
-        epoch and gradient-step counts per phase.
+        epoch and gradient-step counts per phase. A ``max_grad_steps`` caps both phases
+        together: phase 2 gets the steps phase 1 left, which must be at least one.
         """
         phase1 = TwoPhaseParams.parse(phase1)
         if not isinstance(self.obj_model, ObjectTensorDecomp):
@@ -729,6 +773,7 @@ class Tomography(TomographyOpt, TomographyBase):
         if "pose" not in phase1.optimizer_params:
             self.dset.remove_optimizer()
 
+        max_grad_steps = reconstruct_kwargs.pop("max_grad_steps", None)
         shared_kwargs = {
             k: v
             for k, v in reconstruct_kwargs.items()
@@ -745,6 +790,7 @@ class Tomography(TomographyOpt, TomographyBase):
                 obj_constraints=phase1_constraints,
                 num_samples_per_ray=phase1_samples,
                 eval_callback=eval_callback,
+                max_grad_steps=max_grad_steps,
                 **shared_kwargs,
             )
             rotations = _unwrap(phase1_obj.model).extract_tau_state().to(self.device)
@@ -765,6 +811,14 @@ class Tomography(TomographyOpt, TomographyBase):
         }
         del phase1_obj
 
+        phase2_max_steps = None
+        if max_grad_steps is not None:
+            phase2_max_steps = max_grad_steps - summary["phase1_grad_steps"]
+            if phase2_max_steps < 1:
+                raise ValueError(
+                    f"max_grad_steps={max_grad_steps} leaves no phase-2 steps after "
+                    f"{summary['phase1_grad_steps']} phase-1 steps."
+                )
         phase1_epochs = summary["phase1_epochs"]
         phase2_eval = (
             None if eval_callback is None else (lambda epoch: eval_callback(epoch + phase1_epochs))
@@ -776,6 +830,7 @@ class Tomography(TomographyOpt, TomographyBase):
                 optimizer_params=optimizer_params,
                 scheduler_params=scheduler_params,
                 eval_callback=phase2_eval,
+                max_grad_steps=phase2_max_steps,
                 **reconstruct_kwargs,
             )
         finally:

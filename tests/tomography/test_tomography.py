@@ -271,6 +271,140 @@ class TestInrFactory:
         assert tomo.overhead_s >= 0.2
         assert tomo._overhead_t0 is None
 
+    def _exact_kwargs(self, tomo, batch_size=16, **kwargs):
+        out = dict(
+            batch_size=batch_size,
+            num_workers=0,
+            num_samples_per_ray=2,
+            optimizer_params={"object": OptimizerParams.Adam(lr=1e-3)},
+        )
+        out.update(kwargs)
+        return out
+
+    def test_max_grad_steps_stops_mid_epoch_and_averages_the_partial_epoch(self, monkeypatch):
+        from quantem.tomography import tomography as tomography_module
+
+        tomo = self._inr_tomo("cpu", n=4)
+        assert tomo.grad_steps_per_epoch(16) == 5
+        batch_losses = []
+        original = tomography_module.get_loss_module
+
+        def recording_loss(**kwargs):
+            loss = original(**kwargs)
+
+            def wrapped(pred, target):
+                value = loss(pred, target)
+                batch_losses.append(float(value.detach()))
+                return value
+
+            return wrapped
+
+        monkeypatch.setattr(tomography_module, "get_loss_module", recording_loss)
+        snapshots, evals = [], []
+        tomo.reconstruct(
+            num_iter=3,
+            max_grad_steps=7,
+            snapshot_every=5,
+            snapshot_steps={7},
+            snapshot_callback=lambda step, vol: snapshots.append(step),
+            eval_callback=evals.append,
+            eval_every=2,
+            **self._exact_kwargs(tomo),
+        )
+        assert tomo._grad_steps == 7
+        assert tomo.num_epochs == 2
+        assert snapshots == [5, 7]
+        assert evals == [2]
+        assert len(batch_losses) == 7
+        assert tomo._consistency_losses[0] == pytest.approx(np.mean(batch_losses[:5]), rel=1e-5)
+        assert tomo._consistency_losses[1] == pytest.approx(np.mean(batch_losses[5:]), rel=1e-5)
+
+    def test_max_grad_steps_validates_the_stopping_epoch(self):
+        tomo = self._inr_tomo("cpu", n=4)
+        tomo.reconstruct(
+            num_iter=4,
+            max_grad_steps=6,
+            holdout_fraction=0.2,
+            holdout_every=10,
+            **self._exact_kwargs(tomo),
+        )
+        assert tomo._grad_steps == 6
+        assert tomo.num_epochs == 2
+        assert len(tomo._val_losses) == 1
+
+    def test_max_grad_steps_beyond_num_iter_runs_every_epoch(self):
+        tomo = self._inr_tomo("cpu", n=4)
+        tomo.reconstruct(num_iter=2, max_grad_steps=100, **self._exact_kwargs(tomo))
+        assert tomo._grad_steps == 10
+        assert tomo.num_epochs == 2
+
+    def test_max_grad_steps_counts_from_the_start_of_each_call(self):
+        tomo = self._inr_tomo("cpu", n=4)
+        tomo.reconstruct(num_iter=1, **self._exact_kwargs(tomo))
+        tomo.reconstruct(num_iter=2, max_grad_steps=3, **self._exact_kwargs(tomo))
+        assert tomo._grad_steps == 8
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_max_grad_steps_rejects_non_positive(self, value):
+        tomo = self._inr_tomo("cpu", n=4)
+        with pytest.raises(ValueError, match="max_grad_steps"):
+            tomo.reconstruct(num_iter=1, max_grad_steps=value, **self._exact_kwargs(tomo))
+
+    def test_grad_step_cosine_schedule_decays_every_step_to_eta_min(self):
+        tomo = self._inr_tomo("cpu", n=4)
+        lrs = []
+        tomo.reconstruct(
+            num_iter=3,
+            max_grad_steps=7,
+            scheduler_params={"object": {"name": "cosine_annealing", "eta_min": 0.0}},
+            scheduler_step="grad_step",
+            snapshot_every=1,
+            snapshot_callback=lambda step, vol: lrs.append(tomo.obj_model.get_current_lr()),
+            **self._exact_kwargs(tomo),
+        )
+        expected = [0.5e-3 * (1 + np.cos(np.pi * k / 7)) for k in range(1, 8)]
+        np.testing.assert_allclose(lrs, expected, rtol=1e-6, atol=1e-12)
+        assert all(b < a for a, b in zip(lrs, lrs[1:]))
+        assert tomo.learning_rates["object"][-1] == pytest.approx(0.0, abs=1e-12)
+
+    def test_epoch_cosine_schedule_is_unchanged_by_default(self):
+        tomo = self._inr_tomo("cpu", n=4)
+        lrs = []
+        tomo.reconstruct(
+            num_iter=2,
+            scheduler_params={"object": {"name": "cosine_annealing", "eta_min": 0.0}},
+            snapshot_every=1,
+            snapshot_callback=lambda step, vol: lrs.append(tomo.obj_model.get_current_lr()),
+            **self._exact_kwargs(tomo),
+        )
+        assert lrs == [pytest.approx(1e-3)] * 5 + [pytest.approx(0.5e-3)] * 5
+
+    def test_grad_step_schedule_rejects_plateau(self):
+        tomo = self._inr_tomo("cpu", n=4)
+        with pytest.raises(ValueError, match="plateau"):
+            tomo.reconstruct(
+                num_iter=1,
+                scheduler_params={"object": {"name": "plateau"}},
+                scheduler_step="grad_step",
+                **self._exact_kwargs(tomo),
+            )
+
+    def test_scheduler_step_rejects_unknown_value(self):
+        tomo = self._inr_tomo("cpu", n=4)
+        with pytest.raises(ValueError, match="scheduler_step"):
+            tomo.reconstruct(num_iter=1, scheduler_step="batch", **self._exact_kwargs(tomo))
+
+    def test_snapshot_steps_add_explicit_steps(self):
+        tomo = self._inr_tomo("cpu", n=4)
+        snapshots = []
+        tomo.reconstruct(
+            num_iter=2,
+            snapshot_steps=[1, 3, 10, 50],
+            snapshot_callback=lambda step, vol: snapshots.append(step),
+            **self._exact_kwargs(tomo),
+        )
+        assert snapshots == [1, 3, 10]
+
 
 @requires_torch
 class TestLiteINRReconstructBranch:
