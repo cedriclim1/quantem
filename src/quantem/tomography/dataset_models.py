@@ -163,6 +163,26 @@ class PixelHoldoutSplit:
     val_bg_indices: torch.Tensor
 
 
+_TORCH_QUANTILE_MAX_NUMEL = 2**24
+
+
+def _quantile(values: torch.Tensor, q: float) -> torch.Tensor:
+    """torch.quantile over all elements, also above its 2**24-element input limit.
+
+    Up to the limit this is torch.quantile itself. Above it, the same linearly
+    interpolated quantile is computed exactly from two order statistics.
+    """
+    if values.numel() <= _TORCH_QUANTILE_MAX_NUMEL:
+        return torch.quantile(values, q)
+    flat = values.flatten()
+    pos = q * (flat.numel() - 1)
+    lo = int(pos)
+    hi = min(lo + 1, flat.numel() - 1)
+    v_lo = flat.kthvalue(lo + 1).values
+    v_hi = flat.kthvalue(hi + 1).values
+    return v_lo + (pos - lo) * (v_hi - v_lo)
+
+
 def _allocate_pixel_holdout_counts(group_sizes: list[int], n_holdout: int) -> list[int]:
     """Allocate an exact holdout count across groups by largest remainder."""
     if n_holdout < 0:
@@ -347,7 +367,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         if type(tilt_angles) is not torch.Tensor:
             tilt_angles = torch.from_numpy(tilt_angles)
         if norm_quantile:
-            max_val = torch.quantile(tilt_stack, 0.95)
+            max_val = _quantile(tilt_stack, 0.95)
         else:
             max_val = torch.max(tilt_stack)
         if max_val <= 0:
