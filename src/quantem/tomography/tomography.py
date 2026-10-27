@@ -1,6 +1,6 @@
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Collection, Literal, Self, Sequence
@@ -47,6 +47,12 @@ from quantem.tomography.tomography_opt import TomographyOpt
 def _should_take_grad_step_snapshot(grad_step: int, snapshot_every: int) -> bool:
     """Return whether a gradient-update snapshot should fire at ``grad_step``."""
     return snapshot_every > 0 and grad_step > 0 and grad_step % snapshot_every == 0
+
+
+def _chunk_bounds(num_points: int, num_chunks: int) -> list[tuple[int, int]]:
+    """Split ``range(num_points)`` into ``num_chunks`` contiguous near-equal ranges."""
+    edges = [num_points * i // num_chunks for i in range(num_chunks + 1)]
+    return list(zip(edges[:-1], edges[1:]))
 
 
 def _take_grad_step_snapshot(
@@ -214,6 +220,7 @@ class Tomography(TomographyOpt, TomographyBase):
         max_grad_steps: int | None = None,
         scheduler_step: Literal["epoch", "grad_step"] = "epoch",
         snapshot_steps: Collection[int] | None = None,
+        grad_accum_steps: int = 1,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -233,7 +240,21 @@ class Tomography(TomographyOpt, TomographyBase):
         after every optimizer step instead of at epoch ends; plateau schedulers need
         ``"epoch"``. ``snapshot_steps`` adds explicit gradient steps (counted like
         ``snapshot_every``, over the object's lifetime) to the snapshot cadence.
+
+        ``grad_accum_steps`` (``k``) bounds activation memory without changing the step:
+        each batch's ray samples are first evaluated in ``k`` chunks without a graph, the
+        full-batch loss (consistency and every soft term, including batch-coupled ones such
+        as S3IM and the distortion normaliser) is built on those detached densities, and
+        each chunk is then re-evaluated and backpropagated with its slice of the density
+        gradient, followed by the pose path through the ray coordinates. The gradient is
+        the full-batch gradient up to float summation order, at the cost of one extra
+        no-grad forward per step; ray-independent terms are counted once. There is still
+        one clip, optimizer step, scheduler step and pose sync per batch, DDP syncs only
+        on the last chunk, and holdout validation is evaluated in ``k`` chunks too.
+        ``k = 1`` is the single-pass path.
         """
+        if not isinstance(grad_accum_steps, int) or grad_accum_steps < 1:
+            raise ValueError(f"grad_accum_steps must be an int >= 1, got {grad_accum_steps!r}.")
         if snapshot_every < 0:
             raise ValueError("snapshot_every must be >= 0.")
         if pose_warmup_epochs < 0:
@@ -396,8 +417,7 @@ class Tomography(TomographyOpt, TomographyBase):
             epoch_soft_constraint_loss = torch.tensor(0.0, device=self.device)
             epoch_soft_terms: dict[str, torch.Tensor] = {}
             epoch_batches = 0
-            active_obj_constraints = self.obj_model.constraints
-            distortion_enabled = getattr(active_obj_constraints, "distortion", 0.0) > 0
+            distortion_enabled = getattr(self.obj_model.constraints, "distortion", 0.0) > 0
             active_dset_constraints = getattr(self.dset, "constraints", None)
             pose_tv_enabled = (
                 getattr(active_dset_constraints, "tv_zs", 0.0) > 0
@@ -429,66 +449,43 @@ class Tomography(TomographyOpt, TomographyBase):
                 all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
                 nvtx.range_pop()
 
-                nvtx.range_push("obj_forward")
                 tap_coords = self.obj_model.sample_tv_tap_coords(all_coords)
-                with _tomography_autocast(self.device, use_bfloat16):
-                    if tap_coords is not None:
-                        all_densities, tv_tap_raw = self.obj_model.forward_with_tv_taps(
-                            all_coords, tap_coords
-                        )
-                    else:
-                        all_densities = self.obj_model.forward(all_coords)
-                        tv_tap_raw = None
-                nvtx.range_pop()
-
-                batch_distortion = None
-                target = None
-                if distortion_enabled:
-                    nvtx.range_push("ray_distortion")
-                    target = batch["target_value"].to(self.device, non_blocking=True).float()
-                    batch_distortion = self.dset.ray_distortion(
-                        all_densities,
-                        target,
-                        norm=active_obj_constraints.distortion_norm,
-                        eps_rel=active_obj_constraints.distortion_eps_rel,
+                batch_loss_kwargs = dict(
+                    batch=batch,
+                    all_coords=all_coords,
+                    num_samples_per_ray=curr_num_samples_per_ray,
+                    loss_func=loss_func,
+                    distortion_enabled=distortion_enabled,
+                    pose_tv_enabled=pose_tv_enabled,
+                )
+                if grad_accum_steps == 1:
+                    nvtx.range_push("obj_forward")
+                    all_densities, tv_tap_raw = self._forward_chunk(
+                        all_coords, tap_coords, use_bfloat16
                     )
                     nvtx.range_pop()
 
-                nvtx.range_push("integrate_rays")
-                integrated_densities = self.dset.integrate_rays(
-                    all_densities,
-                    curr_num_samples_per_ray,
-                    len(batch["target_value"]),
-                )
-                nvtx.range_pop()
-
-                pred = integrated_densities.float()
-
-                if target is None:
-                    target = batch["target_value"].to(self.device, non_blocking=True).float()
-
-                nvtx.range_push("soft_constraints")
-                batch_soft_terms: dict[str, torch.Tensor] = {}
-                soft_constraints_loss = self.obj_model.apply_soft_constraints(
-                    ctx=ReconstructionContext(
-                        coords=all_coords,
-                        pred=pred,
-                        all_densities=all_densities,
-                        target=target,
-                        tv_tap_densities=tv_tap_raw,
-                        distortion=batch_distortion,
-                        soft_terms=batch_soft_terms,
+                    batch_consistency_loss, soft_constraints_loss, batch_soft_terms = (
+                        self._batch_loss(
+                            all_densities=all_densities,
+                            tv_tap_raw=tv_tap_raw,
+                            **batch_loss_kwargs,
+                        )
                     )
-                )
-                nvtx.range_pop()
+                    batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
 
-                nvtx.range_push("consistency_loss")
-                batch_consistency_loss = loss_func(pred, target)
-
-                dataset_soft_loss = self.dset.apply_soft_constraints()
-                soft_constraints_loss += dataset_soft_loss
-                if pose_tv_enabled:
-                    batch_soft_terms["pose_tv"] = dataset_soft_loss.detach()
+                    nvtx.range_push("backward")
+                    batch_loss.backward()
+                    nvtx.range_pop()
+                else:
+                    batch_loss, batch_consistency_loss, soft_constraints_loss, batch_soft_terms = (
+                        self._accumulate_gradients(
+                            tap_coords=tap_coords,
+                            num_chunks=grad_accum_steps,
+                            use_bfloat16=use_bfloat16,
+                            **batch_loss_kwargs,
+                        )
+                    )
 
                 epoch_soft_constraint_loss += soft_constraints_loss.detach()
                 for term_name, term_value in batch_soft_terms.items():
@@ -497,12 +494,6 @@ class Tomography(TomographyOpt, TomographyBase):
                     else:
                         epoch_soft_terms[term_name] = term_value.float().clone()
 
-                batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
-                nvtx.range_pop()
-
-                nvtx.range_push("backward")
-                batch_loss.backward()
-                nvtx.range_pop()
                 # Clip gradients
                 nvtx.range_push("clip_and_optim_step")
                 self._sync_pose_gradients_ddp()
@@ -597,6 +588,7 @@ class Tomography(TomographyOpt, TomographyBase):
                         object_extent=N,
                         loss_func=loss_func,
                         use_bfloat16=use_bfloat16,
+                        forward_chunks=grad_accum_steps,
                     )
                     if getattr(self, "val_fg_dataloader", None) is not None:
                         avg_val_fg_loss = self._evaluate_validation_loss(
@@ -605,6 +597,7 @@ class Tomography(TomographyOpt, TomographyBase):
                             object_extent=N,
                             loss_func=loss_func,
                             use_bfloat16=use_bfloat16,
+                            forward_chunks=grad_accum_steps,
                         )
                     if getattr(self, "val_bg_dataloader", None) is not None:
                         avg_val_bg_loss = self._evaluate_validation_loss(
@@ -613,6 +606,7 @@ class Tomography(TomographyOpt, TomographyBase):
                             object_extent=N,
                             loss_func=loss_func,
                             use_bfloat16=use_bfloat16,
+                            forward_chunks=grad_accum_steps,
                         )
                     nvtx.range_pop()  # validation
 
@@ -870,6 +864,167 @@ class Tomography(TomographyOpt, TomographyBase):
 
     # --- Helper Functions ---
 
+    def _forward_chunk(
+        self, coords: torch.Tensor, tap_coords: torch.Tensor | None, use_bfloat16: bool
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Object densities at ``coords`` plus raw volume-TV tap densities when ``tap_coords``."""
+        with _tomography_autocast(self.device, use_bfloat16):
+            if tap_coords is not None:
+                return self.obj_model.forward_with_tv_taps(coords, tap_coords)
+            return self.obj_model.forward(coords), None
+
+    def _batch_loss(
+        self,
+        *,
+        batch: dict[str, torch.Tensor],
+        all_coords: torch.Tensor,
+        all_densities: torch.Tensor,
+        tv_tap_raw: torch.Tensor | None,
+        num_samples_per_ray: int,
+        loss_func: Callable,
+        distortion_enabled: bool,
+        pose_tv_enabled: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Consistency loss, summed soft-constraint loss and detached soft terms of one batch."""
+        active_obj_constraints = self.obj_model.constraints
+        batch_distortion = None
+        target = None
+        if distortion_enabled:
+            nvtx.range_push("ray_distortion")
+            target = batch["target_value"].to(self.device, non_blocking=True).float()
+            batch_distortion = self.dset.ray_distortion(
+                all_densities,
+                target,
+                norm=active_obj_constraints.distortion_norm,
+                eps_rel=active_obj_constraints.distortion_eps_rel,
+            )
+            nvtx.range_pop()
+
+        nvtx.range_push("integrate_rays")
+        integrated_densities = self.dset.integrate_rays(
+            all_densities,
+            num_samples_per_ray,
+            len(batch["target_value"]),
+        )
+        nvtx.range_pop()
+
+        pred = integrated_densities.float()
+
+        if target is None:
+            target = batch["target_value"].to(self.device, non_blocking=True).float()
+
+        nvtx.range_push("soft_constraints")
+        batch_soft_terms: dict[str, torch.Tensor] = {}
+        soft_constraints_loss = self.obj_model.apply_soft_constraints(
+            ctx=ReconstructionContext(
+                coords=all_coords,
+                pred=pred,
+                all_densities=all_densities,
+                target=target,
+                tv_tap_densities=tv_tap_raw,
+                distortion=batch_distortion,
+                soft_terms=batch_soft_terms,
+            )
+        )
+        nvtx.range_pop()
+
+        nvtx.range_push("consistency_loss")
+        batch_consistency_loss = loss_func(pred, target)
+
+        dataset_soft_loss = self.dset.apply_soft_constraints()
+        soft_constraints_loss += dataset_soft_loss
+        if pose_tv_enabled:
+            batch_soft_terms["pose_tv"] = dataset_soft_loss.detach()
+        nvtx.range_pop()
+        return batch_consistency_loss, soft_constraints_loss, batch_soft_terms
+
+    def _object_no_sync(self):
+        """DDP ``no_sync`` on the object model, or a null context outside DDP."""
+        model = self.obj_model.model
+        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            return model.no_sync()
+        return nullcontext()
+
+    def _accumulate_gradients(
+        self,
+        *,
+        all_coords: torch.Tensor,
+        tap_coords: torch.Tensor | None,
+        num_chunks: int,
+        use_bfloat16: bool,
+        **batch_loss_kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Accumulate the full-batch gradient over chunks; return batch, consistency, soft losses."""
+        bounds = _chunk_bounds(all_coords.shape[0], num_chunks)
+        last = len(bounds) - 1
+        coords = all_coords.detach()
+        taps = None if tap_coords is None else tap_coords.detach()
+
+        nvtx.range_push("obj_forward_no_grad")
+        with torch.no_grad():
+            chunks = [
+                self._forward_chunk(coords[start:end], taps if i == last else None, use_bfloat16)
+                for i, (start, end) in enumerate(bounds)
+            ]
+        nvtx.range_pop()
+        all_densities = torch.cat([densities for densities, _ in chunks]).requires_grad_(True)
+        tv_tap_raw = chunks[last][1]
+        if tv_tap_raw is not None:
+            tv_tap_raw = tv_tap_raw.detach().requires_grad_(True)
+        del chunks
+
+        with self._object_no_sync():
+            batch_consistency_loss, soft_constraints_loss, batch_soft_terms = self._batch_loss(
+                all_coords=all_coords,
+                all_densities=all_densities,
+                tv_tap_raw=tv_tap_raw,
+                **batch_loss_kwargs,
+            )
+            batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
+            nvtx.range_push("backward_loss")
+            batch_loss.backward(retain_graph=all_coords.requires_grad)
+            nvtx.range_pop()
+
+        density_grad = all_densities.grad
+        if density_grad is None:
+            density_grad = torch.zeros_like(all_densities)
+        tap_grad = None
+        if tv_tap_raw is not None:
+            tap_grad = tv_tap_raw.grad
+            if tap_grad is None:
+                tap_grad = torch.zeros_like(tv_tap_raw)
+
+        coords_leaf = coords.requires_grad_(all_coords.requires_grad)
+        taps_leaf = None
+        if taps is not None:
+            taps_leaf = taps.requires_grad_(tap_coords.requires_grad)
+        for i, (start, end) in enumerate(bounds):
+            nvtx.range_push(f"chunk_{i}")
+            with nullcontext() if i == last else self._object_no_sync():
+                densities, chunk_taps = self._forward_chunk(
+                    coords_leaf[start:end], taps_leaf if i == last else None, use_bfloat16
+                )
+                outputs, grads = [densities], [density_grad[start:end]]
+                if chunk_taps is not None:
+                    outputs.append(chunk_taps)
+                    grads.append(tap_grad)
+                torch.autograd.backward(outputs, grads)
+            del densities, chunk_taps, outputs
+            nvtx.range_pop()
+
+        roots, root_grads = [], []
+        if coords_leaf.grad is not None:
+            roots.append(all_coords)
+            root_grads.append(coords_leaf.grad)
+        if taps_leaf is not None and taps_leaf.grad is not None:
+            roots.append(tap_coords)
+            root_grads.append(taps_leaf.grad)
+        if roots:
+            nvtx.range_push("backward_coords")
+            torch.autograd.backward(roots, root_grads)
+            nvtx.range_pop()
+        return batch_loss, batch_consistency_loss, soft_constraints_loss, batch_soft_terms
+
     def _evaluate_validation_loss(
         self,
         *,
@@ -878,6 +1033,7 @@ class Tomography(TomographyOpt, TomographyBase):
         object_extent: int,
         loss_func: torch.nn.Module,
         use_bfloat16: bool = True,
+        forward_chunks: int = 1,
     ) -> float | None:
         """Rank-averaged holdout loss, with the same precision handling as training."""
         val_loss = torch.tensor(0.0, device=self.device)
@@ -891,8 +1047,17 @@ class Tomography(TomographyOpt, TomographyBase):
             with torch.no_grad():
                 for batch in dataloader:
                     all_coords = self.dset.get_coords(batch, object_extent, num_samples_per_ray)
-                    with _tomography_autocast(self.device, use_bfloat16):
-                        all_densities = self.obj_model.forward(all_coords)
+                    if forward_chunks == 1:
+                        with _tomography_autocast(self.device, use_bfloat16):
+                            all_densities = self.obj_model.forward(all_coords)
+                    else:
+                        bounds = _chunk_bounds(all_coords.shape[0], forward_chunks)
+                        all_densities = torch.cat(
+                            [
+                                self._forward_chunk(all_coords[start:end], None, use_bfloat16)[0]
+                                for start, end in bounds
+                            ]
+                        )
                     integrated_densities = self.dset.integrate_rays(
                         all_densities,
                         num_samples_per_ray,

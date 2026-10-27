@@ -557,6 +557,7 @@ _compiled_forward_cache: "weakref.WeakKeyDictionary[nn.Module, Callable]" = (
 
 class ObjectINR(ObjectConstraints, DDPMixin):
     DEFAULT_CONSTRAINTS = ObjConstraintParams.ObjINRConstraints()
+    VOLUME_CHUNK_SIZE = 2**19
 
     def __init__(
         self,
@@ -993,15 +994,18 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             )
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
 
-    def create_volume(self, return_vol: bool = False):
+    def create_volume(self, return_vol: bool = False, chunk_size: int | None = None):
+        """Evaluate the grid in chunks of ``chunk_size`` points, capped by VOLUME_CHUNK_SIZE."""
         N = max(self._shape)
+        if chunk_size is None:
+            chunk_size = min(5 * N * N, self.VOLUME_CHUNK_SIZE)
+        if chunk_size < 1:
+            raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
         with torch.no_grad():
-            coords_1d = torch.linspace(-1, 1, N)
-            x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
-            inputs = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
+            coords_1d = torch.linspace(-1, 1, N).to(self.device)
             model = _unwrap(self.model)
 
-            inference_batch_size = 5 * N * N
+            inference_batch_size = chunk_size
             total_samples = N**3
             samples_per_gpu = total_samples // self.world_size
             remainder = total_samples % self.world_size
@@ -1013,14 +1017,13 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                 start_idx = self.global_rank * samples_per_gpu + remainder
                 end_idx = start_idx + samples_per_gpu
 
-            inputs_subset = inputs[start_idx:end_idx]
-            num_samples = inputs_subset.shape[0]
-
             outputs_list = []
-            for batch_start in range(0, num_samples, inference_batch_size):
-                batch_end = min(batch_start + inference_batch_size, num_samples)
-                batch_coords = inputs_subset[batch_start:batch_end].to(
-                    self.device, non_blocking=True
+            for batch_start in range(start_idx, end_idx, inference_batch_size):
+                batch_end = min(batch_start + inference_batch_size, end_idx)
+                flat = torch.arange(batch_start, batch_end, device=coords_1d.device)
+                batch_coords = torch.stack(
+                    [coords_1d[flat // (N * N)], coords_1d[(flat // N) % N], coords_1d[flat % N]],
+                    dim=-1,
                 )
 
                 batch_outputs = model(batch_coords)  # (B, C) or (B,) etc.
