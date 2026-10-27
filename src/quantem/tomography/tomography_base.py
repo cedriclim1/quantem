@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -53,6 +55,8 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         self._soft_term_losses: list[dict[str, float]] = []
         self._lrs: dict[str, list] = {}
         self._grad_steps: int = 0
+        self._overhead_s: float = 0.0
+        self._overhead_t0: float | None = None
         # DDP Initialization
         if isinstance(obj_model, ObjectINR) or isinstance(obj_model, ObjectTensorDecomp):
             self.setup_distributed(device=device)
@@ -160,6 +164,16 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
     @property
     def num_epochs(self) -> int:
         return len(self._epoch_losses)
+
+    @property
+    def overhead_s(self) -> float:
+        """
+        Returns the wall seconds spent so far outside training steps (snapshots, validation,
+        logger writes, eval callbacks), including a window still open.
+        """
+        t0 = getattr(self, "_overhead_t0", None)
+        open_s = 0.0 if t0 is None else time.perf_counter() - t0
+        return getattr(self, "_overhead_s", 0.0) + open_s
 
     # --- Helper Functions ---
 
