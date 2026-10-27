@@ -15,6 +15,7 @@ from quantem.tomography.dataset_models import (
     TomographyINRDataset,
     TomographyINRPretrainDataset,
     TomographyPixDataset,
+    _quantile,
 )
 from quantem.tomography.tomography_opt import _pose_optimizer_specs
 
@@ -60,6 +61,24 @@ class TestTomographyPixDataset:
         d = TomographyPixDataset.from_data(_stack(), np.linspace(-60, 60, 5).astype(np.float32))
         q95 = torch.quantile(d.tilt_stack, 0.95)
         assert torch.isclose(q95, torch.tensor(1.0), atol=1e-4)
+
+    def test_quantile_matches_torch_below_limit(self):
+        x = torch.from_numpy(_stack(nang=7, n=33, seed=3))
+        assert torch.equal(_quantile(x, 0.95), torch.quantile(x, 0.95))
+
+    def test_quantile_above_torch_limit_matches_numpy(self):
+        rng = np.random.default_rng(1)
+        x = rng.random(7 * 11 * 217900).astype(np.float32).reshape(-1, 7, 11)
+        assert x.size > 2**24
+        got = float(_quantile(torch.from_numpy(x), 0.95))
+        assert got == pytest.approx(float(np.quantile(x.astype(np.float64), 0.95)), rel=1e-6)
+
+    def test_normalisation_above_torch_quantile_limit(self):
+        # 71 x 512 x 512 views exceed torch.quantile's 2**24-element input limit.
+        stack = np.full((71, 512, 512), 4.0, dtype=np.float32)
+        stack[:, :8] = 8.0
+        d = TomographyPixDataset.from_data(stack, np.linspace(-70, 70, 71).astype(np.float32))
+        assert float(d.tilt_stack.median()) == pytest.approx(1.0)
 
     def test_sparse_stack_normalisation_stays_finite(self):
         # >95% zeros makes the 95th quantile 0; normalisation must not divide
