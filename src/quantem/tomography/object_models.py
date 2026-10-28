@@ -13,7 +13,9 @@ from tqdm.auto import tqdm
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.ddp import DDPMixin
+from quantem.core.ml.dist_utils import is_model_parallel
 from quantem.core.ml.loss_functions import get_loss_module
+from quantem.core.ml.models.kplanes import KPlanesTILTED, KPlanesTILTEDShard
 from quantem.core.ml.models.model_base import PlanarDecompositionModel
 from quantem.core.ml.s3im import S3IMLoss
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
@@ -1004,17 +1006,20 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         with torch.no_grad():
             coords_1d = torch.linspace(-1, 1, N).to(self.device)
             model = _unwrap(self.model)
+            # A model-parallel slice needs every rank on every voxel: its forward sums the
+            # ranks' partial outputs, so the voxel split and gather below are skipped.
+            world, rank = (1, 0) if is_model_parallel(model) else (self.world_size, self.global_rank)
 
             inference_batch_size = chunk_size
             total_samples = N**3
-            samples_per_gpu = total_samples // self.world_size
-            remainder = total_samples % self.world_size
+            samples_per_gpu = total_samples // world
+            remainder = total_samples % world
 
-            if self.global_rank < remainder:
-                start_idx = self.global_rank * (samples_per_gpu + 1)
+            if rank < remainder:
+                start_idx = rank * (samples_per_gpu + 1)
                 end_idx = start_idx + samples_per_gpu + 1
             else:
-                start_idx = self.global_rank * samples_per_gpu + remainder
+                start_idx = rank * samples_per_gpu + remainder
                 end_idx = start_idx + samples_per_gpu
 
             outputs_list = []
@@ -1041,13 +1046,13 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             outputs = torch.cat(outputs_list, dim=0)  # (local_B, C)
             C = outputs.shape[-1]  # e.g. 5
 
-            if self.world_size > 1:
+            if world > 1:
                 # gather variable-sized first dimension (local_B) while keeping channels
                 local_B = outputs.shape[0]
                 output_size = torch.tensor(local_B, device=self.device, dtype=torch.long)
                 all_sizes = [
                     torch.zeros(1, device=self.device, dtype=torch.long)
-                    for _ in range(self.world_size)
+                    for _ in range(world)
                 ]
                 dist.all_gather(all_sizes, output_size)
                 max_size = max(size.item() for size in all_sizes)
@@ -1065,7 +1070,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
                 gathered_outputs = [
                     torch.empty((max_size, C), device=self.device, dtype=outputs_dev.dtype)  # type: ignore
-                    for _ in range(self.world_size)
+                    for _ in range(world)
                 ]
                 dist.all_gather(gathered_outputs, outputs_padded.contiguous())
 
@@ -1102,6 +1107,8 @@ class ObjectTensorDecomp(ObjectINR):
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
         model: nn.Module | None = None,
+        plane_split: bool = False,
+        t_shards: int | None = None,
         _token: object | None = None,
     ):
         super().__init__(
@@ -1118,7 +1125,15 @@ class ObjectTensorDecomp(ObjectINR):
         # Register the network submodule (important: real nn.Module attribute)
         if model is not None:
             self.setup_distributed(device=device)
+            if plane_split:
+                model = self._split_planes(model, t_shards)
             self._model = self.distribute_model(model)
+
+    def _split_planes(self, model: nn.Module, t_shards: int | None) -> nn.Module:
+        """This rank's ``KPlanesTILTEDShard`` of ``model`` (built identically on every rank)."""
+        if not isinstance(model, KPlanesTILTED):
+            raise TypeError(f"plane_split needs a KPlanesTILTED model, got {type(model).__name__}")
+        return KPlanesTILTEDShard(model, self.global_rank, self.world_size, t_shards)
 
     @classmethod
     def from_model(
@@ -1127,12 +1142,19 @@ class ObjectTensorDecomp(ObjectINR):
         shape: tuple[int, int, int],
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
+        plane_split: bool = False,
+        t_shards: int | None = None,
     ):
+        """Wrap ``model``. With ``plane_split`` each rank keeps one ``KPlanesTILTEDShard`` instead
+        of a DDP replica: pass the same full model (same seed) on every rank, which all see the
+        same ray batches (``Tomography`` handles the sampler, gradient sync and clipping)."""
         obj_model = cls(
             shape=shape,
             device=device,
             rng=rng,
             model=model,  # ✅ build/register in __init__
+            plane_split=plane_split,
+            t_shards=t_shards,
         )
 
         obj_model.setup_distributed(device=device)
@@ -1218,6 +1240,8 @@ class ObjectTensorDecomp(ObjectINR):
         that lets a two-phase run keep ``l21_plane`` in its CPTilted phase.
         """
         model = _unwrap(self.model)
+        if is_model_parallel(model):
+            return self.constraints.l21_plane * model.plane_l21()
         group_norms = []
         for grid in model.grids:
             if grid.dim() not in (3, 4):
@@ -1263,6 +1287,8 @@ class ObjectTensorDecomp(ObjectINR):
         ``T`` rotations; KPlanes sums its 3 planes. Levels are summed.
         """
         model = _unwrap(self.model)
+        if is_model_parallel(model):
+            return self.constraints.tv_plane * model.plane_tv()
         is_tilted = model.tilted
         per_level = []
 

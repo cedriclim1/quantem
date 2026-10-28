@@ -100,6 +100,55 @@ def get_world_size() -> int:
     return 1
 
 
+def _multi_rank() -> bool:
+    return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+
+
+class _SumAcrossRanks(torch.autograd.Function):
+    """Forward: sum over ranks. Backward: identity, for a loss every rank computes identically."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        y = x.clone()
+        if _multi_rank():
+            dist.all_reduce(y)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> torch.Tensor:
+        return grad
+
+
+class _SumGradAcrossRanks(torch.autograd.Function):
+    """Forward: identity. Backward: sum the incoming gradient over ranks."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> torch.Tensor:
+        grad = grad.contiguous().clone()
+        if _multi_rank():
+            dist.all_reduce(grad)
+        return grad
+
+
+def sum_across_ranks(x: torch.Tensor) -> torch.Tensor:
+    """Sum ``x`` over ranks; the gradient passes through unchanged (model-parallel partial sums)."""
+    return _SumAcrossRanks.apply(x)
+
+
+def sum_grad_across_ranks(x: torch.Tensor) -> torch.Tensor:
+    """Return ``x`` unchanged; in backward, sum its gradient over ranks (shared model inputs)."""
+    return _SumGradAcrossRanks.apply(x)
+
+
+def is_model_parallel(model: Any) -> bool:
+    """True for a module that holds one rank's slice of a model (plane-split training)."""
+    return bool(getattr(model, "model_parallel", False))
+
+
 def all_reduce_params(*params: torch.Tensor, op: Any = dist.ReduceOp.AVG) -> None:
     """Average the .grad tensors of the given parameters across all ranks in-place."""
     for p in params:

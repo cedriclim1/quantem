@@ -9,10 +9,12 @@ from typing import Callable, Literal, Sequence
 
 # import tinycudann as tcnn
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
 from quantem.core import config
+from quantem.core.ml.dist_utils import sum_across_ranks, sum_grad_across_ranks
 
 from .model_base import PPLR, TensorDecompositionModel
 from .so3params import SO3ParamQuat, SO3ParamR9SVD
@@ -744,6 +746,196 @@ class KPlanesTILTED(KPlanes):
     @property
     def tilted(self) -> bool:
         return True
+
+
+def plane_split_layout(world_size: int, T: int, M: int, t_shards: int | None = None) -> tuple[int, int]:
+    """(rotation shards, channel shards) for ``world_size`` ranks; rotations are split first by default."""
+    t = math.gcd(world_size, T) if t_shards is None else int(t_shards)
+    if t < 1 or world_size % t or T % t:
+        raise ValueError(f"t_shards={t} must divide both world_size={world_size} and T={T}")
+    c = world_size // t
+    if M % c:
+        raise ValueError(
+            f"{world_size} ranks with {t} rotation shards need {c} channel shards, "
+            f"which must divide M_features={M}"
+        )
+    return t, c
+
+
+class KPlanesTILTEDShard(nn.Module):
+    """One rank's slice of a ``KPlanesTILTED`` for plane-split (model-parallel) training.
+
+    The ``T`` rotations and ``M`` channels of every scale are dealt out in blocks: this rank
+    keeps rotations ``t0 : t0 + T_local`` and channels ``c0 : c0 + M_local`` of each plane
+    level plus the matching decoder columns. The decoder must be the single ``nn.Linear``,
+    whose output is a sum over features, so each rank computes a partial pre-activation for
+    every point and one ``sum_across_ranks`` gives the full model's value. Every rank must
+    see the same points. The bias and the rotations are replicated; their gradients are
+    summed by ``sync_replicated_grads``. When the coordinates carry a gradient (pose
+    learning) it is summed over ranks at the model input, so pose gradients come out
+    complete and identical on every rank. Coarse-to-fine gates and plane blur act per
+    channel and are applied to the local slice.
+    """
+
+    model_parallel = True
+
+    def __init__(self, model: KPlanesTILTED, rank: int, world_size: int, t_shards: int | None = None):
+        super().__init__()
+        if not isinstance(model.sigma_net, nn.Linear):
+            raise ValueError("plane split needs the single-Linear decoder (use_hybrid_mlp=False)")
+        T, M = model.T, model.M_features
+        t, c = plane_split_layout(world_size, T, M, t_shards)
+        self.T, self.M_features, self.t_shards, self.c_shards = T, M, t, c
+        self.T_local, self.M_local = T // t, M // c
+        self.t0 = (rank // c) * self.T_local
+        self.c0 = (rank % c) * self.M_local
+        self.rank, self.world_size = rank, world_size
+        t_sl = slice(3 * self.t0, 3 * (self.t0 + self.T_local))
+        c_sl = slice(self.c0, self.c0 + self.M_local)
+        self.grids = nn.ParameterList(
+            [nn.Parameter(g.detach()[t_sl, c_sl].clone().contiguous()) for g in model.grids]
+        )
+        num_scales = len(model.grids)
+        cols = [
+            si * T * M + ti * M + ci
+            for si in range(num_scales)
+            for ti in range(self.t0, self.t0 + self.T_local)
+            for ci in range(self.c0, self.c0 + self.M_local)
+        ]
+        self.weight = nn.Parameter(model.sigma_net.weight.detach()[:, cols].clone())
+        self.bias = nn.Parameter(model.sigma_net.bias.detach().clone())
+        self.so3 = model.so3
+        self.density_activation = model.density_activation
+        self.resolution = list(model.resolution)
+        self.multiscale_res_multipliers = list(model.multiscale_res_multipliers)
+        self.num_scales = num_scales
+        self.td_type = model.td_type
+        self.c2f_warmup_frac = model.c2f_warmup_frac
+        self.c2f_blur_sigma0 = model.c2f_blur_sigma0
+        self.c2f_blur_frac = model.c2f_blur_frac
+        self.set_progress(0.0)
+
+    @property
+    def tilted(self) -> bool:
+        return True
+
+    @property
+    def layout(self) -> dict[str, int]:
+        return {
+            "world_size": self.world_size,
+            "t_shards": self.t_shards,
+            "c_shards": self.c_shards,
+            "rotations_per_rank": self.T_local,
+            "channels_per_rank": self.M_local,
+        }
+
+    def set_progress(self, frac: float) -> None:
+        """Set training progress in [0, 1] and update the coarse-to-fine schedules."""
+        self._progress = min(1.0, max(0.0, float(frac)))
+        self._scale_gates = c2f_scale_gates(self._progress, self.c2f_warmup_frac, self.num_scales)
+        self._blur_sigma = c2f_blur_sigma(self._progress, self.c2f_blur_sigma0, self.c2f_blur_frac)
+
+    @property
+    def scale_gates(self) -> list[float]:
+        return list(self._scale_gates)
+
+    @property
+    def blur_sigma(self) -> float:
+        return self._blur_sigma
+
+    def _active_grids(self) -> Sequence[torch.Tensor]:
+        if self._blur_sigma <= 0:
+            return self.grids
+        finest = max(self.multiscale_res_multipliers)
+        return [
+            gaussian_blur_planes(g, self._blur_sigma * m / finest)
+            for g, m in zip(self.grids, self.multiscale_res_multipliers)
+        ]
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        if coords.requires_grad:
+            coords = sum_grad_across_ranks(coords)
+        pts = coords.reshape(-1, 3)
+        R = self.so3.as_matrix()[self.t0 : self.t0 + self.T_local]
+        gates = None if all(g == 1.0 for g in self._scale_gates) else self._scale_gates
+        features = interpolate_ms_features_tilted(pts, self._active_grids(), R, scale_gates=gates)
+        pre = features @ self.weight.t()
+        if self.rank == 0:
+            pre = pre + self.bias
+        return self.density_activation(sum_across_ranks(pre))
+
+    def get_params(self) -> dict[str, list[nn.Parameter]]:
+        return {
+            "grids": list(self.grids),
+            "sigma_net": [self.weight, self.bias],
+            "so3": list(self.so3.parameters()),
+        }
+
+    @property
+    def param_keys(self) -> list[str]:
+        return ["grids", "sigma_net", "so3"]
+
+    def owned_parameters(self) -> list[nn.Parameter]:
+        return [*self.grids, self.weight]
+
+    def replicated_parameters(self) -> list[nn.Parameter]:
+        return [self.bias, *self.so3.parameters()]
+
+    def sync_replicated_grads(self) -> None:
+        """Sum the partial gradients of the replicated bias and rotations over ranks."""
+        for p in self.replicated_parameters():
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(p.grad)
+
+    def clip_grad_norm_(self, max_norm: float) -> torch.Tensor:
+        """``torch.nn.utils.clip_grad_norm_`` on the full model's gradient; replicated params count once."""
+        owned = [p.grad for p in self.owned_parameters() if p.grad is not None]
+        replicated = [p.grad for p in self.replicated_parameters() if p.grad is not None]
+        sq = torch.zeros((), device=self.weight.device)
+        if owned:
+            sq = sq + torch.stack([g.pow(2).sum() for g in owned]).sum()
+        if self.rank == 0 and replicated:
+            sq = sq + torch.stack([g.pow(2).sum() for g in replicated]).sum()
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(sq)
+        total = sq.sqrt()
+        coef = (max_norm / (total + 1e-6)).clamp(max=1.0)
+        torch._foreach_mul_(owned + replicated, coef)
+        return total
+
+    def _full_groups(self, local: torch.Tensor) -> torch.Tensor:
+        """Place this rank's per-group values (3 * T_local,) into all 3 * T groups, summed over ranks."""
+        full = local.new_zeros(3 * self.T)
+        full = full.index_add(0, torch.arange(3 * self.t0, 3 * (self.t0 + self.T_local), device=local.device), local)
+        return sum_across_ranks(full)
+
+    def plane_tv(self) -> torch.Tensor:
+        """The unsliced model's plane TV (``ObjectTensorDecomp._get_plane_tv_loss`` without the weight)."""
+        per_level = []
+        for p in self.grids:
+            H, W = p.shape[-2:]
+            dh = self._full_groups((p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).sum(dim=(1, 2, 3)))
+            dw = self._full_groups((p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).sum(dim=(1, 2, 3)))
+            per_group = dh / (self.M_features * (H - 1) * W) + dw / (self.M_features * H * (W - 1))
+            per_level.append(per_group.view(self.T, 3).sum(dim=1).mean())
+        return torch.stack(per_level).sum()
+
+    def plane_l21(self) -> torch.Tensor:
+        """The unsliced model's group l2,1 norm (``ObjectTensorDecomp.get_plane_l21_loss`` without the weight)."""
+        norms = []
+        for p in self.grids:
+            H, W = p.shape[-2:]
+            sq = self._full_groups(p.reshape(p.shape[0], -1).pow(2).sum(dim=1))
+            norms.append(torch.sqrt(sq / (self.M_features * H * W) + 1e-12))
+        return torch.cat(norms).mean()
+
+    def extra_repr(self) -> str:
+        return (
+            f"rank={self.rank}/{self.world_size}, rotations={self.t0}:{self.t0 + self.T_local} of {self.T}, "
+            f"channels={self.c0}:{self.c0 + self.M_local} of {self.M_features}"
+        )
 
 
 # CP Decomp for Warmup SO3 rotations

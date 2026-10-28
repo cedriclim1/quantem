@@ -5,7 +5,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, random_split
 
-from quantem.core.ml.dist_utils import worker_init_fn
+from quantem.core.ml.dist_utils import is_model_parallel, worker_init_fn
 from quantem.tomography.dataset_models import DatasetModelType
 
 __all__ = ["DDPMixin", "worker_init_fn"]
@@ -158,10 +158,17 @@ class DDPMixin:
     ) -> nn.Module | nn.parallel.DistributedDataParallel:
         """
         Wraps the model with DistributedDataParallel if mulitple GPUs are available.
+        A model-parallel slice (``is_model_parallel``) is only moved to the device: DDP's
+        initial broadcast would overwrite every rank's slice with rank 0's.
 
         Returns the model.
         """
         model = model.to(self.device)
+
+        if is_model_parallel(model):
+            if self.global_rank == 0:
+                print("Model-parallel slice: not wrapped with DDP")
+            return model
 
         if self.world_size > 1:
             model = torch.nn.parallel.DistributedDataParallel(

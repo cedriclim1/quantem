@@ -13,6 +13,7 @@ from torch.cuda import nvtx
 from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
+from quantem.core.ml.dist_utils import is_model_parallel
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.optimizer_mixin import SchedulerParams
 from quantem.core.ml.profiling import nsys_capture_tick
@@ -158,6 +159,25 @@ class Tomography(TomographyOpt, TomographyBase):
                 if p.grad is None:
                     p.grad = torch.zeros_like(p)
                 dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
+    def _clip_object_gradients(self, max_norm: float) -> None:
+        """Clip the object model's gradient to ``max_norm``; a plane-split slice syncs and clips globally.
+
+        Under a plane split every rank already holds the complete pose gradient (summed at
+        the model input), so the pose average above only keeps the copies identical.
+        """
+        model = _unwrap(self.obj_model.model)
+        if is_model_parallel(model):
+            model.sync_replicated_grads()
+            model.clip_grad_norm_(max_norm)
+        else:
+            torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=max_norm)
+
+    def _sampler_rank(self) -> dict[str, int]:
+        """Sampler shard: every rank draws the full batch under a plane split, else its own shard."""
+        if is_model_parallel(_unwrap(self.obj_model.model)):
+            return dict(rank=0, world_size=1)
+        return dict(rank=self.global_rank, world_size=self.world_size)
 
     @contextmanager
     def _overhead_window(self):
@@ -497,7 +517,7 @@ class Tomography(TomographyOpt, TomographyBase):
                 # Clip gradients
                 nvtx.range_push("clip_and_optim_step")
                 self._sync_pose_gradients_ddp()
-                torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)
+                self._clip_object_gradients(max_norm=1.0)
                 self.step_optimizers()
                 if step_schedulers_per_grad_step:
                     self.step_schedulers()
@@ -1176,7 +1196,7 @@ class Tomography(TomographyOpt, TomographyBase):
                 val_fg_indices = torch.empty(0, dtype=torch.long)
                 val_bg_indices = torch.empty(0, dtype=torch.long)
 
-            ddp = dict(rank=self.global_rank, world_size=self.world_size)
+            ddp = self._sampler_rank()
             self.dataloader = DeviceBatchSampler(
                 self.dset, batch_size, self.device, indices=train_indices, **ddp
             )
